@@ -1,0 +1,9 @@
+# Leduc Poker (AGENTS.md §1 D8).
+# 2-player, sequential, imperfect-info, zero-sum. Standard benchmark poker.
+# Exploitability computable via OpenSpiel. Compared alongside Kuhn in Step 3.
+name: leduc
+game_string: leduc_poker
+notes: >
+  Two-round Hold'em with a 6-card deck (2 suits x 3 ranks). 3 actions (fold,
+  check/call, bet/raise), info-state tensor size 30, max length 8. A standard
+  benchmark with exact exploitability; used to compare ACH / PPO / CFR+ / NFSP.

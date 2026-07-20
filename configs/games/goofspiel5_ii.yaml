@@ -1,0 +1,11 @@
+# Goofspiel, 5-card, imperfect-info (AGENTS.md §1 D8).
+# 2-player, SIMULTANEOUS, imperfect-info, zero-sum. The headline league
+# benchmark in the Phase-1 plan: small enough to train cheaply but rich enough
+# that latest-vs-latest cycles and league play shows empirical benefit.
+name: goofspiel5_ii
+game_string: "goofspiel(imp_info=True,num_cards=5,points_order=descending)"
+notes: >
+  Each player holds a 5-card bid deck; players simultaneously play one card to
+  contest the current point card (descending values). Opponent's played card
+  is hidden (imperfect info). Horizon 5; 5 actions; info-state tensor 97.
+  Evaluated via NashConv (simultaneous => exploitability() not applicable).

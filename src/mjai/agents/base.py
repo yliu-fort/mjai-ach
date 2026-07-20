@@ -88,19 +88,12 @@ class Policy(ABC):
         """Restore in-place from ``path`` (produced by :meth:`save`)."""
         ...
 
-    # ---- Optional hooks (default impls where sensible) ----
-
-    def parameters(self) -> list[Any]:
-        """Trainable parameters; empty for tabular (handled via dicts by the
-        UpdateRule). NN subclasses override to return torch tensors.
-        """
-        return []
-
-    def train(self) -> None:
-        """Set training mode. Optional override (NN subclasses); default noop."""
-
-    def eval_mode(self) -> None:
-        """Set eval mode. Optional override (NN subclasses); default noop."""
+    # NOTE: parameters() / train() / eval_mode() are deliberately NOT on the
+    # ABC. nn.Module already provides parameters()/train()/eval(); redefining
+    # them here would create MRO/signature conflicts for NN subclasses
+    # (MLPSharedActorCritic multiple-inherits nn.Module + Policy). Tabular
+    # policies carry their state in dicts read by the UpdateRule, so they have
+    # no need for these hooks.
 
 
 def entropy_of_probs(probs: list[float]) -> float:

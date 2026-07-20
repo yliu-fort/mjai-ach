@@ -1,0 +1,12 @@
+# Oshi-Zumo, 5 coins, size-3 ring, horizon 20 (AGENTS.md §1 D8).
+# 2-player, SIMULTANEOUS, PERFECT-info, zero-sum. The clearest strategy-cycle
+# game in the plan (aggressive early-bid beats conservative; conservative beats
+# uniform; uniform beats early-exhaust aggressive). Recommended first league
+# experiment. Loader auto-selects observation_tensor (no info-state tensor).
+name: oshi_zumo
+game_string: "oshi_zumo(coins=5,size=3,horizon=20)"
+notes: >
+  Both players secretly bid coins each round; higher bid pushes the wrestler one
+  step toward the opponent; spent coins are gone. A small-coin / short-horizon
+  variant of the canonical 50-coin game so it trains fast on CPU. Evaluated
+  via NashConv.

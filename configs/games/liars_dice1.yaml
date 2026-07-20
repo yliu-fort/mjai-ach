@@ -1,0 +1,10 @@
+# Liar's Dice, 1 die each, 6 sides (AGENTS.md §1 D8).
+# 2-player, sequential, imperfect-info, zero-sum. Closest small game to ACH's
+# hidden-type / belief-inference / bluff setting (the paper's domain is
+# Mahjong). Used in Step 3 to check ACH transfer to a different IIG family.
+name: liars_dice1
+game_string: "liars_dice(numdice=1,dice_sides=6)"
+notes: >
+  Each player sees only their own die, then bid or challenge (13 actions).
+  Info-state tensor 21; max length 13. Sequential, so exploitability() works.
+  Note: pyspiel param is `numdice` (no underscore), not `num_dice`.

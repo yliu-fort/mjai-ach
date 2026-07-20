@@ -1,0 +1,9 @@
+# Biased Rock-Paper-Scissors (AGENTS.md §1 D8).
+# Payoffs {0,-25,50; 25,0,-5; -50,5,0}; exact Nash equilibrium (1/16, 10/16, 5/16).
+# One-shot simultaneous 2x0-sum. Used as the cycling sanity check (Step 3).
+name: brps
+game_string: matrix_brps
+notes: >
+  The cheapest game that exhibits non-transitive best-response cycling under
+  latest-vs-latest self-play. Exact NE known, so distance-to-Nash is a clean
+  metric. Horizon = 1.

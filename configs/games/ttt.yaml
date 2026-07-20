@@ -1,0 +1,10 @@
+# Tic-Tac-Toe (AGENTS.md §1 D8, §5).
+# 2-player, sequential, PERFECT-info, zero-sum. No information_state tensor;
+# loader auto-selects observation_tensor. Used as a unit-test fixture and the
+# simplest game where a tabular policy can be validated against minimax.
+name: ttt
+game_string: tic_tac_toe
+notes: >
+  Perfect-information; minimax value is a draw. Used to verify the pipeline
+  end-to-end on a trivially-solvable game and as a CLI smoke-test fixture.
+  obs_kind falls back to "observation" (no info-state tensor).

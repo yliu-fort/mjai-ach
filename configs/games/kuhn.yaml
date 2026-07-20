@@ -1,0 +1,10 @@
+# Kuhn Poker (AGENTS.md §1 D8).
+# 2-player, sequential, imperfect-info, zero-sum. The canonical tiny poker.
+# Exact Nash known; exploitability computable via OpenSpiel. Used in Step 3
+# tabular validation (PPO vs ACH vs CFR+) and as a unit-test fixture.
+name: kuhn
+game_string: kuhn_poker
+notes: >
+  Smallest real poker. 2 actions (check/call, bet/raise), 3-card deck.
+  Information-state tensor size 11; max game length 3. Used to demonstrate
+  ACH last-iterate convergence vs PPO cycling on an extensive-form game.
