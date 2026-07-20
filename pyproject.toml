@@ -199,7 +199,11 @@ forbidden_modules = ["mjai.cli"]
 [tool.pytest.ini_options]
 minversion = "8.3"
 testpaths = ["tests"]
-addopts = "-ra --strict-markers --strict-config"
+# -p no:cacheprovider: the cache serializes every parametrized node id to disk
+# at session end; with ~thousands of parametrized cases across the suite this
+# triggered a MemoryError on a 16 GB machine. The cache is only used for
+# `--last-failed` / `--failed-first`, which we don't rely on.
+addopts = "-ra --strict-markers --strict-config -p no:cacheprovider"
 markers = [
     "gpu: tests that require a CUDA device (skipped without one)",
     "slow: tests that take more than a few seconds (excluded from fast suite)",
