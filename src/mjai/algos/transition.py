@@ -49,11 +49,39 @@ class Batch:
     returns: np.ndarray  # (B,) float32
     advantages: np.ndarray  # (B,) float32
     legal_mask: np.ndarray  # (B, num_actions) bool — True where legal
+    players: np.ndarray  # (B,) int8 — which seat each transition belongs to
     num_actions: int  # action-space width (for mask shape)
 
     @property
     def size(self) -> int:
         return int(self.obs.shape[0])
+
+    def for_player(self, player: int) -> Batch:
+        """Return a new Batch containing only transitions of ``player``.
+
+        Used by the league controller to train each learner on its own seat's
+        transitions only (the opponent seat belongs to a different learner).
+        """
+        if self.size == 0:
+            return self
+        mask = self.players == player
+        if mask.all():
+            return self
+        import numpy as np
+
+        idx = np.nonzero(mask)[0]
+        return Batch(
+            obs=self.obs[idx],
+            legal_actions=[self.legal_actions[i] for i in idx],
+            actions=self.actions[idx],
+            logprobs=self.logprobs[idx],
+            values=self.values[idx],
+            returns=self.returns[idx],
+            advantages=self.advantages[idx],
+            legal_mask=self.legal_mask[idx],
+            players=self.players[idx],
+            num_actions=self.num_actions,
+        )
 
 
 def make_batch(transitions: Sequence[Transition], num_actions: int) -> Batch:
@@ -74,6 +102,7 @@ def make_batch(transitions: Sequence[Transition], num_actions: int) -> Batch:
             returns=np.zeros((0,), dtype=np.float32),
             advantages=np.zeros((0,), dtype=np.float32),
             legal_mask=np.zeros((0, num_actions), dtype=bool),
+            players=np.zeros((0,), dtype=np.int8),
             num_actions=num_actions,
         )
     legal_mask = np.zeros((n, num_actions), dtype=bool)
@@ -89,6 +118,7 @@ def make_batch(transitions: Sequence[Transition], num_actions: int) -> Batch:
         returns=np.asarray([t.return_ for t in transitions], dtype=np.float32),
         advantages=np.asarray([t.advantage for t in transitions], dtype=np.float32),
         legal_mask=legal_mask,
+        players=np.asarray([t.player for t in transitions], dtype=np.int8),
         num_actions=num_actions,
     )
 
