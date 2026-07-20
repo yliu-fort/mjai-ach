@@ -45,6 +45,11 @@ class ExperimentConfig:
     eval_every_steps: int = 100
     seed: int = 0
     out_dir: str = "runs/default"
+    # When True, evaluate the current policy every ``eval_every_steps`` and
+    # append to train_curve.json. Required for the notebook's training-curve
+    # plots (AGENTS.md Fig 2 reproduction). Off by default to keep fast smoke
+    # runs cheap.
+    eval_during_training: bool = False
     # Algo + rollout + league sub-configs are built in code from these scalars
     # (kept flat here for YAML simplicity; richer configs can extend later).
     learning_rate: float = 0.1
@@ -129,6 +134,9 @@ def run_experiment(cfg: ExperimentConfig) -> Path:
 
     Snapshots the main policy to disk periodically, logs scalars to TensorBoard,
     and writes the full config as ``config.json`` at the start (AGENTS.md §9).
+    When ``cfg.eval_during_training`` is True, also evaluates the current policy
+    every ``eval_every_steps`` and appends to ``train_curve.json`` (used by the
+    notebook's training-curve plots — AGENTS.md Fig 2 reproduction).
     """
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)  # noqa: NPY002 -- global seed for any 3rd-party RNG pulls; intentional.
@@ -145,6 +153,8 @@ def run_experiment(cfg: ExperimentConfig) -> Path:
     (out_dir / "config.json").write_text(json.dumps(_cfg_to_dict(cfg), indent=2))
 
     writer = SummaryWriter(log_dir=str(out_dir / "tb"))
+    curve_path = out_dir / "train_curve.json"
+    curve_rows: list[dict[str, object]] = []
     step = 0
     for step in range(1, cfg.n_steps + 1):
         trainer.step()
@@ -153,9 +163,70 @@ def run_experiment(cfg: ExperimentConfig) -> Path:
             _log_stats(writer, step, stats)
         if step % cfg.save_every_steps == 0:
             _save_checkpoint(out_dir, spec, cfg, policy, step)
+        if cfg.eval_during_training and step % cfg.eval_every_steps == 0:
+            row = _eval_during_training(spec, policy, stats, step)
+            curve_rows.append(row)
+            _write_curve(curve_path, curve_rows)
+    if cfg.eval_during_training and (not curve_rows or curve_rows[-1]["step"] != step):
+        curve_rows.append(_eval_during_training(spec, policy, stats, step))
+        _write_curve(curve_path, curve_rows)
     _save_checkpoint(out_dir, spec, cfg, policy, step)
     writer.close()
     return out_dir
+
+
+def _eval_during_training(
+    spec: GameSpec, policy: Policy, stats: UpdateStats | None, step: int
+) -> dict[str, object]:
+    """Compute equilibrium metrics + per-action BRPS probe for the curve row.
+
+    Failures inside the equilibrium evaluator are caught — we want a training
+    curve even when one metric isn't computable for a game.
+    """
+    import contextlib
+
+    row: dict[str, object] = {"step": step}
+    if stats is not None:
+        for k in (
+            "policy_loss",
+            "value_loss",
+            "entropy",
+            "approx_kl",
+            "clip_frac",
+            "explained_variance",
+        ):
+            v = getattr(stats, k, None)
+            if v is not None:
+                row[k] = float(v)
+    # Equilibrium metrics (best available for this game).
+    from mjai.eval.nash import evaluate_equilibrium
+
+    with contextlib.suppress(Exception):
+        row.update({f"eval/{k}": v for k, v in evaluate_equilibrium(spec, policy).items()})
+    # BRPS-specific probe: P(R), P(P), P(S) at the trivial observation, so the
+    # notebook can plot the policy trajectory (AGENTS.md Fig 1).
+    if spec.name == "brps":
+        with contextlib.suppress(Exception):
+            from mjai.eval.nash import distance_to_brps_nash
+
+            obs = [0.0]
+            legal = list(range(spec.num_actions))
+            logits = policy.action_logits(obs, legal)
+            import math
+
+            mx = max(logits)
+            exps = [math.exp(x - mx) for x in logits]
+            s = sum(exps) or 1.0
+            probs = [e / s for e in exps]
+            padded = [*probs, 0.0, 0.0, 0.0]
+            row["brps/P_R"], row["brps/P_P"], row["brps/P_S"] = padded[:3]
+            row["brps/nash_distance"] = distance_to_brps_nash(policy, num_actions=spec.num_actions)
+    return row
+
+
+def _write_curve(path: Path, rows: list[dict[str, object]]) -> None:
+    """Persist the training-curve rows as JSON (overwritten each eval)."""
+    path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
 
 
 def _log_stats(writer: SummaryWriter, step: int, stats: UpdateStats) -> None:

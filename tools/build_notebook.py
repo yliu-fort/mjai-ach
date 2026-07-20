@@ -1,9 +1,31 @@
-{
- "cells": [
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
+"""Regenerate notebooks/phase1_one_click.ipynb.
+
+Run: uv run python tools/build_notebook.py
+"""
+
+import json
+from pathlib import Path
+
+CELLS = []
+
+
+def md(*lines):
+    CELLS.append({"cell_type": "markdown", "metadata": {}, "source": list(lines)})
+
+
+def code(*lines):
+    CELLS.append(
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": list(lines),
+        }
+    )
+
+
+md(
     "# Phase-1 one-click experiment notebook\n",
     "\n",
     "Single parameterized entry point for the 2x2 Phase-1 experiment matrix\n",
@@ -11,19 +33,14 @@
     "the ACH 2022 ICLR paper's headline figures (Fig 1 BRPS trajectory, Fig 2\n",
     "equilibrium-distance curves) plus a set of league diagnostics.\n",
     "\n",
-    "**Output is layered** (AGENTS.md \u00a76): a few core figures are inlined here;\n",
+    "**Output is layered** (AGENTS.md §6): a few core figures are inlined here;\n",
     "per-game details (cross-play heatmaps, per-game training curves, forgetting\n",
     "curves) are written to `runs/<cell>/plots/` and shown as path links.\n",
     "\n",
-    "Imports from `mjai.*`; does not reimplement logic."
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
+    "Imports from `mjai.*`; does not reimplement logic.",
+)
+
+code(
     "# === Parameters ===\n",
     "# Set RUN_ALL_MATRIX=True to sweep all 28 cells. QUICK=True picks 3 representative\n",
     "# games + short steps for a fast (<5 min on CPU) end-to-end demo of every plot.\n",
@@ -50,15 +67,10 @@
     "from mjai.agents.ckpt_io import discover_checkpoints\n",
     "from mjai.config.game_config import load_all_game_configs\n",
     "print('Available games:', sorted(load_all_game_configs().keys()))\n",
-    "print('QUICK:', QUICK, '| RUN_ALL_MATRIX:', RUN_ALL_MATRIX)"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
+    "print('QUICK:', QUICK, '| RUN_ALL_MATRIX:', RUN_ALL_MATRIX)",
+)
+
+code(
     "# === Build the cell list ===\n",
     "ALL_GAMES = ['brps', 'kuhn', 'leduc', 'liars_dice1', 'goofspiel5_ii', 'oshi_zumo', 'ttt']\n",
     "ALGOS = ['ppo', 'ach']\n",
@@ -78,25 +90,16 @@
     "    cells = [(g, a, m) for g in ALL_GAMES for a in ALGOS for m in MODES]\n",
     "else:\n",
     "    cells = [(GAME, ALGO, SELF_PLAY)]\n",
-    "print(f'Will run {len(cells)} experiment(s); {N_STEPS_LOCAL} steps each; eval every {EVAL_EVERY} steps.')"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
+    "print(f'Will run {len(cells)} experiment(s); {N_STEPS_LOCAL} steps each; eval every {EVAL_EVERY} steps.')",
+)
+
+md(
     "## Train\n",
     "\n",
     "Every cell trains with `eval_during_training=True` so we get a `train_curve.json`\n",
-    "(required for the training-curve plots below)."
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
+    "(required for the training-curve plots below).",
+)
+code(
     "run_dirs = {}\n",
     "for game, algo, mode in cells:\n",
     "    cfg = ExperimentConfig(\n",
@@ -107,26 +110,17 @@
     "    )\n",
     "    print(f'\\n=== {game}/{algo}/{mode} ({N_STEPS_LOCAL} steps) ===')\n",
     "    run_dirs[(game, algo, mode)] = run_experiment(cfg)\n",
-    "print('\\nAll training complete.')"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
+    "print('\\nAll training complete.')",
+)
+
+md(
     "## Core figure 1 - Biased-RPS policy trajectory (paper Fig 1 reproduction)\n",
     "\n",
     "P(R)/P(P)/P(S) over training, with the analytic Nash (1/16, 10/16, 5/16)\n",
     "dashed. Two panels: PPO/mirror (expected to cycle) vs ACH/mirror (expected\n",
-    "to converge)."
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
+    "to converge).",
+)
+code(
     "fig, axes = plt.subplots(1, 2, figsize=(13, 4.5), sharey=True)\n",
     "for ax, (algo, mode) in zip(axes, [('ppo', 'mirror'), ('ach', 'mirror')]):\n",
     "    key = ('brps', algo, mode)\n",
@@ -138,25 +132,16 @@
     "                         save_path=plots_dir / 'fig1_trajectory.png')\n",
     "    plt.show()  # inline the standalone version too\n",
     "axes[0].set_ylabel('action probability')\n",
-    "print('Per-cell versions saved to runs/brps_*/plots/fig1_trajectory.png')"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
+    "print('Per-cell versions saved to runs/brps_*/plots/fig1_trajectory.png')",
+)
+
+md(
     "## Core figure 2 - Equilibrium-distance training curves (paper Fig 2)\n",
     "\n",
     "One panel per game. Within each panel, 4 lines = {PPO, ACH} x {mirror, league}.\n",
-    "y-axis is symlog (lower = closer to Nash)."
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
+    "y-axis is symlog (lower = closer to Nash).",
+)
+code(
     "games_run = sorted({g for (g, _, _) in run_dirs})\n",
     "n = len(games_run)\n",
     "ncols = min(3, n); nrows = (n + ncols - 1) // ncols\n",
@@ -178,24 +163,15 @@
     "for j in range(len(games_run), nrows * ncols):\n",
     "    axes[j // ncols][j % ncols].axis('off')\n",
     "fig.tight_layout()\n",
-    "plt.show()"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
+    "plt.show()",
+)
+
+md(
     "## Core figure 3 - Final 2x2 comparison bar chart (paper Tab 1 graphical)\n",
     "\n",
-    "Final equilibrium distance per cell, grouped by game. Lower bar = closer to Nash."
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
+    "Final equilibrium distance per cell, grouped by game. Lower bar = closer to Nash.",
+)
+code(
     "results = {}\n",
     "metric_name = 'exploitability'\n",
     "for (g, algo, mode), rd in run_dirs.items():\n",
@@ -209,24 +185,15 @@
     "            break\n",
     "fig = plot_final_metric_bars(results, games=games_run, metric_name=metric_name,\n",
     "                             save_path='runs/fig3_final_bars.png')\n",
-    "plt.show()"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
+    "plt.show()",
+)
+
+md(
     "## Core figure 4 - Final 2x2 comparison TABLE (paper Tab 1 format)\n",
     "\n",
-    "Same data as the bar chart, in a pivot table; best cell per game is highlighted."
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
+    "Same data as the bar chart, in a pivot table; best cell per game is highlighted.",
+)
+code(
     "import pandas as pd\n",
     "df = pd.DataFrame([{'game': g, 'algo': a, 'mode': m, metric_name: v}\n",
     "                   for (g, a, m), v in results.items()])\n",
@@ -237,25 +204,16 @@
     "        return ['background-color: #cfc' if b else '' for b in is_best]\n",
     "    display(pivot.style.apply(_hl, axis=1).format('{:.4g}'))  # noqa\n",
     "else:\n",
-    "    print('no results')"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
+    "    print('no results')",
+)
+
+md(
     "## Detail figures - per-cell cross-play heatmap + forgetting curve\n",
     "\n",
-    "These are written to `runs/<cell>/plots/` (AGENTS.md \u00a76). The links below\n",
-    "point at each file."
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
+    "These are written to `runs/<cell>/plots/` (AGENTS.md §6). The links below\n",
+    "point at each file.",
+)
+code(
     "from mjai.eval.crossplay import cross_play_matrix, nontransitivity_score\n",
     "from mjai.games.loader import load_game\n",
     "from mjai.pipeline.rollout import RolloutConfig, RolloutWorkerCore\n",
@@ -285,13 +243,10 @@
     "for label, hm, fg, nt in links:\n",
     "    print(f'{label}  (nontransitivity={nt:.3g})')\n",
     "    print(f'  cross-play heatmap: {hm}')\n",
-    "    print(f'  forgetting curve:   {fg}')"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
+    "    print(f'  forgetting curve:   {fg}')",
+)
+
+md(
     "## Interpretation\n",
     "\n",
     "(No automated reasoning - read the figures and judge. Pointers below.)\n",
@@ -306,21 +261,20 @@
     "- **Detail heatmaps**: visible off-diagonal structure = non-transitive;\n",
     "  near-antisymmetric = strong RPS-style cycling.\n",
     "\n",
-    "Artifacts: every figure is also saved under `runs/<cell>/plots/`."
-   ]
-  }
- ],
- "metadata": {
-  "kernelspec": {
-   "display_name": "Python 3",
-   "language": "python",
-   "name": "python3"
-  },
-  "language_info": {
-   "name": "python",
-   "version": "3.12"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 5
+    "Artifacts: every figure is also saved under `runs/<cell>/plots/`.",
+)
+
+nb = {
+    "cells": CELLS,
+    "metadata": {
+        "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+        "language_info": {"name": "python", "version": "3.12"},
+    },
+    "nbformat": 4,
+    "nbformat_minor": 5,
 }
+
+out = Path("notebooks/phase1_one_click.ipynb")
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text(json.dumps(nb, indent=1), encoding="utf-8")
+print(f"wrote {out} ({len(CELLS)} cells)")
