@@ -157,6 +157,14 @@ ignore_missing_imports = true
 module = ["torch.*"]
 ignore_missing_imports = true
 
+# pipeline._ray builds Ray actor classes dynamically inside factory functions;
+# the @ray.remote decorator produces objects whose methods mypy can't type-check
+# meaningfully. The module is exercised only on a live Ray cluster (marked
+# pragma: no cover); its typed surface is the Ray-free LocalIMPALARunner below.
+[[tool.mypy.overrides]]
+module = "mjai.pipeline._ray"
+disable_error_code = ["no-untyped-def", "no-untyped-call"]
+
 # -----------------------------------------------------------------------------
 
 # import-linter: enforce the layering in AGENTS.md §2.
