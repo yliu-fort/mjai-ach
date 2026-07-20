@@ -1,0 +1,85 @@
+# Pre-commit gates per AGENTS.md.
+# - commit (fast, ~15s): ruff, line-count guard, import-linter layers, mypy strict,
+#   fast unit suite (TTT + Kuhn tabular, CPU-only).
+# - push (slower): full unit suite + integration smoke (BRPS + Goofspiel) + tracemalloc leak check.
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.6
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        # importlinter config + game configs use yaml; the pytorch index block in
+        # pyproject is toml, not yaml, so it's fine here.
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: debug-statements
+      - id: requirements-txt-fixer
+
+  # AST line-count guard (AGENTS.md §3 rule 1). Local hook, no network.
+  - repo: local
+    hooks:
+      - id: file-length
+        name: AST line-count guard (<500 lines)
+        entry: uv run python tools/check_file_length.py --max 500
+        language: system
+        types: [python]
+        pass_filenames: true
+
+      - id: import-linter
+        name: import-linter (layered architecture)
+        entry: uv run lint-imports
+        # entry above is for the uv-managed env; when running outside uv the
+        # binary is `lint-imports` (hyphen, not the module name lint_imports).
+        language: system
+        pass_filenames: false
+        files: ^src/
+
+      - id: mypy
+        name: mypy (strict)
+        entry: uv run mypy src
+        language: system
+        pass_filenames: false
+        files: ^src/
+
+      # Fast unit suite: CPU-only, no GPU/Ray/slow markers. Must stay <20s.
+      - id: pytest-fast
+        name: pytest fast unit suite
+        entry: uv run pytest tests/unit -m "not gpu and not slow and not ray"
+        language: system
+        pass_filenames: false
+        files: ^(src|tests)/
+
+# -----------------------------------------------------------------------------
+# Pre-push stage: full unit suite + integration smoke (BRPS + Goofspiel-5).
+# Activated by `uv run pre-commit install --hook-type pre-push` after clone.
+# Runs only on push, so it can afford the slower tests.
+  - repo: local
+    hooks:
+      - id: pytest-unit-full
+        name: pytest full unit suite
+        entry: uv run pytest tests/unit -m "not gpu"
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+        files: ^(src|tests)/
+
+      - id: pytest-integration
+        name: pytest integration smoke (BRPS + Goofspiel)
+        entry: uv run pytest tests/integration -m "not gpu"
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+
+# Guard against default_stage drift: ensure the commit stage stays the default.
+default_install_hook_types: [pre-commit, pre-push]

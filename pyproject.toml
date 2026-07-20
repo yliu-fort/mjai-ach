@@ -1,0 +1,207 @@
+[project]
+name = "mjai-ach"
+version = "0.1.0"
+description = "IMPALA-style PPO/ACH + league-play research pipeline for imperfect-information games"
+readme = "AGENTS.md"
+requires-python = "==3.12.*"
+license = { text = "MIT" }
+authors = [{ name = "mjai-ach contributors" }]
+
+# Runtime deps are pinned loosely at the major boundary; uv.lock freezes exact versions.
+# Rationale per AGENTS.md D7: Python is fixed at 3.12.*; the rest is locked via uv.lock.
+dependencies = [
+    # Numerics / tensors (D1: PyTorch). CUDA 12.8 wheel is selected by the index URL
+    # in [tool.uv.sources] / [tool.uv] below — installs the cu128 build.
+    "torch>=2.5,<3",
+    "numpy>=1.26,<3",
+    # Game environments (D8): all 7 games live in OpenSpiel.
+    "open-spiel>=2.0.1,<3",
+    # IMPALA-style distributed execution (D2: Ray). Core logic is Ray-free; this
+    # drives the worker/learner/hub actors.
+    "ray[default]>=2.40,<3",
+    # Config: YAML -> frozen dataclasses via cattrs.
+    "cattrs>=23.2,<25",
+    "pyyaml>=6.0,<7",
+    # Logging (D9: TensorBoard ONLY).
+    "tensorboard>=2.18,<3",
+    # Play CLI (D10) backend: rich for panels/tables/color; stdlib input() for prompts.
+    "rich>=13.7,<14",
+    # Small helpers.
+    "tqdm>=4.66,<5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.7,<1",
+    "mypy>=1.13,<2",
+    "import-linter>=2.1,<3",
+    "pytest>=8.3,<9",
+    "pytest-cov>=5,<7",
+    "pre-commit>=4.0,<5",
+    # Notebook execution (used to validate the one-click notebook from CLI).
+    "jupyter>=1.1,<2",
+    "ipykernel>=6.29,<7",
+]
+
+[project.scripts]
+# D10: one-command launch of the play CLI.
+mjai-play = "mjai.cli.main:main"
+# Convenience entrypoints for training and evaluation.
+mjai-train = "mjai.scripts.train:main"
+mjai-eval = "mjai.scripts.evaluate:main"
+
+# -----------------------------------------------------------------------------
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mjai"]
+
+# -----------------------------------------------------------------------------
+
+# Source layout: src/mjai/ is the import root.
+[tool.setuptools]
+# kept for tooling that reads it; hatchling is the actual backend.
+package-dir = { "" = "src" }
+
+# -----------------------------------------------------------------------------
+
+# CUDA 12.8 wheel index for torch (D6: GPU by default, no silent degradation).
+# uv will resolve torch from this index. Falls back to PyPI for non-torch deps.
+[tool.uv]
+# We do NOT set an index here unconditionally — torch's cu128 wheels live at the
+# pytorch index below; everything else comes from PyPI.
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+# -----------------------------------------------------------------------------
+
+# Ruff: lint + format in one tool. Config lives here so editor integrations match CI.
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "scripts"]
+extend-exclude = ["notebooks"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes (unused, undefined, etc.)
+    "I",        # isort
+    "B",        # bugbear
+    "UP",       # pyupgrade
+    "C4",       # comprehensions
+    "SIM",      # simplify
+    "PL",       # pylint subset
+    "RUF",      # ruff-specific
+    "PTH",      # use pathlib
+    "NPY",      # numpy
+]
+ignore = [
+    "E501",     # line length handled by formatter
+    "PLR0913",  # too-many-arguments (we prefer explicit over *args)
+    "PLR2004",  # magic-value-in-comparison (tests use literals)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["PLR2004", "S101"]  # asserts + magic values fine in tests
+"scripts/**" = ["T201"]           # print is fine in scripts
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+# -----------------------------------------------------------------------------
+
+# mypy: strict. Type errors are bugs.
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+packages = ["mjai"]
+strict = true
+warn_return_any = true
+warn_unreachable = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_reexport = true
+exclude = "^notebooks/"
+
+# OpenSpiel's pybind11 stubs are incomplete; be lenient only there.
+[[tool.mypy.overrides]]
+module = ["pyspiel.*", "open_spiel.*"]
+ignore_missing_imports = true
+
+# Ray's type stubs are partial.
+[[tool.mypy.overrides]]
+module = ["ray.*"]
+ignore_missing_imports = true
+
+# torch ships without inline type stubs; mypy can't introspect C++ extensions.
+[[tool.mypy.overrides]]
+module = ["torch.*"]
+ignore_missing_imports = true
+
+# -----------------------------------------------------------------------------
+
+# import-linter: enforce the layering in AGENTS.md §2.
+[tool.importlinter]
+root_package = "mjai"
+
+[[tool.importlinter.contracts]]
+name = "Layered architecture"
+type = "layers"
+layers = [
+    "mjai.cli",
+    "mjai.pipeline",
+    "mjai.eval",
+    "mjai.league",
+    "mjai.algos",
+    "mjai.config",
+    "mjai.games | mjai.agents",
+    "mjai.utils",
+]
+
+[[tool.importlinter.contracts]]
+name = "League does not depend on concrete algos"
+type = "forbidden"
+source_modules = ["mjai.league"]
+forbidden_modules = [
+    "mjai.algos.ppo",
+    "mjai.algos.ach",
+    "mjai.algos.trainer",
+    "mjai.algos.baselines",
+]
+
+[[tool.importlinter.contracts]]
+name = "CLI is a leaf — nothing imports it"
+type = "forbidden"
+source_modules = ["mjai.pipeline", "mjai.eval", "mjai.league", "mjai.algos", "mjai.games", "mjai.agents", "mjai.config", "mjai.utils"]
+forbidden_modules = ["mjai.cli"]
+
+# -----------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+minversion = "8.3"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "gpu: tests that require a CUDA device (skipped without one)",
+    "slow: tests that take more than a few seconds (excluded from fast suite)",
+    "ray: tests that spin up a Ray cluster (excluded from fast suite)",
+]
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning:ray.*",
+    "ignore::DeprecationWarning:tensorboard.*",
+]
