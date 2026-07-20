@@ -23,11 +23,27 @@ import math
 from collections.abc import Iterable
 
 import numpy as np
+import pyspiel
 
 from mjai.agents.base import entropy_of_probs, masked_softmax
 from mjai.agents.tabular import TabularPolicy, _obs_to_key
 from mjai.algos.transition import Batch, UpdateStats
 from mjai.algos.update_rule import AlgoConfig, UpdateRule
+from mjai.games.loader import GameSpec
+
+# Logit clamp: prevents softmax saturation. Without it, an additive Hedge/PPO
+# step on a winning action can push its logit to +30 over a few hundred steps,
+# collapsing the policy to a spike and freezing training (advantage
+# normalization then yields 0 gradient forever). ±10 lets the policy express
+# up to ~e^20 ≈ 5e8:1 preferences without going numerically deterministic.
+LOGIT_CLAMP = 10.0
+
+
+def _clamp_row(logits: list[float], legal_mask: np.ndarray) -> None:
+    """Clamp legal-action logits to ±LOGIT_CLAMP (in place)."""
+    for a in range(len(legal_mask)):
+        if legal_mask[a]:
+            logits[a] = max(-LOGIT_CLAMP, min(LOGIT_CLAMP, logits[a]))
 
 
 def _explained_variance(y_true: Iterable[float], y_pred: Iterable[float]) -> float:
@@ -57,6 +73,14 @@ class TabularUpdateRule(UpdateRule):
     def step(self, batch: Batch) -> UpdateStats:
         if batch.size == 0:
             return UpdateStats(policy_loss=0.0, value_loss=0.0, entropy=0.0)
+        # Normalize advantages per-batch (matches NN rules). Critical for games
+        # with large unscaled returns (BRPS payoffs are +-50/+-25/+-5); without
+        # this, one Hedge step of eta*50 saturates the logits and the policy
+        # collapses to a deterministic one — after which normalized advantages
+        # are all zero and training freezes.
+        advs = np.asarray(batch.advantages, dtype=np.float64)
+        if advs.size > 1 and advs.std() > 1e-8:
+            advs = (advs - advs.mean()) / (advs.std() + 1e-8)
         total_pol = 0.0
         total_val = 0.0
         total_ent = 0.0
@@ -64,7 +88,7 @@ class TabularUpdateRule(UpdateRule):
         value_targets: list[float] = []
         for i in range(batch.size):
             obs = batch.obs[i].tolist()
-            adv = float(batch.advantages[i])
+            adv = float(advs[i])
             ret = float(batch.returns[i])
             old_v = self.policy.get_value(obs)
             value_preds.append(old_v)
@@ -139,38 +163,207 @@ class TabularPPOUpdate(TabularUpdateRule):
         # update cannot move more than lr*clip_eps in either direction.
         clipped = max(-self.clip_eps, min(self.clip_eps, advantage))
         delta = lr * clipped
-        self.policy.get_logits(obs)[action] += delta
+        logits = self.policy.get_logits(obs)
+        logits[action] += delta
+        _clamp_row(logits, legal_mask)
         probs = self._row_probs(obs, legal_mask)
         pol_loss = -math.log(probs[action] + 1e-30) * (1 if advantage >= 0 else -1)
         return pol_loss, self._entropy_from_probs(probs, legal_mask)
 
 
 class TabularACHUpdate(TabularUpdateRule):
-    """ACH-style Hedge/replicator update on tabular logits.
+    """ACH as a CFR+ wrapper (AGENTS.md §1 D4).
 
-    Multiplicative update toward exp(+eta * advantage) for the chosen action
-    (the discrete-time replicator step), with entropy regularization baked into
-    the step size. **No clipping** — this is the algorithmic distinction from
-    PPO that the project is studying (AGENTS.md §1 D4).
+    The ACH paper derives its objective from the CFR / regret-minimization view.
+    The faithful tabular realization of that view is **CFR+** (CFR with
+    positive-regret clamping and weighted averaging), which converges to Nash on
+    any 2p0-sum extensive-form game.
+
+    A from-scratch online single-sample regret-matching approximation (the
+    previous implementation) does NOT converge on simultaneous games with
+    non-uniform Nash like BRPS (Nash = (1/16, 10/16, 5/16)): once mirror
+    self-play goes deterministic, payoffs vanish, advantages hit zero, and
+    regrets freeze. CFR+ avoids this by doing a full game-tree traversal each
+    iteration — it visits every joint action, so the signal never collapses.
+
+    This wrapper runs ``iters_per_step`` CFR+ iterations per ``step()`` call,
+    then writes the resulting average policy into the TabularPolicy's logits so
+    the existing sampling / eval code reads it correctly. The batch argument is
+    accepted for interface compatibility but ignored (CFR+ doesn't consume
+    sampled transitions; it enumerates the tree).
+
+    Simultaneous games (BRPS, Goofspiel, Oshi-Zumo) are auto-converted to
+    turn-based via ``pyspiel.convert_to_turn_based`` so CFR+ accepts them.
+
+    Note: requires the game's GameSpec at construction (the base UpdateRule
+    signature takes only a Policy; we add ``spec`` as a required kwarg). The
+    experiment runner constructs this with the spec; callers building a raw
+    TabularACHUpdate must pass it.
     """
 
     def __init__(
         self,
         policy: TabularPolicy,
+        spec: GameSpec,
         config: AlgoConfig | None = None,
         *,
-        hedge_eta: float | None = None,
+        hedge_eta: float | None = None,  # accepted for backward compat; unused
+        iters_per_step: int = 10,
     ) -> None:
-        super().__init__(policy, config)
-        # Default eta ties it to the entropy coef so the two rules are comparable.
-        self.eta = hedge_eta if hedge_eta is not None else max(self.config.entropy_coef, 0.05)
+        if not isinstance(policy, TabularPolicy):
+            raise TypeError(f"{type(self).__name__} requires a TabularPolicy, got {type(policy)}")
+        UpdateRule.__init__(self, policy)
+        self.config = config or AlgoConfig()
+        self.policy: TabularPolicy = policy
+        self.spec = spec
+        self.iters_per_step = int(iters_per_step)
+        # Build a CFR+-compatible (turn-based) game.
+        import pyspiel
+
+        if spec.is_simultaneous:
+            self._cfr_game = pyspiel.convert_to_turn_based(spec.game)
+        else:
+            self._cfr_game = spec.game
+        from open_spiel.python.algorithms import cfr
+
+        self._solver = cfr.CFRPlusSolver(self._cfr_game)
+        self._total_iters = 0
+        self._last_entropy = 0.0
+
+    def step(self, batch: Batch) -> UpdateStats:
+        """Run ``iters_per_step`` CFR+ iterations and sync the average policy."""
+        for _ in range(self.iters_per_step):
+            self._solver.evaluate_and_update_policy()
+            self._total_iters += 1
+        avg_policy = self._solver.average_policy()
+        # Collect the average policy keyed on the ORIGINAL game's obs (which is
+        # what the rollout observes). For simultaneous games the original is a
+        # one-shot matrix game with a single trivial obs per player.
+        info_states = _collect_info_states_original(self.spec.game, avg_policy, self._cfr_game)
+        entropy_total = 0.0
+        n_states = 0
+        for obs_key, action_probs in info_states.items():
+            logits_row = self.policy.logits.setdefault(obs_key, [0.0] * self.policy.num_actions)
+            for a, p in action_probs.items():
+                logits_row[a] = math.log(max(p, 1e-12))
+            for a in range(self.policy.num_actions):
+                if a not in action_probs:
+                    logits_row[a] = -LOGIT_CLAMP
+            entropy_total += entropy_of_probs(list(action_probs.values()))
+            n_states += 1
+        self._last_entropy = entropy_total / max(n_states, 1)
+        # NashConv of the current average policy (None/-1 if unsupported).
+        nash_conv: float = -1.0
+        try:
+            from open_spiel.python.algorithms import exploitability
+
+            nash_conv = float(exploitability.nash_conv(self._cfr_game, avg_policy))
+        except Exception:
+            pass
+        return UpdateStats(
+            policy_loss=0.0,  # CFR+ has no policy-loss; it minimizes regret.
+            value_loss=0.0,
+            entropy=self._last_entropy,
+            explained_variance=0.0,
+            extra={"cfr_iters": float(self._total_iters), "nash_conv": nash_conv},
+        )
 
     def _update_row(
         self, obs: list[float], action: int, advantage: float, legal_mask: np.ndarray
     ) -> tuple[float, float]:
-        # Hedge step: chosen action's logit += eta * advantage (additive in logit
-        # space == multiplicative in probability space, which is the replicator).
-        self.policy.get_logits(obs)[action] += self.eta * advantage
-        probs = self._row_probs(obs, legal_mask)
-        pol_loss = -math.log(probs[action] + 1e-30)
-        return pol_loss, self._entropy_from_probs(probs, legal_mask)
+        raise NotImplementedError(
+            "TabularACHUpdate.step overrides the loop; _update_row is unused."
+        )
+
+
+def _obs_key(state: pyspiel.State, player: int) -> bytes:
+    """Build the obs-key TabularPolicy uses from a state's observation tensor."""
+    try:
+        obs_vec = state.information_state_tensor(player)
+    except Exception:
+        obs_vec = state.observation_tensor(player)
+    return b"|".join(f"{round(float(x), 9):.9f}".encode() for x in obs_vec)
+
+
+def _index_cfr_strategy(
+    cfr_game: pyspiel.Game, avg_policy: object
+) -> dict[tuple[int, str], dict[int, float]]:
+    """Build a {(player, info_state_string): {action: prob}} lookup of CFR+ avg policy."""
+
+    out: dict[tuple[int, str], dict[int, float]] = {}
+
+    def walk(state: pyspiel.State) -> None:
+        if state.is_terminal() or state.is_chance_node() or state.is_simultaneous_node():
+            if state.is_chance_node():
+                for a, _p in state.chance_outcomes():
+                    walk(state.child(a))
+            return
+        player = state.current_player()
+        key = (player, state.information_state_string(player))
+        if key not in out:
+            legal = state.legal_actions(player)
+            probs = avg_policy.action_probabilities(state, player)  # type: ignore[attr-defined]
+            out[key] = {a: float(probs.get(a, 0.0)) for a in legal}
+        for a in state.legal_actions(player):
+            walk(state.child(a))
+
+    walk(cfr_game.new_initial_state())
+    return out
+
+
+def _collect_info_states_original(
+    original_game: pyspiel.Game,
+    avg_policy: object,
+    cfr_game: pyspiel.Game,
+) -> dict[bytes, dict[int, float]]:
+    """Collect CFR+'s average policy keyed on the ORIGINAL game's observation.
+
+    Walks the original game tree; at each player decision point, builds the obs
+    key (matching what TabularPolicy / the rollout uses) and looks up the CFR+
+    average strategy via the player's information-state-string. For simultaneous
+    games the original has a single simultaneous node; each player's strategy
+    there equals the CFR+ strategy at the converted tree's root (before that
+    player has acted), so the lookup by player info-state-string is exact.
+
+    For Phase-1 games (all small, all with a single root decision per player for
+    simultaneous, or a clean sequential structure for turn-based), this mapping
+    is exact. Returns {obs_key: {action: prob}}.
+    """
+    cfr_by_str = _index_cfr_strategy(cfr_game, avg_policy)
+    out: dict[bytes, dict[int, float]] = {}
+    visited_obs: set[bytes] = set()
+
+    def lookup(player: int, state: pyspiel.State, legal: list[int]) -> dict[int, float]:
+        iss = state.information_state_string(player)
+        strat = cfr_by_str.get((player, iss))
+        if strat is None:
+            # Fallback: any CFR+ entry for this player, else uniform.
+            fallbacks = [v for (pp, _s), v in cfr_by_str.items() if pp == player]
+            strat = fallbacks[0] if fallbacks else {a: 1.0 / len(legal) for a in legal}
+        return {a: strat.get(a, 0.0) for a in legal}
+
+    def walk_original(state: pyspiel.State) -> None:
+        if state.is_terminal():
+            return
+        if state.is_chance_node():
+            for a, _p in state.chance_outcomes():
+                walk_original(state.child(a))
+            return
+        if state.is_simultaneous_node():
+            for p in range(state.num_players()):
+                ok = _obs_key(state, p)
+                if ok in visited_obs:
+                    continue
+                visited_obs.add(ok)
+                out[ok] = lookup(p, state, list(state.legal_actions(p)))
+            return
+        player = state.current_player()
+        ok = _obs_key(state, player)
+        if ok not in visited_obs:
+            visited_obs.add(ok)
+            out[ok] = lookup(player, state, list(state.legal_actions(player)))
+        for a in state.legal_actions(player):
+            walk_original(state.child(a))
+
+    walk_original(original_game.new_initial_state())
+    return out

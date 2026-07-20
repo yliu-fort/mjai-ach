@@ -11,7 +11,7 @@ from mjai.algos.controller import (
     RolloutRunnerProtocol,
     Trainer,
 )
-from mjai.algos.tabular_updates import TabularACHUpdate
+from mjai.algos.tabular_updates import TabularPPOUpdate
 from mjai.algos.transition import Batch, Transition, make_batch
 
 
@@ -67,7 +67,7 @@ def test_mirror_collect_before_set_learner_raises():
 
 def test_trainer_step_returns_round_summary():
     p = TabularPolicy(num_actions=2, seed=0)
-    rule = TabularACHUpdate(p)
+    rule = TabularPPOUpdate(p)
     ctrl = MirrorSelfPlay(_ScriptedRunner())
     trainer = Trainer(policy=p, update_rule=rule, controller=ctrl)
     round_ = trainer.step()
@@ -81,14 +81,12 @@ def test_trainer_step_actually_updates_policy():
     # Get a row reference for the only obs in the toy batch ([0.0, 0.0]).
     obs = [0.0, 0.0]
     before = p.get_logits(obs)[0]
-    rule = TabularACHUpdate(p, hedge_eta=1.0)
+    rule = TabularPPOUpdate(p, clip_eps=0.2)
     ctrl = MirrorSelfPlay(_ScriptedRunner())
     trainer = Trainer(policy=p, update_rule=rule, controller=ctrl)
     trainer.step()
     after = p.get_logits(obs)[0]
-    # Transition 0 has advantage -1.5 (0 - 1.5); action 0 was chosen.
-    # ACH: logit[0] += eta * adv = 1.0 * (-1.5) = -1.5; plus value updates are
-    # on a different row entirely. Net: the chosen-action logit must move.
+    # PPO moved the chosen-action logit by lr*clip(advantage).
     assert abs(after - before) > 0
 
 
@@ -97,7 +95,7 @@ def test_controller_set_learner_called_each_trainer_step():
     runner = _ScriptedRunner()
     ctrl = MirrorSelfPlay(runner)
     p = TabularPolicy(num_actions=2, seed=0)
-    trainer = Trainer(policy=p, update_rule=TabularACHUpdate(p), controller=ctrl)
+    trainer = Trainer(policy=p, update_rule=TabularPPOUpdate(p), controller=ctrl)
     trainer.step()
     trainer.step()
     assert len(runner.calls) == 2

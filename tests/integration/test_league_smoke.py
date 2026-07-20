@@ -48,7 +48,11 @@ def _build_trainer(rule_cls, **rule_kwargs):
 
     cfg = LeagueConfig(main_save_every_steps=2, capacity=8, promo_window=4)
     mgr = LeagueManager(main, make_policy, copy_weights, config=cfg)
-    rule = rule_cls(main, AlgoConfig(learning_rate=0.1), **rule_kwargs)
+    # ACH (CFR+ wrapper) requires the GameSpec; PPO doesn't.
+    if rule_cls is TabularACHUpdate:
+        rule = rule_cls(main, spec, AlgoConfig(learning_rate=0.1), **rule_kwargs)
+    else:
+        rule = rule_cls(main, AlgoConfig(learning_rate=0.1), **rule_kwargs)
     runner = RolloutWorkerCore(spec, learner_player=0, config=RolloutConfig(n_episodes=20, seed=42))
     ctrl = LeagueSelfPlay(mgr, runner, episodes_per_round=20)
     return Trainer(policy=main, update_rule=rule, controller=ctrl), mgr, main

@@ -19,9 +19,11 @@ dependencies = [
     # IMPALA-style distributed execution (D2: Ray). Core logic is Ray-free; this
     # drives the worker/learner/hub actors.
     "ray[default]>=2.40,<3",
-    # Config: YAML -> frozen dataclasses via cattrs.
-    "cattrs>=23.2,<25",
-    "pyyaml>=6.0,<7",
+# Config: YAML -> frozen dataclasses via cattrs.
+"cattrs>=23.2,<25",
+"pyyaml>=6.0,<7",
+# Notebook pivot tables / result frames.
+"pandas>=2.2,<4",
     # Logging (D9: TensorBoard ONLY).
     "tensorboard>=2.18,<3",
     # Play CLI (D10) backend: rich for panels/tables/color; stdlib input() for prompts.

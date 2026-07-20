@@ -62,6 +62,8 @@ def main(argv: list[str] | None = None) -> int:
     import dataclasses
 
     cfg = dataclasses.replace(cfg, **{k: v for k, v in overrides.items() if v is not None})
+    # CLI always shows live progress.
+    cfg = dataclasses.replace(cfg, verbose=True)
 
     print(
         f"mjai-train: {cfg.game}/{cfg.algo}/{cfg.self_play_mode} for {cfg.n_steps} steps -> {cfg.out_dir}"

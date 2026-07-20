@@ -37,7 +37,11 @@ def _cpu_mode():
 def _build_trainer(rule_cls, **rule_kwargs):
     spec = load_game("brps")
     policy = TabularPolicy(num_actions=spec.num_actions, seed=0, temperature=1.0)
-    rule = rule_cls(policy, AlgoConfig(learning_rate=0.1, value_coef=0.5), **rule_kwargs)
+    # ACH (CFR+ wrapper) requires the GameSpec; PPO doesn't.
+    if rule_cls is TabularACHUpdate:
+        rule = rule_cls(policy, spec, AlgoConfig(learning_rate=0.1, value_coef=0.5), **rule_kwargs)
+    else:
+        rule = rule_cls(policy, AlgoConfig(learning_rate=0.1, value_coef=0.5), **rule_kwargs)
     worker = RolloutWorkerCore(spec, learner_player=0, config=RolloutConfig(n_episodes=50, seed=42))
     controller = MirrorSelfPlay(worker)
     return Trainer(policy=policy, update_rule=rule, controller=controller), policy
@@ -115,7 +119,7 @@ def test_kuhn_mirror_loop_runs():
     """Smoke: the loop also runs on a turn-based game (Kuhn)."""
     spec = load_game("kuhn")
     policy = TabularPolicy(num_actions=spec.num_actions, seed=0, temperature=1.0)
-    rule = TabularACHUpdate(policy, AlgoConfig(learning_rate=0.05), hedge_eta=0.2)
+    rule = TabularACHUpdate(policy, spec, AlgoConfig(learning_rate=0.05), hedge_eta=0.2)
     worker = RolloutWorkerCore(spec, config=RolloutConfig(n_episodes=100, seed=7))
     trainer = Trainer(policy=policy, update_rule=rule, controller=MirrorSelfPlay(worker))
     batch_sizes = []

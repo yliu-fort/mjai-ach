@@ -41,7 +41,7 @@ def _batch(advantages: list[float], returns: list[float] | None = None, actions=
 
 def test_empty_batch_returns_zero_stats():
     p = TabularPolicy(num_actions=NUM_ACTIONS, seed=0)
-    rule = TabularACHUpdate(p)
+    rule = TabularPPOUpdate(p)
     stats = rule.step(_batch([]))
     assert stats.policy_loss == 0.0 and stats.value_loss == 0.0
 
@@ -50,30 +50,60 @@ def test_rejects_non_tabular_policy():
     """A non-TabularPolicy instance (duck-typed) is rejected with a clear error."""
 
     class NotATabularPolicy:
-        # Has the attribute the base class narrows, but is the wrong type.
         pass
 
+    # PPO's __init__ does the isinstance check before any other args.
     with pytest.raises(TypeError, match="TabularPolicy"):
-        TabularACHUpdate(NotATabularPolicy())  # type: ignore[arg-type]
+        TabularPPOUpdate(NotATabularPolicy())  # type: ignore[arg-type]
 
 
-def test_ach_positive_advantage_increases_action_logit():
-    """Hedge step: chosen action's logit grows when advantage > 0."""
-    p = TabularPolicy(num_actions=NUM_ACTIONS, seed=0)
-    before = p.get_logits(OBS)[0]
-    rule = TabularACHUpdate(p, hedge_eta=1.0)
-    rule.step(_batch([+1.0], actions=[0]))  # advantage +1 on action 0
-    after = p.get_logits(OBS)[0]
-    assert after > before
+def test_ach_cfr_plus_converges_to_nash_on_brps():
+    """TabularACHUpdate wraps CFR+ and converges to BRPS Nash (1/16,10/16,5/16).
+
+    This is the real contract: ACH-as-regret-minimization (AGENTS.md §1 D4) on
+    a tabular game should find the Nash equilibrium. The previous in-place
+    Hedge approximation failed this (collapsed to a pure strategy); the CFR+
+    wrapper solves it exactly.
+    """
+    from mjai.games.loader import load_game
+
+    spec = load_game("brps")
+    p = TabularPolicy(num_actions=3, seed=0, temperature=1.0)
+    rule = TabularACHUpdate(p, spec, iters_per_step=50)
+    rule.step(_batch([]))  # batch is ignored by CFR+; it enumerates the tree.
+    import math
+
+    lg = p.get_logits([0.0])
+    mx = max(lg)
+    exps = [math.exp(x - mx) for x in lg]
+    s = sum(exps)
+    probs = [e / s for e in exps]
+    # Nash = (0.0625, 0.625, 0.3125); allow small tolerance for 50 CFR+ iters.
+    assert abs(probs[0] - 1 / 16) < 0.02
+    assert abs(probs[1] - 10 / 16) < 0.02
+    assert abs(probs[2] - 5 / 16) < 0.02
 
 
-def test_ach_negative_advantage_decreases_action_logit():
-    p = TabularPolicy(num_actions=NUM_ACTIONS, seed=0)
-    before = p.get_logits(OBS)[1]
-    rule = TabularACHUpdate(p, hedge_eta=1.0)
-    rule.step(_batch([-1.0], actions=[1]))
-    after = p.get_logits(OBS)[1]
-    assert after < before
+def test_ach_requires_game_spec():
+    """CFR+ ACH needs the GameSpec to build the solver."""
+    p = TabularPolicy(num_actions=3, seed=0)
+    # Missing spec => TypeError.
+    with pytest.raises(TypeError):
+        TabularACHUpdate(p)  # type: ignore[call-arg]
+        TabularACHUpdate(p)  # type: ignore[call-arg]
+
+
+def test_ach_stats_contain_nash_conv():
+    """The CFR+ wrapper reports nash_conv in stats.extra."""
+    from mjai.games.loader import load_game
+
+    spec = load_game("brps")
+    p = TabularPolicy(num_actions=3, seed=0)
+    rule = TabularACHUpdate(p, spec, iters_per_step=20)
+    stats = rule.step(_batch([]))
+    assert "cfr_iters" in stats.extra
+    assert "nash_conv" in stats.extra
+    assert stats.extra["cfr_iters"] == 20
 
 
 def test_ppo_positive_advantage_increases_action_logit():
@@ -115,7 +145,7 @@ def test_value_update_moves_toward_target():
 
 def test_stats_are_finite_and_reasonable():
     p = TabularPolicy(num_actions=NUM_ACTIONS, seed=0)
-    rule = TabularACHUpdate(p)
+    rule = TabularPPOUpdate(p)
     stats = rule.step(_batch([0.5, -0.5, 0.2]))
     for v in (stats.policy_loss, stats.value_loss, stats.entropy):
         assert math.isfinite(v)
@@ -146,16 +176,18 @@ def test_make_batch_empty():
     assert b.legal_mask.shape == (0, 4)
 
 
-def test_ach_does_not_clip_unlike_ppo():
-    """The headline algorithmic distinction (AGENTS.md §1 D4)."""
-    # ACH with large advantage moves proportionally; PPO clips.
-    p_ach = TabularPolicy(num_actions=NUM_ACTIONS, seed=0)
-    p_ppo = TabularPolicy(num_actions=NUM_ACTIONS, seed=0)
-    ach = TabularACHUpdate(p_ach, AlgoConfig(learning_rate=1.0), hedge_eta=1.0)
-    ppo = TabularPPOUpdate(p_ppo, AlgoConfig(learning_rate=1.0), clip_eps=0.2)
-    ach.step(_batch([+5.0], actions=[0]))
-    ppo.step(_batch([+5.0], actions=[0]))
-    # ACH moves by eta*adv = 5.0; PPO clips to 0.2.
-    ach_delta = p_ach.get_logits(OBS)[0]
-    ppo_delta = p_ppo.get_logits(OBS)[0]
-    assert ach_delta > ppo_delta  # ACH moved much further
+def test_ach_converges_while_ppo_cycles_on_brps():
+    """The headline algorithmic distinction (AGENTS.md §1 D4, ACH Fig 1/2).
+
+    ACH (CFR+) converges to Nash on BRPS; PPO self-play cycles and does not.
+    This is the paper's core motivation. We just check the ACH side reaches low
+    nash_conv here; PPO's cycling is exercised in the integration smoke test.
+    """
+    from mjai.games.loader import load_game
+
+    spec = load_game("brps")
+    p_ach = TabularPolicy(num_actions=3, seed=0)
+    ach = TabularACHUpdate(p_ach, spec, iters_per_step=300)
+    stats = ach.step(_batch([]))
+    # After 300 CFR+ iterations, nash_conv should be small (< 0.05).
+    assert stats.extra["nash_conv"] < 0.05

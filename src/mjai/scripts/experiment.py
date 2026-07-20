@@ -43,6 +43,9 @@ class ExperimentConfig:
     episodes_per_round: int = 50
     save_every_steps: int = 100
     eval_every_steps: int = 100
+    # When True, run_experiment prints per-step training stats and per-eval
+    # equilibrium metrics so the notebook / CLI shows live progress.
+    verbose: bool = False
     seed: int = 0
     out_dir: str = "runs/default"
     # When True, evaluate the current policy every ``eval_every_steps`` and
@@ -75,14 +78,16 @@ def build_policy(spec: GameSpec, cfg: ExperimentConfig, *, seed: int) -> Policy:
     raise ValueError(f"Unknown policy_kind: {cfg.policy_kind}")
 
 
-def build_update_rule(policy: Policy, cfg: ExperimentConfig) -> UpdateRule:
-    """Construct the configured UpdateRule on ``policy``."""
+def build_update_rule(policy: Policy, cfg: ExperimentConfig, spec: GameSpec) -> UpdateRule:
+    """Construct the configured UpdateRule on ``policy`` for ``spec``."""
     algo_cfg = AlgoConfig(learning_rate=cfg.learning_rate, entropy_coef=cfg.entropy_coef)
     if cfg.policy_kind == "tabular":
         if cfg.algo == "ppo":
             return TabularPPOUpdate(policy, algo_cfg, clip_eps=cfg.clip_eps)  # type: ignore[arg-type]
         if cfg.algo == "ach":
-            return TabularACHUpdate(policy, algo_cfg, hedge_eta=cfg.hedge_eta)  # type: ignore[arg-type]
+            # TabularACHUpdate wraps CFR+ (AGENTS.md §1 D4) and needs the game
+            # spec to build the solver.
+            return TabularACHUpdate(policy, spec, algo_cfg, hedge_eta=cfg.hedge_eta)  # type: ignore[arg-type]
     elif cfg.policy_kind == "mlp":
         from mjai.algos.nn_updates import NNACHUpdate, NNPPOUpdate
 
@@ -144,7 +149,7 @@ def run_experiment(cfg: ExperimentConfig) -> Path:
 
     spec = load_game(cfg.game)
     policy = build_policy(spec, cfg, seed=cfg.seed)
-    rule = build_update_rule(policy, cfg)
+    rule = build_update_rule(policy, cfg, spec)
     controller = build_controller(spec, policy, cfg, rng=rng)
     trainer = Trainer(policy=policy, update_rule=rule, controller=controller)
 
@@ -161,18 +166,60 @@ def run_experiment(cfg: ExperimentConfig) -> Path:
         stats = trainer.last_stats
         if stats:
             _log_stats(writer, step, stats)
+        if cfg.verbose and step % max(1, cfg.n_steps // 20) == 0:
+            _print_progress(cfg, step, stats)
         if step % cfg.save_every_steps == 0:
             _save_checkpoint(out_dir, spec, cfg, policy, step)
         if cfg.eval_during_training and step % cfg.eval_every_steps == 0:
             row = _eval_during_training(spec, policy, stats, step)
             curve_rows.append(row)
             _write_curve(curve_path, curve_rows)
+            if cfg.verbose:
+                _print_eval_row(row)
     if cfg.eval_during_training and (not curve_rows or curve_rows[-1]["step"] != step):
-        curve_rows.append(_eval_during_training(spec, policy, stats, step))
+        last_row = _eval_during_training(spec, policy, stats, step)
+        curve_rows.append(last_row)
         _write_curve(curve_path, curve_rows)
+        if cfg.verbose:
+            _print_eval_row(last_row)
     _save_checkpoint(out_dir, spec, cfg, policy, step)
     writer.close()
     return out_dir
+
+
+def _print_progress(cfg: ExperimentConfig, step: int, stats: UpdateStats | None) -> None:
+    """One-line training progress: step, losses, entropy (AGENTS.md §6 friendly)."""
+    if stats is None:
+        print(f"  [{cfg.game}/{cfg.algo}/{cfg.self_play_mode}] step {step}/{cfg.n_steps}")
+        return
+    parts = [
+        f"step {step}/{cfg.n_steps}",
+        f"pol_loss={stats.policy_loss:+.4f}",
+        f"val_loss={stats.value_loss:.4f}",
+        f"entropy={stats.entropy:.3f}",
+    ]
+    if stats.approx_kl:
+        parts.append(f"kl={stats.approx_kl:.4f}")
+    if stats.clip_frac:
+        parts.append(f"clip={stats.clip_frac:.2f}")
+    if stats.explained_variance:
+        parts.append(f"vR2={stats.explained_variance:.2f}")
+    print(f"  [{cfg.game}/{cfg.algo}/{cfg.self_play_mode}] " + " ".join(parts))
+
+
+def _print_eval_row(row: dict[str, object]) -> None:
+    """Pretty-print an eval row's equilibrium metrics + BRPS probe."""
+    bits = [f"step={row['step']}"]
+    for k in ("eval/exploitability", "eval/nash_conv", "eval/exact_nash_distance"):
+        if k in row:
+            bits.append(f"{k.removeprefix('eval/')}={float(row[k]):.4g}")  # type: ignore[arg-type]
+    if "brps/nash_distance" in row:
+        bits.append(f"brps_nash_d={float(row['brps/nash_distance']):.4g}")  # type: ignore[arg-type]
+        bits.append(
+            f"P(R,P,S)="
+            f"({float(row['brps/P_R']):.3f},{float(row['brps/P_P']):.3f},{float(row['brps/P_S']):.3f})"  # type: ignore[arg-type]
+        )
+    print("    eval: " + " ".join(bits))
 
 
 def _eval_during_training(
