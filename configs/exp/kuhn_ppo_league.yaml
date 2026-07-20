@@ -1,0 +1,16 @@
+# kuhn / ppo / league (one cell of the Phase-1 2x2 matrix).
+game: kuhn
+algo: ppo
+self_play_mode: league
+policy_kind: tabular
+n_steps: 1000
+episodes_per_round: 50
+save_every_steps: 200
+eval_every_steps: 200
+seed: 0
+out_dir: runs/kuhn_ppo_league
+learning_rate: 0.1
+entropy_coef: 0.01
+hedge_eta: null
+clip_eps: 0.2
+league_capacity: 16
