@@ -65,7 +65,7 @@ def _cuda_available() -> bool:
     when only the CPU helpers are needed.
     """
     try:
-        import torch  # noqa: PLC0415  -- lazy on purpose so `import mjai.utils` is cheap without torch.
+        import torch  # lazy on purpose so `import mjai.utils` is cheap without torch.
 
         return bool(torch.cuda.is_available())
     except ImportError as e:  # pragma: no cover - torch is a hard dep in practice

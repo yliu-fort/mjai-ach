@@ -110,6 +110,9 @@ ignore = [
     "PLR0913",  # too-many-arguments (we prefer explicit over *args)
     "PLR2004",  # magic-value-in-comparison (tests use literals)
     "B027",     # empty optional-override methods in ABCs (intentional hook pattern)
+    "PLC0415",  # deliberate lazy imports (gpu_assert avoids torch; baselines avoid
+                # heavy open_spiel solvers when only constants are needed). Each
+                # lazy import is documented at its call site.
 ]
 
 [tool.ruff.lint.per-file-ignores]
