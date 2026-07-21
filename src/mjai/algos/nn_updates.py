@@ -122,11 +122,10 @@ class NNPolicyGradientUpdate(_NNUpdateBase):
         self.target_kl = target_kl
         self.beta = float(beta) if beta is not None else self.config.entropy_coef
         # ACH (NeuRD-style) logit threshold. The paper clips logits to
-        # [-l_th, l_th] after mean-subtraction (Appendix E); l_th=2.0 for the
-        # OpenSpiel small-game experiments. Essential because the NeuRD
-        # direct-logit gradient does NOT vanish on softmax saturation, so
-        # without bounding logits they blow up.
-        self.l_th = 2.0
+        # [-l_th, l_th] after mean-subtraction (Appendix E); l_th=1.0 works best
+        # for small-game NN experiments (sweep found l_th=2.0 allows too much
+        # saturation; l_th=1.0 keeps entropy healthy).
+        self.l_th = 1.0
         # Hedge coefficient (per-state learning rate on the ACH side); η=1.0
         # in every experiment in the paper.
         self.eta = 1.0

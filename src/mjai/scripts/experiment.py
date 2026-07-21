@@ -55,8 +55,8 @@ class ExperimentConfig:
     eval_during_training: bool = False
     # Algo + rollout + league sub-configs are built in code from these scalars
     # (kept flat here for YAML simplicity; richer configs can extend later).
-    learning_rate: float = 0.1
-    entropy_coef: float = 0.01
+    learning_rate: float = 0.0001  # NN-tuned; tabular overrides at call site
+    entropy_coef: float = 0.05    # NN-tuned; sweep found ec=0.5 optimal for ACH
     hedge_eta: float | None = None  # ACH only
     clip_eps: float = 0.2  # PPO only
     league_capacity: int = 16
