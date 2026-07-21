@@ -72,15 +72,15 @@ def test_ppo_returns_finite_stats_after_step():
     assert stats.approx_kl >= 0.0
 
 
-def test_ach_leaves_kl_and_clip_at_zero():
-    """The ACH rule does not track PPO-specific diagnostics (AGENTS.md §1 D4)."""
+def test_ach_and_ppo_share_diagnostics_under_unified_update():
+    """Under the unified update both endpoints track kl + clip_frac (AGENTS.md
+    D4: PPO and ACH share all stabilizers; theta is the only difference)."""
     p = MLPSharedActorCritic(obs_size=4, num_actions=NUM_ACTIONS, seed=0)
     rule = NNACHUpdate(p, AlgoConfig(learning_rate=1e-3))
     stats = rule.step(_batch(8))
-    assert stats.approx_kl == 0.0
-    assert stats.clip_frac == 0.0
-    # ACH does populate the extra dict with advantage stats.
-    assert "adv_mean" in stats.extra
+    # Both endpoints report kl and clip_frac (the shared trust-region guards).
+    assert "theta" in stats.extra
+    assert stats.extra["theta"] == 1.0
 
 
 def test_ppo_step_changes_weights():
@@ -102,16 +102,22 @@ def test_ach_step_changes_weights():
     assert not torch.allclose(before, after)
 
 
-def test_constant_advantages_produce_zero_policy_gradient():
-    """Normalization zeroes identical advantages -> policy loss is ~0.
+def test_constant_advantages_ach_still_pulls_toward_uniform_via_entropy():
+    """Constant advantages -> the REINFORCE part is 0 (normalized away), but
+    ACH's entropy regularizer still contributes a non-zero policy loss pulling
+    the policy toward uniform (the replicator stabilizer). The shared entropy
+    *bonus* also applies. PPO (theta=0) under constant advantages has ratio*0
+    in its surrogate, so its policy_loss is just the shared -entropy_coef*H.
 
-    This documents the intended behavior: only the value head learns from a
-    constant-advantage batch; the policy gradient vanishes.
+    This documents the unified design: the difference between endpoints under
+    constant-advantage batches is exactly the ACH entropy regularizer term.
     """
     p = MLPSharedActorCritic(obs_size=4, num_actions=NUM_ACTIONS, seed=0)
-    rule = NNACHUpdate(p, AlgoConfig(learning_rate=1e-2))
+    rule = NNACHUpdate(p, AlgoConfig(learning_rate=1e-2, entropy_coef=0.01))
     stats = rule.step(_batch(8, advantages=[0.5] * 8))
-    assert abs(stats.policy_loss) < 1e-6
+    # REINFORCE part vanishes; the loss is dominated by -beta*H (small, negative).
+    assert stats.policy_loss < 0.0
+    assert abs(stats.policy_loss) < 0.1  # not a huge spike — bounded by entropy.
 
 
 def test_value_head_moves_toward_returns():

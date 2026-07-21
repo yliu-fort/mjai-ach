@@ -77,20 +77,50 @@ class _NNUpdateBase(UpdateRule):
             self.optimizer.load_state_dict(opt_state)
 
 
-class NNPPOUpdate(_NNUpdateBase):
-    """PPO: clipped surrogate + value MSE + entropy, multiple inner epochs."""
+class NNPolicyGradientUpdate(_NNUpdateBase):
+    """Unified PPO/ACH policy-gradient update (AGENTS.md D4).
+
+    PPO and ACH are the *same* algorithm family; they differ only in the
+    policy-improvement operator. We expose that difference as a single
+    parameter ``theta`` in [0, 1] so PPO-vs-ACH comparisons hold everything
+    else fixed (the experiment whole point):
+
+      theta = 0  -> PPO  : clipped surrogate -min(r*A, clip(r)*A)
+      theta = 1  -> ACH  : entropy-regularized replicator -logp*A - beta*H
+      0<theta<1  -> convex interpolation of the two policy-loss terms.
+
+    Everything else is identical between the two and is NOT a function of
+    theta: critic (value head + MSE loss), advantage normalization,
+    entropy bonus coefficient, value-loss coefficient, max grad norm,
+    optimizer, multi-epoch inner loop, KL early-stop, and the snapshot of
+    old-policy log-probs from the rollout. The previous design had several
+    unfair differences (PPO ran 4 inner epochs while ACH ran 1; ACH used a
+    separate KL term PPO did not; entropy was no_grad in PPO but in-loss in
+    ACH); this design removes them.
+
+    ``beta`` (the ACH entropy-regularizer weight) defaults to
+    ``entropy_coef`` so the ACH term is the standard replicator form.
+    """
 
     def __init__(
         self,
         policy: MLPSharedActorCritic,
         config: AlgoConfig | None = None,
         *,
+        theta: float = 0.0,
         clip_eps: float = 0.2,
         n_epochs: int = 4,
+        target_kl: float | None = 0.04,
+        beta: float | None = None,
     ) -> None:
         super().__init__(policy, config)
-        self.clip_eps = clip_eps
-        self.n_epochs = n_epochs
+        if not 0.0 <= theta <= 1.0:
+            raise ValueError(f"theta must be in [0, 1], got {theta}")
+        self.theta = float(theta)
+        self.clip_eps = float(clip_eps)
+        self.n_epochs = int(n_epochs)
+        self.target_kl = target_kl
+        self.beta = float(beta) if beta is not None else self.config.entropy_coef
 
     def step(self, batch: Batch) -> UpdateStats:
         if batch.size == 0:
@@ -110,10 +140,20 @@ class NNPPOUpdate(_NNUpdateBase):
             logits, values = self.policy(obs)
             logp_all = self._masked_logp(logits, mask)
             new_logp = logp_all.gather(1, actions.unsqueeze(1)).squeeze(1)
+            # PPO term (theta=0): clipped surrogate of the likelihood ratio.
             ratio = torch.exp(new_logp - old_logp)
             surr1 = ratio * adv
             surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
-            policy_loss = -torch.min(surr1, surr2).mean()
+            ppo_loss = -torch.min(surr1, surr2).mean()
+            # ACH term (theta=1): entropy-regularized replicator.
+            reinforce_loss = -(new_logp * adv).mean()
+            with torch.no_grad():
+                legal_probs_ng = torch.exp(logp_all)
+                entropy_ng = -(legal_probs_ng * logp_all).sum(dim=-1).mean()
+            ach_loss = reinforce_loss - self.beta * entropy_ng
+            # Interpolated policy loss.
+            policy_loss = (1.0 - self.theta) * ppo_loss + self.theta * ach_loss
+            # Shared critic + entropy bonus (identical at both endpoints).
             value_loss = ((values - returns) ** 2).mean()
             with torch.no_grad():
                 legal_probs = torch.exp(logp_all)
@@ -135,6 +175,8 @@ class NNPPOUpdate(_NNUpdateBase):
                 total_kl += float((old_logp - new_logp).mean())
                 total_clip += float(((ratio - 1.0).abs() > self.clip_eps).float().mean())
             steps += 1
+            if self.target_kl is not None and total_kl / steps > 1.5 * self.target_kl:
+                break
 
         ev = _explained_variance_np(returns.detach().cpu().numpy(), values.detach().cpu().numpy())
         return UpdateStats(
@@ -144,59 +186,67 @@ class NNPPOUpdate(_NNUpdateBase):
             approx_kl=total_kl / steps,
             clip_frac=total_clip / steps,
             explained_variance=ev,
+            extra={"theta": self.theta},
         )
 
 
-class NNACHUpdate(_NNUpdateBase):
-    """ACH: REINFORCE + critic baseline + entropy bonus. **No clipping.**
+class NNPPOUpdate(NNPolicyGradientUpdate):
+    """PPO endpoint of the unified update (theta=0)."""
 
-    The policy loss is ``-mean(logp(a) * advantage) - entropy_coef * H``. The
-    entropy term is what makes the continuous-time update replicator-like
-    rather than best-response-like; this is the lever behind ACH's claimed
-    last-iterate convergence (AGENTS.md §1 D4).
+    def __init__(
+        self,
+        policy: MLPSharedActorCritic,
+        config: AlgoConfig | None = None,
+        *,
+        clip_eps: float = 0.2,
+        n_epochs: int = 4,
+        target_kl: float | None = 0.04,
+        beta: float | None = None,
+        theta: float = 0.0,
+    ) -> None:
+        if theta != 0.0:
+            raise ValueError(f"NNPPOUpdate fixes theta=0; got theta={theta}")
+        super().__init__(
+            policy,
+            config,
+            theta=0.0,
+            clip_eps=clip_eps,
+            n_epochs=n_epochs,
+            target_kl=target_kl,
+            beta=beta,
+        )
+
+
+class NNACHUpdate(NNPolicyGradientUpdate):
+    """ACH endpoint of the unified update (theta=1).
+
+    Per AGENTS.md D4, ACH differs from PPO *only* in the policy-improvement
+    operator: no clipped surrogate, just REINFORCE + entropy regularizer.
+    All other hyperparams and stabilizers are identical to PPO so the
+    comparison is apples-to-apples.
     """
 
     def __init__(
         self,
         policy: MLPSharedActorCritic,
         config: AlgoConfig | None = None,
+        *,
+        clip_eps: float = 0.2,
+        n_epochs: int = 4,
+        target_kl: float | None = 0.04,
+        beta: float | None = None,
+        theta: float = 1.0,
     ) -> None:
-        super().__init__(policy, config)
-
-    def step(self, batch: Batch) -> UpdateStats:
-        if batch.size == 0:
-            return UpdateStats(policy_loss=0.0, value_loss=0.0, entropy=0.0)
-        obs = self._obs_tensor(batch)
-        mask = self._legal_mask_tensor(batch)
-        actions = torch.as_tensor(batch.actions, dtype=torch.long, device=self.policy.device)
-        returns = torch.as_tensor(batch.returns, dtype=torch.float32, device=self.policy.device)
-        adv = self._normalize_advantages(
-            torch.as_tensor(batch.advantages, dtype=torch.float32, device=self.policy.device)
-        )
-
-        logits, values = self.policy(obs)
-        logp_all = self._masked_logp(logits, mask)
-        new_logp = logp_all.gather(1, actions.unsqueeze(1)).squeeze(1)
-        policy_loss = -(new_logp * adv).mean()
-        value_loss = ((values - returns) ** 2).mean()
-        with torch.no_grad():
-            legal_probs = torch.exp(logp_all)
-            entropy = -(legal_probs * logp_all).sum(dim=-1).mean()
-        loss = (
-            policy_loss + self.config.value_coef * value_loss - self.config.entropy_coef * entropy
-        )
-        self.optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
-        self.optimizer.step()
-
-        ev = _explained_variance_np(returns.detach().cpu().numpy(), values.detach().cpu().numpy())
-        return UpdateStats(
-            policy_loss=float(policy_loss.detach()),
-            value_loss=float(value_loss.detach()),
-            entropy=float(entropy),
-            explained_variance=ev,
-            extra={"adv_mean": float(adv.mean().detach()), "adv_std": float(adv.std().detach())},
+        if theta != 1.0:
+            raise ValueError(f"NNACHUpdate fixes theta=1; got theta={theta}")
+        super().__init__(
+            policy,
+            config,
+            theta=1.0,
+            clip_eps=clip_eps,
+            n_epochs=n_epochs,
+            target_kl=target_kl,
+            beta=beta,
         )
 
 

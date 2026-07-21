@@ -91,10 +91,12 @@ def build_update_rule(policy: Policy, cfg: ExperimentConfig, spec: GameSpec) -> 
     elif cfg.policy_kind == "mlp":
         from mjai.algos.nn_updates import NNACHUpdate, NNPPOUpdate
 
+        # Identical stabilizers for both endpoints (apples-to-apples, AGENTS.md
+        # §1 D4): same clip_eps, n_epochs, target_kl. theta differs (0=ppo/1=ach).
         if cfg.algo == "ppo":
             return NNPPOUpdate(policy, algo_cfg, clip_eps=cfg.clip_eps)  # type: ignore[arg-type]
         if cfg.algo == "ach":
-            return NNACHUpdate(policy, algo_cfg)  # type: ignore[arg-type]
+            return NNACHUpdate(policy, algo_cfg, clip_eps=cfg.clip_eps)  # type: ignore[arg-type]
     raise ValueError(f"Unknown algo/policy combo: {cfg.algo}/{cfg.policy_kind}")
 
 
