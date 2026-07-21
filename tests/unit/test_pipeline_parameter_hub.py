@@ -121,8 +121,10 @@ def test_snapshot_unknown_type_raises():
 
 
 def test_restore_unknown_kind_raises():
+    # snapshot/restore now delegate to Policy.snapshot_state/restore_state, so
+    # an unknown kind is rejected by the policy itself (not the hub helper).
     p = TabularPolicy(num_actions=2, seed=0)
-    with pytest.raises(ValueError, match="Unknown snapshot kind"):
+    with pytest.raises(ValueError, match="Snapshot kind mismatch"):
         restore_policy_weights(p, {"kind": "bogus"})
 
 

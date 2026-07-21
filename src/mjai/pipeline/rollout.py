@@ -90,42 +90,44 @@ class RolloutWorkerCore:
     def _play_one_episode(
         self, learner: Policy, opponent: Policy
     ) -> tuple[list[Transition], list[float]]:
+        """Play one episode, recording (action, logprob, value) per decision point.
+
+        Hot-path note (AGENTS.md §8): each decision point calls the policy ONCE
+        via ``act_with_value`` (single forward for NN; single masked-softmax for
+        tabular). The behavior-policy logprob recorded here is exact — it is the
+        same value the old two-pass implementation recomputed in a second loop.
+        """
         state = self.game_spec.new_state()
-        transitions: list[Transition] = []
-        # Record (player, obs, legal, action, value) at each decision point.
-        steps: list[tuple[int, list[float], list[int], int, float]] = []
+        # Record (player, obs, legal, action, logprob, value) at each decision
+        # point in a single pass — no post-episode recompute loop.
+        steps: list[tuple[int, list[float], list[int], int, float, float]] = []
 
         while not state.is_terminal():
             if state.is_chance_node():
                 self._sample_chance(state)
                 continue
             if state.is_simultaneous_node():
-                joint = self._simultaneous_actions(state, learner, opponent)
+                joint, lps, per_player_values = self._simultaneous_actions(state, learner, opponent)
                 # Record both players' transitions BEFORE applying (so obs is
                 # the pre-step observation).
                 for p in range(self.game_spec.num_players):
                     obs = self.game_spec.obs_tensor(state, p)
                     # Per-player legal set (positional id; kw form rejected by pyspiel).
                     legal = list(state.legal_actions(p))
-                    policy = self._policy_for(p, learner, opponent)
-                    v = policy.value(obs)
-                    steps.append((p, obs, legal, joint[p], v))
+                    steps.append((p, obs, legal, joint[p], lps[p], per_player_values[p]))
                 state.apply_actions(joint)
             else:
                 p = state.current_player()
                 obs = self.game_spec.obs_tensor(state, p)
                 legal = list(state.legal_actions())
                 policy = self._policy_for(p, learner, opponent)
-                v = policy.value(obs)
-                a, lp = policy.act(obs, legal, eval=False)
-                steps.append((p, obs, legal, a, v))
+                a, lp, v = policy.act_with_value(obs, legal, eval=False)
+                steps.append((p, obs, legal, a, lp, v))
                 state.apply_action(a)
 
         returns = list(state.returns())
-        for p, obs, legal, a, v in steps:
-            policy = self._policy_for(p, learner, opponent)
-            # Recompute logprob under the (unchanged) policy for the record.
-            _, lp = policy.act(obs, legal, eval=False)
+        transitions: list[Transition] = []
+        for p, obs, legal, a, lp, v in steps:
             reward = returns[p]  # terminal-only rewards for these games
             transitions.append(
                 Transition(
@@ -186,15 +188,26 @@ class RolloutWorkerCore:
 
     def _simultaneous_actions(
         self, state: pyspiel.State, learner: Policy, opponent: Policy
-    ) -> list[int]:
+    ) -> tuple[list[int], list[float], list[float]]:
+        """Choose each player's action independently; return (actions, logprobs, values).
+
+        Each player gets exactly one fused ``act_with_value`` call — the
+        behavior-policy logprob and value baseline are captured here in the same
+        call that samples the action, so the caller records them without a
+        second forward (AGENTS.md §8).
+        """
         n = self.game_spec.num_players
         actions: list[int] = []
+        logprobs: list[float] = []
+        values: list[float] = []
         for p in range(n):
             obs = self.game_spec.obs_tensor(state, p)
             # legal_actions accepts the player id positionally (kw form rejected
             # by pyspiel's pybind for matrix games).
             legal = list(state.legal_actions(p))
             policy = self._policy_for(p, learner, opponent)
-            a, _ = policy.act(obs, legal, eval=False)
+            a, lp, v = policy.act_with_value(obs, legal, eval=False)
             actions.append(a)
-        return actions
+            logprobs.append(lp)
+            values.append(v)
+        return actions, logprobs, values

@@ -19,7 +19,6 @@ from __future__ import annotations
 import math
 from typing import Any
 
-import numpy as np
 import torch
 from torch import nn
 
@@ -29,10 +28,17 @@ from mjai.algos.transition import Batch, UpdateStats
 from mjai.algos.update_rule import AlgoConfig, UpdateRule
 
 
-def _explained_variance_np(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    if y_true.var() < 1e-12:
+def _explained_variance_torch(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
+    """Explained variance: 1 - Var(y_true - y_pred) / Var(y_true); 1.0 = perfect.
+
+    Computed entirely on-device to avoid the two full-array D2H transfers a
+    numpy variant would pay for (AGENTS.md §8). The trailing ``.item()`` is a
+    single-scalar sync.
+    """
+    yt_var = y_true.var()
+    if yt_var.item() < 1e-12:
         return 0.0
-    return float(1.0 - (y_true - y_pred).var() / y_true.var())
+    return float(1.0 - (y_true - y_pred).var() / yt_var)
 
 
 class _NNUpdateBase(UpdateRule):
@@ -137,13 +143,15 @@ class NNPolicyGradientUpdate(_NNUpdateBase):
         mask = self._legal_mask_tensor(batch)
         actions = torch.as_tensor(batch.actions, dtype=torch.long, device=self.policy.device)
         old_logp = torch.as_tensor(batch.logprobs, dtype=torch.float32, device=self.policy.device)
-        # old_probs(a) for the ACH importance-correction term (1/pi_old). In
-        # synchronous self-play pi_old == current policy so this is ~1, but we
-        # keep it for correctness.
-        with torch.no_grad():
-            old_logits_snap, _ = self.policy(obs)
-            old_logp_all = self._masked_logp(old_logits_snap, mask)
-        old_probs = torch.exp(old_logp_all).gather(1, actions.unsqueeze(1)).squeeze(1)
+        # Behavior-policy prob of the sampled action — this IS the π_old that
+        # importance-sampling corrections require. It is already recorded in
+        # ``batch.logprobs`` by the rollout (under the exact policy that sampled
+        # the action), so recomputing it here under the current weights would be
+        # both wasteful (an extra batch forward) and wrong under async sampling
+        # (where the rollout policy differs from the current learner). The old
+        # no_grad forward-snapshot of ``old_probs`` is removed for both reasons
+        # (AGENTS.md §8: no non-essential round-trips).
+        old_probs = torch.exp(old_logp)
         returns = torch.as_tensor(batch.returns, dtype=torch.float32, device=self.policy.device)
         adv = self._normalize_advantages(
             torch.as_tensor(batch.advantages, dtype=torch.float32, device=self.policy.device)
@@ -154,7 +162,13 @@ class NNPolicyGradientUpdate(_NNUpdateBase):
         # mini-batch at each iteration." PPO is aligned to the same single-step
         # regime so the PPO-vs-ACH comparison isolates the policy-improvement
         # operator (theta), not the update-count.
-        total_pol = total_val = total_ent = total_kl = total_clip = 0.0
+        #
+        # Hot-path note (AGENTS.md §8): the 5 per-epoch stat scalars are
+        # accumulated as GPU tensors and read back once at the end (one D2H
+        # sync). KL is the lone exception — the early-stop check needs it every
+        # epoch, so it keeps a Python-float running sum fed by a single ``.item()``.
+        stat_acc = torch.zeros(4, dtype=torch.float32, device=self.policy.device)
+        kl_running = 0.0
         steps = 0
         for _ in range(1):
             logits, values = self.policy(obs)
@@ -198,23 +212,29 @@ class NNPolicyGradientUpdate(_NNUpdateBase):
             loss.backward()
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
             self.optimizer.step()
+            # Accumulate stats on-device (4 scalars in one stack) + KL via item()
+            # for the early-stop check. No batch D2H until the loop ends.
+            clip_frac = ((ratio.detach() - 1.0).abs() > self.clip_eps).float().mean()
             with torch.no_grad():
-                total_pol += float(policy_loss.detach())
-                total_val += float(value_loss.detach())
-                total_ent += float(entropy.detach())
-                total_kl += float((old_logp - new_logp.detach()).mean())
-                total_clip += float(((ratio.detach() - 1.0).abs() > self.clip_eps).float().mean())
+                stat_acc += torch.stack(
+                    [policy_loss.detach(), value_loss.detach(), entropy.detach(), clip_frac]
+                )
+            kl_step = float((old_logp - new_logp.detach()).mean().item())
+            kl_running += kl_step
             steps += 1
-            if self.target_kl is not None and total_kl / steps > 1.5 * self.target_kl:
+            if self.target_kl is not None and kl_running / steps > 1.5 * self.target_kl:
                 break
 
-        ev = _explained_variance_np(returns.detach().cpu().numpy(), values.detach().cpu().numpy())
+        # One D2H for the 4 accumulated stats; KL already read incrementally.
+        # ``stat_acc`` is the SUM over epochs; divide by step count for the mean.
+        total_pol, total_val, total_ent, total_clip = (stat_acc / max(steps, 1)).cpu().tolist()
+        ev = _explained_variance_torch(returns, values.detach())
         return UpdateStats(
-            policy_loss=total_pol / steps,
-            value_loss=total_val / steps,
-            entropy=total_ent / steps,
-            approx_kl=total_kl / steps,
-            clip_frac=total_clip / steps,
+            policy_loss=total_pol,
+            value_loss=total_val,
+            entropy=total_ent,
+            approx_kl=kl_running / max(steps, 1),
+            clip_frac=total_clip,
             explained_variance=ev,
             extra={"theta": self.theta},
         )

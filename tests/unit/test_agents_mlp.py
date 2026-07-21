@@ -145,3 +145,72 @@ def test_policy_entropy_near_uniform_at_init():
         ents.append(entropy_of_probs(probs))
     # Uniform over 3 actions = log(3) ~= 1.099 nats. Allow some slack from init.
     assert max(ents) > 0.5
+
+
+def test_act_with_value_matches_separate_calls_in_eval():
+    """Fused ``act_with_value`` (one forward) must equal ``act`` + ``value`` (two forwards).
+
+    Eval mode is deterministic (greedy argmax, no RNG draw), so the fused and
+    separate paths are comparable bit-for-bit on the same net. This is the
+    correctness contract for the rollout hot-path optimization (AGENTS.md §8):
+    the single-forward override may not drift from the canonical act+value.
+    """
+    m = MLPSharedActorCritic(obs_size=4, num_actions=5, seed=7)
+    m.eval_mode()
+    legal = [0, 2, 4]
+    # Run many observations to cover weight space reasonably.
+    for _ in range(20):
+        obs = torch.randn(4).tolist()
+        a_sep, lp_sep = m.act(obs, legal, eval=True)
+        v_sep = m.value(obs)
+        a_fused, lp_fused, v_fused = m.act_with_value(obs, legal, eval=True)
+        assert a_sep == a_fused
+        assert lp_sep == lp_fused  # both 0.0 in eval mode
+        assert math.isclose(v_sep, v_fused, abs_tol=1e-6)
+
+
+def test_snapshot_restore_roundtrip_and_independence():
+    """snapshot_state -> restore_state reproduces the policy exactly and is
+    independent of later mutations to the source.
+
+    Also verifies the GPU-memory discipline (AGENTS.md §8): snapshot tensors
+    live on CPU regardless of the policy's device, so long-lived stores (hub
+    history, league pool) never pin GPU memory.
+    """
+    m = MLPSharedActorCritic(obs_size=4, num_actions=3, hidden_sizes=(8,), seed=11)
+    m.eval_mode()
+    snap = m.snapshot_state()
+    assert snap["kind"] == "nn"
+    # Snapshot must hold CPU tensors — the whole point of moving off GPU.
+    for v in snap["state_dict"].values():
+        assert v.device.type == "cpu"
+    # Reload into a fresh net of matching shape and verify identical outputs.
+    m2 = MLPSharedActorCritic(obs_size=4, num_actions=3, hidden_sizes=(8,), seed=0)
+    m2.restore_state(snap)
+    m2.eval_mode()
+    for _ in range(10):
+        obs = torch.randn(4).tolist()
+        assert m.act(obs, [0, 1, 2], eval=True) == m2.act(obs, [0, 1, 2], eval=True)
+        assert math.isclose(m.value(obs), m2.value(obs), abs_tol=1e-6)
+    # Independence: mutate m via a gradient step; m2 and the snapshot must not move.
+    opt = torch.optim.SGD(m.parameters(), lr=1.0)
+    obs_t = torch.as_tensor([0.1, 0.2, 0.3, 0.4]).unsqueeze(0)
+    logits, value = m(obs_t)
+    loss = logits.sum() + value.sum()
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+    probe = [0.1, 0.2, 0.3, 0.4]
+    a_after, _ = m.act(probe, [0, 1, 2], eval=True)
+    a2_after, _ = m2.act(probe, [0, 1, 2], eval=True)
+    # m moved (greedy action may or may not change), but m2 must equal what m
+    # was BEFORE the step — i.e. m2 must not equal the post-step m on a probe
+    # where the step actually shifted the argmax. We assert the strong form:
+    # m2's output equals a fresh restore from the (unchanged) snapshot.
+    m3 = MLPSharedActorCritic(obs_size=4, num_actions=3, hidden_sizes=(8,), seed=0)
+    m3.restore_state(snap)
+    m3.eval_mode()
+    assert m2.act(probe, [0, 1, 2], eval=True) == m3.act(probe, [0, 1, 2], eval=True)
+    assert math.isclose(m2.value(probe), m3.value(probe), abs_tol=1e-6)
+    # Silence unused-var lint for a_after/a2_after (kept for debug readability).
+    _ = a_after, a2_after

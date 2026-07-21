@@ -159,10 +159,16 @@ class LeagueManager:
         }[role]
 
     def _clone(self, policy: Policy) -> Policy:
-        """Deep-copy a policy so the snapshot is independent of live training."""
-        import copy
+        """Build a fresh policy and load the source's snapshot into it.
 
-        return copy.deepcopy(policy)
+        Uses :meth:`Policy.snapshot_state` / :meth:`restore_state` rather than
+        ``copy.deepcopy(policy)``. For NN policies the snapshot lives on CPU, so
+        the clone's GPU footprint is exactly one policy's weights — no transient
+        doubling from a full-module deepcopy (AGENTS.md §8).
+        """
+        fresh = self._make_policy()
+        fresh.restore_state(policy.snapshot_state())
+        return fresh
 
     def _find_member_id(self, policy: Policy) -> int | None:
         for m in self.store.members:

@@ -40,7 +40,14 @@ class ParameterHub:
         self._max_history = 8
 
     def publish(self, weights: Any) -> int:
-        """Publish a new weight snapshot; returns the new version number."""
+        """Publish a new weight snapshot; returns the new version number.
+
+        ``weights`` should be an independent snapshot (typically the output of
+        ``Policy.snapshot_state()``, which for NN policies stores CPU tensors).
+        The defensive ``deepcopy`` here keeps hub-held snapshots decoupled from
+        the caller's object graph; for NN weights that means copying CPU
+        tensors, not GPU memory — bounded history (8 versions) never pins GPU.
+        """
         with self._lock:
             version = 0 if self._latest is None else self._latest.version + 1
             snap = WeightVersion(version=version, weights=copy.deepcopy(weights))
@@ -77,31 +84,21 @@ class ParameterHub:
 
 
 def snapshot_policy_weights(policy: Any) -> Any:
-    """Deep-copy a policy's trainable state into a plain structure.
+    """Take an independent snapshot of a policy's trainable state.
 
-    For TabularPolicy: {logits: ..., values: ...}. For NN (torch nn.Module):
-    state_dict(). Returned object is what gets published to the hub.
+    Thin delegate to :meth:`Policy.snapshot_state` — the policy itself picks the
+    right device for the copy (NN: CPU tensors to avoid GPU-memory accumulation
+    in long-lived stores; tabular: deep-copied dicts). This helper is kept for
+    backwards compatibility with callers that already use the function form.
     """
-    if hasattr(policy, "logits") and hasattr(policy, "values"):
-        return {
-            "kind": "tabular",
-            "logits": copy.deepcopy(policy.logits),
-            "values": copy.deepcopy(policy.values),
-        }
-    if hasattr(policy, "state_dict"):
-        # NN policy: state_dict is already a plain dict of tensors.
-        return {"kind": "nn", "state_dict": copy.deepcopy(policy.state_dict())}
-    raise TypeError(
-        f"Cannot snapshot policy of type {type(policy)}; needs logits+values or state_dict"
-    )
+    if hasattr(policy, "snapshot_state"):
+        return policy.snapshot_state()
+    raise TypeError(f"Cannot snapshot policy of type {type(policy)}; needs snapshot_state()")
 
 
 def restore_policy_weights(policy: Any, snapshot: Any) -> None:
     """Inverse of :func:`snapshot_policy_weights`: write ``snapshot`` into ``policy``."""
-    if snapshot["kind"] == "tabular":
-        policy.logits = copy.deepcopy(snapshot["logits"])
-        policy.values = copy.deepcopy(snapshot["values"])
-    elif snapshot["kind"] == "nn":
-        policy.load_state_dict(copy.deepcopy(snapshot["state_dict"]))
-    else:
-        raise ValueError(f"Unknown snapshot kind: {snapshot['kind']}")
+    if hasattr(policy, "restore_state"):
+        policy.restore_state(snapshot)
+        return
+    raise TypeError(f"Cannot restore policy of type {type(policy)}; needs restore_state()")

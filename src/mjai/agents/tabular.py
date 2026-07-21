@@ -14,6 +14,7 @@ dict can key on it. Two states with the same observation vector share a row
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import math
 import pickle
@@ -133,6 +134,38 @@ class TabularPolicy(Policy):
     def value(self, obs: list[float]) -> float:
         return self.get_value(obs)
 
+    def act_with_value(
+        self,
+        obs: list[float],
+        legal_actions: list[int],
+        *,
+        eval: bool = False,
+        rng_key: Any = None,
+    ) -> tuple[int, float, float]:
+        """Fused ``act`` + ``value`` for the rollout hot path (AGENTS.md §8).
+
+        Semantically identical to calling :meth:`act` then :meth:`value`, but
+        computes the masked probability vector only once (``act`` alone already
+        pays for it; ``value`` is a dict lookup). Consumes exactly one RNG draw
+        in the stochastic branch — matching :meth:`act` so the rollout's RNG
+        stream is unchanged from the act+value path.
+        """
+        if not legal_actions:
+            raise ValueError("legal_actions must be non-empty")
+        probs = self._probs_over_full_space(obs, legal_actions)
+        v = self.get_value(obs)
+        if eval:
+            best_a = max(legal_actions, key=lambda a: probs[a])
+            best_p = probs[best_a]
+            for a in legal_actions:
+                if abs(probs[a] - best_p) < 1e-12 and a < best_a:
+                    best_a = a
+            return best_a, 0.0, v
+        legal_probs = [probs[a] for a in legal_actions]
+        chosen = self._sample_categorical(legal_actions, legal_probs)
+        lp = math.log(probs[chosen] + 1e-30)
+        return chosen, lp, v
+
     def _sample_categorical(self, actions: list[int], probs: list[float]) -> int:
         r = self.rng.random()
         cum = 0.0
@@ -172,6 +205,27 @@ class TabularPolicy(Policy):
         self.temperature = payload["temperature"]
         self.logits = _unpickle_b64(payload["logits_b64"])
         self.values = _unpickle_b64(payload["values_b64"])
+
+    # ---- in-memory snapshot / restore (single source of truth for hub+league) ----
+    #
+    # ParameterHub and LeagueManager call these instead of reaching into our
+    # logits/values dicts. The snapshot is a deep copy so the caller may mutate
+    # us freely without affecting stored snapshots (AGENTS.md §8 memory safety).
+
+    def snapshot_state(self) -> dict[str, Any]:
+        return {
+            "kind": "tabular",
+            "logits": copy.deepcopy(self.logits),
+            "values": copy.deepcopy(self.values),
+        }
+
+    def restore_state(self, snapshot: dict[str, Any]) -> None:
+        if snapshot.get("kind") != "tabular":
+            raise ValueError(
+                f"Snapshot kind mismatch: expected 'tabular', got {snapshot.get('kind')!r}"
+            )
+        self.logits = copy.deepcopy(snapshot["logits"])
+        self.values = copy.deepcopy(snapshot["values"])
 
     # ---- diagnostics ----
 

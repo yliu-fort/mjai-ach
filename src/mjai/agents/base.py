@@ -88,6 +88,61 @@ class Policy(ABC):
         """Restore in-place from ``path`` (produced by :meth:`save`)."""
         ...
 
+    # ---- fused online-step API (hot-path optimization, AGENTS.md §8) ----
+    #
+    # During rollout the worker needs (action, logprob, value) at every decision
+    # point. Naively that is two forwards (one in ``act``, one in ``value``).
+    # Concrete subclasses fuse them into a single forward by overriding this
+    # method; the default below falls back to ``act`` + ``value`` so a new
+    # subclass is correct by construction (no silent degradation if a future
+    # Policy forgets to override).
+    def act_with_value(
+        self,
+        obs: list[float],
+        legal_actions: list[int],
+        *,
+        eval: bool = False,
+        rng_key: Any = None,
+    ) -> tuple[int, float, float]:
+        """Fused (action, logprob, value) in one call.
+
+        Semantically identical to calling :meth:`act` then :meth:`value`, but
+        subclasses with a shared backbone (e.g. the MLP actor-critic) fuse the
+        two reads into a single forward pass. The rollout hot path must call
+        this rather than ``act`` + ``value`` separately.
+        """
+        action, logprob = self.act(obs, legal_actions, eval=eval, rng_key=rng_key)
+        value = self.value(obs)
+        return action, logprob, value
+
+    # ---- weight snapshot / restore (hot-path + GPU-memory optimization) ----
+    #
+    # The IMPALA parameter hub (pipeline.parameter_hub) and the league's
+    # promotion logic (league.manager) need *independent* copies of a policy's
+    # trainable state. Centralizing the snapshot semantics on the Policy ABC
+    # means each subclass picks the right device for the copy:
+    #   - tabular: dict deepcopy (CPU-only, tiny).
+    #   - NN:      state_dict copied to CPU tensors (no GPU memory accumulation
+    #             in the hub's bounded history; restored back to device on load).
+    # These methods are the single source of truth — ParameterHub and
+    # LeagueManager delegate to them rather than reaching into policy internals.
+
+    @abstractmethod
+    def snapshot_state(self) -> dict[str, Any]:
+        """Return an independent snapshot of the policy's trainable state.
+
+        The returned dict is fully decoupled from ``self`` — later mutations to
+        ``self`` must not affect it. Storage location (CPU/GPU) is the subclass'
+        choice; the NN arm stores CPU tensors to avoid GPU-memory accumulation
+        in long-lived stores (hub history, league pool).
+        """
+        ...
+
+    @abstractmethod
+    def restore_state(self, snapshot: dict[str, Any]) -> None:
+        """Restore in-place from a snapshot produced by :meth:`snapshot_state`."""
+        ...
+
     # NOTE: parameters() / train() / eval_mode() are deliberately NOT on the
     # ABC. nn.Module already provides parameters()/train()/eval(); redefining
     # them here would create MRO/signature conflicts for NN subclasses

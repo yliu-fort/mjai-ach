@@ -179,3 +179,40 @@ def test_entropy_uniform_is_log_n():
 
 def test_entropy_degenerate_is_zero():
     assert entropy_of_probs([1.0, 0.0, 0.0]) == 0.0
+
+
+def test_act_with_value_matches_separate_calls():
+    """Fused ``act_with_value`` must equal ``act`` + ``value`` on the same policy.
+
+    Covers both the greedy (eval) path — bit-for-bit identical, no RNG — and the
+    stochastic path — same RNG draw, since the override consumes exactly one
+    ``rng.random()`` like ``act`` does, and ``value`` consumes none. This is the
+    correctness contract for the rollout hot-path optimization (AGENTS.md §8).
+    """
+    # Greedy path: deterministic, compare exactly.
+    p = TabularPolicy(num_actions=4, seed=3)
+    p.get_logits(OBS_A)[1] = 5.0  # bias action 1
+    p.values[_obs_to_key(OBS_A)] = 0.7
+    a_g, lp_g, v_g = p.act_with_value(OBS_A, legal_actions=[0, 1, 2, 3], eval=True)
+    a_sep, lp_sep = p.act(OBS_A, [0, 1, 2, 3], eval=True)
+    assert a_g == a_sep == 1
+    assert lp_g == lp_sep == 0.0
+    assert math.isclose(v_g, 0.7, abs_tol=1e-9)
+    assert math.isclose(v_g, p.value(OBS_A), abs_tol=1e-9)
+
+    # Stochastic path: two sibling policies, same seed, same biased logits.
+    # First sibling: call act() then value(). Second: call act_with_value().
+    # Same RNG state at the call => same sample.
+    p1 = TabularPolicy(num_actions=3, seed=99)
+    p2 = TabularPolicy(num_actions=3, seed=99)
+    for p in (p1, p2):
+        p.get_logits(OBS_B)[0] = 0.3
+        p.get_logits(OBS_B)[1] = 0.3
+        p.values[_obs_to_key(OBS_B)] = -1.25
+    a1, lp1 = p1.act(OBS_B, [0, 1, 2], eval=False)
+    v1 = p1.value(OBS_B)
+    a2, lp2, v2 = p2.act_with_value(OBS_B, [0, 1, 2], eval=False)
+    assert a1 == a2
+    assert math.isclose(lp1, lp2, abs_tol=1e-9)
+    assert math.isclose(v1, v2, abs_tol=1e-9)
+    assert math.isclose(v2, -1.25, abs_tol=1e-9)

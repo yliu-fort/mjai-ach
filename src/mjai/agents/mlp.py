@@ -146,6 +146,39 @@ class MLPSharedActorCritic(nn.Module, Policy):
             _, value = self.forward(obs_t)
             return float(value.item())
 
+    def act_with_value(
+        self,
+        obs: list[float],
+        legal_actions: list[int],
+        *,
+        eval: bool = False,
+        rng_key: Any = None,
+    ) -> tuple[int, float, float]:
+        """Fused single-forward ``act`` + ``value`` (AGENTS.md §8).
+
+        Hot-path override: the rollout needs (action, logprob, value) at every
+        decision point. Calling :meth:`act` then :meth:`value` would do two
+        forwards over the same observation; this does one and reuses the logits
+        for both the policy sample and the value head. Consumes exactly one
+        ``torch.multinomial`` draw in the stochastic branch — matching
+        :meth:`act` so the rollout's RNG stream is unchanged.
+        """
+        if not legal_actions:
+            raise ValueError("legal_actions must be non-empty")
+        with torch.no_grad():
+            obs_t = self._obs_to_tensor(obs).unsqueeze(0)
+            logits, value = self.forward(obs_t)
+            log_probs = self._masked_log_probs(logits[0], legal_actions)
+            probs = torch.exp(log_probs)
+            v = float(value.item())
+            if eval:
+                legal_idx = torch.tensor(legal_actions, device=self.device)
+                legal_lp = log_probs[legal_idx]
+                best = int(legal_idx[torch.argmax(legal_lp)].item())
+                return best, 0.0, v
+            action = int(torch.multinomial(probs, num_samples=1).item())
+            return action, float(log_probs[action].item()), v
+
     # ---- train/eval mode hooks ----
 
     def train(self, mode: bool = True) -> MLPSharedActorCritic:
@@ -192,3 +225,24 @@ class MLPSharedActorCritic(nn.Module, Policy):
         p = Path(path)
         state = torch.load(p, map_location=self.device, weights_only=True)
         self.load_state_dict(state)
+
+    # ---- in-memory snapshot / restore (CPU-stored; AGENTS.md §8) ----
+    #
+    # The IMPALA ParameterHub keeps a bounded history of snapshots; the league
+    # pool stores snapshots long-term. If we kept GPU tensors here, every
+    # snapshot would pin GPU memory (8x live weights at the hub's default
+    # history bound). Instead we clone every parameter to a CPU tensor on
+    # snapshot and move it back to the policy's device on restore. Snapshots are
+    # independent of ``self`` — later gradient steps do not mutate them.
+
+    def snapshot_state(self) -> dict[str, Any]:
+        return {
+            "kind": "nn",
+            "state_dict": {k: v.detach().to("cpu").clone() for k, v in self.state_dict().items()},
+        }
+
+    def restore_state(self, snapshot: dict[str, Any]) -> None:
+        if snapshot.get("kind") != "nn":
+            raise ValueError(f"Snapshot kind mismatch: expected 'nn', got {snapshot.get('kind')!r}")
+        moved = {k: v.to(self.device) for k, v in snapshot["state_dict"].items()}
+        self.load_state_dict(moved)
