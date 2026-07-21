@@ -31,6 +31,7 @@ class RolloutConfig:
 
     n_episodes: int = 1  # episodes per run_episode call
     discount: float = 1.0  # IIG episodes are short; default undiscounted
+    gae_lambda: float = 0.95  # GAE(λ) for advantage estimation (ACH paper §E)
     seed: int | None = None
     # Whether to pool transitions from BOTH players (True for self-play, where
     # the same learner occupies both seats) or only the learner's seat.
@@ -142,16 +143,37 @@ class RolloutWorkerCore:
         return transitions, returns
 
     def _assign_returns(self, transitions: list[Transition], returns: list[float]) -> None:
-        """Fill in return_ and advantage per transition.
+        """Fill in return_ and advantage per transition using GAE(λ).
 
-        For these short IIG episodes the return IS the terminal payoff (rewards
-        are terminal-only), so return_ = returns[player]. Advantage =
-        return_ - value baseline (the ACH/PPO advantage with no GAE).
+        For 2p0-sum games the transitions alternate between players. Each
+        player's experience is a sub-trajectory; GAE is computed per-player
+        using that player's value estimates and the terminal return as the
+        episode's payoff. λ comes from ``self.config.gae_lambda``.
         """
+        lam = self.config.gae_lambda
+        # Group transitions by player; within each group the order matches the
+        # temporal order of that player's decisions in the episode.
+        by_player: dict[int, list[Transition]] = {}
         for t in transitions:
-            r = returns[t.player]
-            t.return_ = float(r)
-            t.advantage = float(r) - t.value
+            by_player.setdefault(t.player, []).append(t)
+        for player, ts in by_player.items():
+            r = returns[player]
+            n = len(ts)
+            gae = 0.0
+            # Walk backward through the player's transitions.
+            for i in range(n - 1, -1, -1):
+                t = ts[i]
+                t.return_ = float(r)
+                # TD residual: reward + gamma*V(next) - V(current).
+                # For these games reward is 0 mid-episode and the terminal
+                # payoff at the end; gamma=1 (undiscounted, short episodes).
+                next_value = ts[i + 1].value if i + 1 < n else 0.0
+                delta = 0.0 + next_value - t.value
+                # On the last transition, attach the actual terminal return.
+                if i == n - 1:
+                    delta = r - t.value
+                gae = delta + lam * gae
+                t.advantage = gae
 
     def _policy_for(self, player: int, learner: Policy, opponent: Policy) -> Policy:
         return learner if player == self.learner_player else opponent

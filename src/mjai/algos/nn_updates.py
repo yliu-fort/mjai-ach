@@ -121,6 +121,15 @@ class NNPolicyGradientUpdate(_NNUpdateBase):
         self.n_epochs = int(n_epochs)
         self.target_kl = target_kl
         self.beta = float(beta) if beta is not None else self.config.entropy_coef
+        # ACH (NeuRD-style) logit threshold. The paper clips logits to
+        # [-l_th, l_th] after mean-subtraction (Appendix E); l_th=2.0 for the
+        # OpenSpiel small-game experiments. Essential because the NeuRD
+        # direct-logit gradient does NOT vanish on softmax saturation, so
+        # without bounding logits they blow up.
+        self.l_th = 2.0
+        # Hedge coefficient (per-state learning rate on the ACH side); η=1.0
+        # in every experiment in the paper.
+        self.eta = 1.0
 
     def step(self, batch: Batch) -> UpdateStats:
         if batch.size == 0:
@@ -129,31 +138,51 @@ class NNPolicyGradientUpdate(_NNUpdateBase):
         mask = self._legal_mask_tensor(batch)
         actions = torch.as_tensor(batch.actions, dtype=torch.long, device=self.policy.device)
         old_logp = torch.as_tensor(batch.logprobs, dtype=torch.float32, device=self.policy.device)
+        # old_probs(a) for the ACH importance-correction term (1/pi_old). In
+        # synchronous self-play pi_old == current policy so this is ~1, but we
+        # keep it for correctness.
+        with torch.no_grad():
+            old_logits_snap, _ = self.policy(obs)
+            old_logp_all = self._masked_logp(old_logits_snap, mask)
+        old_probs = torch.exp(old_logp_all).gather(1, actions.unsqueeze(1)).squeeze(1)
         returns = torch.as_tensor(batch.returns, dtype=torch.float32, device=self.policy.device)
         adv = self._normalize_advantages(
             torch.as_tensor(batch.advantages, dtype=torch.float32, device=self.policy.device)
         )
 
+        # Single gradient step per mini-batch for BOTH endpoints (apples-to-
+        # apples). ACH paper Appendix E: "we only update once using a single
+        # mini-batch at each iteration." PPO is aligned to the same single-step
+        # regime so the PPO-vs-ACH comparison isolates the policy-improvement
+        # operator (theta), not the update-count.
         total_pol = total_val = total_ent = total_kl = total_clip = 0.0
         steps = 0
-        for _ in range(self.n_epochs):
+        for _ in range(1):
             logits, values = self.policy(obs)
             logp_all = self._masked_logp(logits, mask)
             new_logp = logp_all.gather(1, actions.unsqueeze(1)).squeeze(1)
-            # PPO term (theta=0): clipped surrogate of the likelihood ratio.
+            # --- PPO term (theta=0): clipped surrogate of the likelihood ratio.
             ratio = torch.exp(new_logp - old_logp)
             surr1 = ratio * adv
             surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
             ppo_loss = -torch.min(surr1, surr2).mean()
-            # ACH term (theta=1): entropy-regularized replicator.
-            reinforce_loss = -(new_logp * adv).mean()
-            with torch.no_grad():
-                legal_probs_ng = torch.exp(logp_all)
-                entropy_ng = -(legal_probs_ng * logp_all).sum(dim=-1).mean()
-            ach_loss = reinforce_loss - self.beta * entropy_ng
-            # Interpolated policy loss.
+            # --- ACH term (theta=1): NeuRD direct-logit loss (paper Algorithm 2).
+            # The gradient of -y(a)*A wrt logit y(a) is -A (constant; does NOT
+            # vanish on softmax saturation like REINFORCE's -(1-pi(a))*A). This
+            # is the single most important difference from REINFORCE and the
+            # reason ACH/NeuRD don't collapse the way REINFORCE does.
+            # Steps: (1) mean-subtract the logits; (2) threshold to [-l_th, l_th]
+            # (zero out the gradient where the logit is already at the bound);
+            # (3) importance-correct by 1/old_prob(a); (4) loss = -eta*y(a)*A/pi_old.
+            centered = logits - logits.mean(dim=-1, keepdim=True)
+            y_a = centered.gather(1, actions.unsqueeze(1)).squeeze(1)
+            # Threshold: where |centered_logit_for_action| > l_th, zero the loss
+            # contribution for that sample (OpenSpiel NeuRD's `thresholded`).
+            within = (y_a.abs() <= self.l_th).float()
+            ach_loss = -(self.eta * y_a * adv * within / (old_probs + 1e-8)).mean()
+            # --- Interpolated policy loss.
             policy_loss = (1.0 - self.theta) * ppo_loss + self.theta * ach_loss
-            # Shared critic + entropy bonus (identical at both endpoints).
+            # --- Shared critic + entropy bonus (identical at both endpoints).
             value_loss = ((values - returns) ** 2).mean()
             with torch.no_grad():
                 legal_probs = torch.exp(logp_all)

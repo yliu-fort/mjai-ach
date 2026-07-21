@@ -102,22 +102,19 @@ def test_ach_step_changes_weights():
     assert not torch.allclose(before, after)
 
 
-def test_constant_advantages_ach_still_pulls_toward_uniform_via_entropy():
-    """Constant advantages -> the REINFORCE part is 0 (normalized away), but
-    ACH's entropy regularizer still contributes a non-zero policy loss pulling
-    the policy toward uniform (the replicator stabilizer). The shared entropy
-    *bonus* also applies. PPO (theta=0) under constant advantages has ratio*0
-    in its surrogate, so its policy_loss is just the shared -entropy_coef*H.
-
-    This documents the unified design: the difference between endpoints under
-    constant-advantage batches is exactly the ACH entropy regularizer term.
+def test_constant_advantages_ach_policy_loss_is_zero():
+    """Constant advantages -> normalized to 0 -> ACH (NeuRD direct-logit) policy
+    loss is exactly 0. The only training signal left is the shared entropy bonus
+    + value loss, which live outside policy_loss. This documents that the NeuRD
+    loss ``-eta*y(a)*A/pi_old`` is 0 when A=0, unlike the old REINFORCE+entropy
+    impl which had a residual entropy term inside policy_loss.
     """
     p = MLPSharedActorCritic(obs_size=4, num_actions=NUM_ACTIONS, seed=0)
     rule = NNACHUpdate(p, AlgoConfig(learning_rate=1e-2, entropy_coef=0.01))
     stats = rule.step(_batch(8, advantages=[0.5] * 8))
-    # REINFORCE part vanishes; the loss is dominated by -beta*H (small, negative).
-    assert stats.policy_loss < 0.0
-    assert abs(stats.policy_loss) < 0.1  # not a huge spike — bounded by entropy.
+    assert stats.policy_loss == 0.0  # NeuRD: y(a)*0 = 0.
+    # The entropy bonus still fires (it's a separate loss term), so entropy > 0.
+    assert stats.entropy > 0.0
 
 
 def test_value_head_moves_toward_returns():
