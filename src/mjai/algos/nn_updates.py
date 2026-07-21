@@ -183,11 +183,13 @@ class NNPolicyGradientUpdate(_NNUpdateBase):
             # --- Interpolated policy loss.
             policy_loss = (1.0 - self.theta) * ppo_loss + self.theta * ach_loss
             # --- Shared critic + entropy bonus (identical at both endpoints).
+            # Entropy MUST keep its gradient (NOT under no_grad) so the entropy
+            # bonus actually pulls logits toward uniform. The previous no_grad
+            # wrapper silently zeroed the entropy gradient — a real bug.
             value_loss = ((values - returns) ** 2).mean()
-            with torch.no_grad():
-                legal_probs = torch.exp(logp_all)
-                ent_per_row = -(legal_probs * logp_all).sum(dim=-1)
-                entropy = ent_per_row.mean()
+            legal_probs = torch.exp(logp_all)
+            ent_per_row = -(legal_probs * logp_all).sum(dim=-1)
+            entropy = ent_per_row.mean()
             loss = (
                 policy_loss
                 + self.config.value_coef * value_loss
@@ -198,11 +200,11 @@ class NNPolicyGradientUpdate(_NNUpdateBase):
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
             self.optimizer.step()
             with torch.no_grad():
-                total_pol += float(policy_loss)
-                total_val += float(value_loss)
-                total_ent += float(entropy)
-                total_kl += float((old_logp - new_logp).mean())
-                total_clip += float(((ratio - 1.0).abs() > self.clip_eps).float().mean())
+                total_pol += float(policy_loss.detach())
+                total_val += float(value_loss.detach())
+                total_ent += float(entropy.detach())
+                total_kl += float((old_logp - new_logp.detach()).mean())
+                total_clip += float(((ratio.detach() - 1.0).abs() > self.clip_eps).float().mean())
             steps += 1
             if self.target_kl is not None and total_kl / steps > 1.5 * self.target_kl:
                 break
