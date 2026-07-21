@@ -27,15 +27,25 @@ from mjai.games.loader import GameSpec
 
 @dataclass
 class RolloutConfig:
-    """How episodes are collected and how returns are computed."""
+    """How episodes are collected and how returns are computed.
 
-    n_episodes: int = 1  # episodes per run_episode call
-    discount: float = 1.0  # IIG episodes are short; default undiscounted
-    gae_lambda: float = 0.95  # GAE(λ) for advantage estimation (ACH paper §E)
+    Attributes:
+        n_episodes: safety cap on episodes per :meth:`run_episode` call.
+        gae_lambda: lambda for the per-player GAE (ACH paper App. E, p24; H.3 leaves
+            it unspecified — spec assumption A1 follows the paper's other
+            experiments at 0.95). Episodes are undiscounted (gamma=1): all Phase-1
+            games are short with terminal-only rewards.
+        seed: RNG seed for chance-node sampling.
+        target_samples: stop collecting whole episodes once the batch holds at
+            least this many transitions (decision points). The paper's batch
+            size is 64 samples (p28 Table 8); episodes are never truncated
+            mid-game. ``None`` disables (collect exactly ``n_episodes``).
+    """
+
+    n_episodes: int = 1
+    gae_lambda: float = 0.95
     seed: int | None = None
-    # Whether to pool transitions from BOTH players (True for self-play, where
-    # the same learner occupies both seats) or only the learner's seat.
-    pool_both_players: bool = True
+    target_samples: int | None = 64
 
 
 @dataclass
@@ -55,8 +65,10 @@ class RolloutWorkerCore:
         learner_player: which seat (0 or 1) the ``learner`` argument controls.
             The opponent occupies the other seat. (For mirror self-play both
             seats get the same policy; ``learner_player`` still selects whose
-            transitions get the "learner" tag, but with pool_both_players=True
-            both are pooled regardless.)
+            transitions get the "learner" tag. Transitions from BOTH players
+            are always pooled — the paper trains the shared theta,omega on both seats'
+            samples (p24); the league controller filters by seat afterwards
+            via :meth:`Batch.for_player`.)
         config: rollout hyperparameters.
     """
 
@@ -73,14 +85,19 @@ class RolloutWorkerCore:
         self._rng = random.Random(self.config.seed)
 
     def run_episode(self, learner: Policy, opponent: Policy) -> Batch:
-        """Play ``n_episodes`` episodes and return the pooled transitions.
+        """Play episodes and return the pooled transitions.
 
         Implements RolloutRunnerProtocol: the controller calls this with the
         learner in the ``learner`` seat and (for mirror) the same policy as the
-        opponent.
+        opponent. Plays whole episodes until ``n_episodes`` is reached OR the
+        pooled batch holds at least ``config.target_samples`` transitions
+        (never truncates an episode mid-game).
         """
         all_transitions: list[Transition] = []
         for _ in range(self.config.n_episodes):
+            target = self.config.target_samples
+            if target is not None and len(all_transitions) >= target:
+                break
             transitions, returns = self._play_one_episode(learner, opponent)
             self._assign_returns(transitions, returns)
             all_transitions.extend(transitions)
@@ -137,7 +154,7 @@ class RolloutWorkerCore:
                     logprob=lp,
                     value=v,
                     reward=reward,
-                    return_=reward,  # overwritten by _assign_returns if discounting
+                    return_=reward,  # overwritten by _assign_returns below
                     advantage=0.0,
                     player=p,
                 )
@@ -145,12 +162,15 @@ class RolloutWorkerCore:
         return transitions, returns
 
     def _assign_returns(self, transitions: list[Transition], returns: list[float]) -> None:
-        """Fill in return_ and advantage per transition using GAE(λ).
+        """Fill in return_ and advantage per transition using GAE(lambda), gamma=1.
 
         For 2p0-sum games the transitions alternate between players. Each
         player's experience is a sub-trajectory; GAE is computed per-player
         using that player's value estimates and the terminal return as the
-        episode's payoff. λ comes from ``self.config.gae_lambda``.
+        episode's payoff. lambda comes from ``self.config.gae_lambda``. gamma
+        is fixed at 1 (undiscounted): all Phase-1 games are short with
+        terminal-only rewards, and the paper's H.3 leaves gamma unspecified
+        (spec assumption A1).
         """
         lam = self.config.gae_lambda
         # Group transitions by player; within each group the order matches the

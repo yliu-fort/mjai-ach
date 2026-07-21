@@ -19,7 +19,7 @@ on a home CPU+GPU across 7 small games. All code is written in Phase 1; Phases 2
 | D1 | Tensor backend | PyTorch (no JAX — no Windows-GPU support) |
 | D2 | Executor | Ray; core logic separated from Ray; SLURM launcher shipped in Phase 1 |
 | D3 | Multi-agent core | Built in-house (OpenSpiel's `PPOAgent` is single-agent only) |
-| D4 | ACH actor loss | Policy-gradient + entropy + critic baseline; **no PPO clipping** |
+| D4 | ACH actor loss | Paper-faithful ACH (Fu et al. ICLR 2022, OpenReview DTXZqTNV5nW, Algorithm 2): logit-space policy gradient + advantage-sign-dependent one-sided logit gate (l_th) + ratio gate (vacuous under synchronous single-thread) + entropy regularizer + critic value loss; **no PPO clipped-surrogate as the policy loss** |
 | D5 | Tabular | From-scratch dict-backed policy + value, same `Trainer` interface as the NN |
 | D6 | GPU | Training defaults to GPU; `torch.cuda.is_available()` asserted unless `--cpu` or `MJAI_CPU=1`. **No silent degradation.** |
 | D7 | Environment | Python `==3.12.*` fixed; `uv` + `pyproject.toml` + `uv.lock` |

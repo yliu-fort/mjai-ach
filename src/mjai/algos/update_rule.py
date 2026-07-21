@@ -9,10 +9,11 @@ batch came from mirror self-play or a league opponent pool.
 Adding an algorithm (AGENTS.md §4 "Algo rule") = new ``UpdateRule`` subclass.
 No edits to Trainer or pipeline.
 
-Two implementations ship in Phase 1:
-  - :class:`mjai.algos.ppo.PPOUpdate` — clipped surrogate + value MSE + entropy
-  - :class:`mjai.algos.ach.ACHUpdate` — REINFORCE + critic baseline + entropy,
-    no PPO clipping (the Hedge/replicator limit; AGENTS.md §1 D4)
+Two implementation families ship in Phase 1:
+  - :mod:`mjai.algos.nn_updates` — :class:`NNPPOUpdate` (reference PPO) and
+    :class:`NNACHUpdate` (paper-faithful ACH, AGENTS.md §1 D4) on torch MLPs.
+  - :mod:`mjai.algos.tabular_updates` — tabular PPO / ACH (CFR+ wrapper) on
+    dict-backed policies.
 """
 
 from __future__ import annotations
@@ -28,16 +29,32 @@ from mjai.algos.transition import Batch, UpdateStats
 class AlgoConfig:
     """Shared hyperparameters consumed by every UpdateRule.
 
-    Concrete rules add their own config dataclasses; this holds only the fields
-    common to PPO and ACH so the Trainer can construct either from one source.
+    All fields are wired from the experiment YAML (AGENTS.md §9 — no magic
+    numbers in code). ACH-specific fields (``eta``, ``l_th``, ``ratio_eps``)
+    are ignored by PPO; ``clip_eps`` lives on the PPO endpoint itself.
+
+    Defaults follow the ACH paper's Appendix H.3 (p27-28) where applicable:
+    eta=1.0, l_th=2.0 (p28 Table 8); ``ratio_eps`` is vacuous under synchronous
+    single-threaded self-play (p28) and only matters for async sampling.
+
+    Attributes:
+        optimizer: ``"sgd"`` | ``"adam"`` | None. None = the endpoint's own
+            default (ACH: SGD constant LR, paper p27; PPO: Adam eps=1e-5).
+        max_grad_norm: grad-norm clip; ``<= 0`` disables (paper mentions no
+            clipping, so the ACH reproduction configs disable it).
+        gae_lambda: lambda for the rollout's per-player GAE (paper H.3 unspecified;
+            0.95 follows the paper's Mahjong/FHP choice — spec assumption A1).
     """
 
     learning_rate: float = 3e-4
     value_coef: float = 0.5
     entropy_coef: float = 0.01
     max_grad_norm: float = 0.5
-    discount: float = 1.0  # IIG returns-to-go is undiscounted over an episode
-    gae_lambda: float = 0.95  # only used by PPO's GAE; ACH uses plain returns
+    gae_lambda: float = 0.95
+    optimizer: str | None = None
+    eta: float = 1.0
+    l_th: float = 2.0
+    ratio_eps: float = 0.5
 
 
 class UpdateRule(ABC):

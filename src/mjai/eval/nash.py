@@ -13,8 +13,6 @@ The mjai Policy → OpenSpiel Policy adapter lives in :class:`_PolicyAdapter`.
 
 from __future__ import annotations
 
-import contextlib
-
 import numpy as np
 import pyspiel
 from open_spiel.python import policy as ospolicy
@@ -119,15 +117,22 @@ def evaluate_equilibrium(spec: GameSpec, policy: Policy) -> dict[str, float]:
     """Run whichever equilibrium metric(s) apply, return as a dict.
 
     Always returns nash_conv when computable; adds exploitability for
-    turn-based games and exact_nash_distance for BRPS.
+    turn-based games and exact_nash_distance for BRPS. A metric that raises
+    (unsupported game/policy combo) is skipped WITH a warning — never silently
+    (AGENTS.md: no silent fallback).
     """
+    import warnings
+
     out: dict[str, float] = {}
     if spec.name == "brps":
         out["exact_nash_distance"] = distance_to_brps_nash(policy, num_actions=spec.num_actions)
-    # Some games / policy combos may not be evaluable by nash_conv; skip silently.
-    with contextlib.suppress(Exception):
+    try:
         out["nash_conv"] = nash_conv_of(spec, policy)
+    except Exception as e:
+        warnings.warn(f"nash_conv not computable for {spec.name}: {e}", stacklevel=2)
     if not spec.is_simultaneous and spec.num_players == 2:
-        with contextlib.suppress(Exception):
+        try:
             out["exploitability"] = exploitability_of(spec, policy)
+        except Exception as e:
+            warnings.warn(f"exploitability not computable for {spec.name}: {e}", stacklevel=2)
     return out

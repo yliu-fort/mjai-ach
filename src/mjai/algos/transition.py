@@ -27,7 +27,8 @@ class Transition:
     action: int  # chosen action id (must be in legal_actions)
     logprob: float  # log P(action | obs) under the behavior policy
     value: float  # V(obs) baseline estimate at sample time
-    reward: float  # immediate reward received
+    reward: float  # terminal payoff attached at every step (Phase-1 games have
+    # zero mid-episode rewards; downstream consumers use return_/advantage)
     return_: float  # Monte-Carlo (or bootstrapped) return-to-go
     advantage: float = 0.0  # GAE/return - value; filled in by the UpdateRule
     player: int = 0  # which player this transition belongs to

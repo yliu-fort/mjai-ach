@@ -1,0 +1,38 @@
+# Paper-faithful ACH reproduction: Leduc poker (Fu et al. ICLR 2022, Appendix G
+# p25-26 + H.3 p27-28). OpenSpiel default game params (configs/games/leduc.yaml).
+game: leduc
+algo: ach
+self_play_mode: mirror
+policy_kind: mlp
+# Network (p25): 1 hidden FC layer of 128 units + ReLU, then two linear heads.
+hidden_sizes: [128]
+activation: relu
+# Optimization (H.3, p27): SGD with constant learning rate, best lr=1e-3.
+optimizer: sgd
+learning_rate: 0.001
+# α=2.0 (p27 Table 7) ⇔ value_coef=1.0 in our value_coef·MSE form (α/2·(V−G)²).
+value_coef: 1.0
+entropy_coef: 0.01     # β = 1e-2 (p28 Table 8)
+gae_lambda: 0.95       # spec assumption A1 (H.3 unspecified; Mahjong/FHP use 0.95)
+max_grad_norm: 0.0     # disabled — the paper mentions no grad clipping
+eta: 1.0               # hedge coefficient η(s) (p27 Table 7)
+l_th: 2.0              # one-sided logit gate threshold (p28 Table 8)
+ratio_eps: 0.5         # ratio gate; vacuous under synchronous single-thread (p28)
+# Batch = 64 samples (p28 Table 8): whole episodes until ≥64 transitions.
+target_samples: 64
+episodes_per_round: 200  # safety cap only (target_samples stops first)
+# Env-step protocol (p25-26): evaluate every 1e5 steps, train to 1e7 steps.
+total_env_steps: 10000000
+eval_every_env_steps: 100000
+# Legacy round-mode fields (unused while total_env_steps is set).
+n_steps: 1000000
+save_every_steps: 1000
+eval_every_steps: 1000
+eval_during_training: true
+verbose: false
+seed: 0
+out_dir: runs/reproduce/leduc_ach_mlp_mirror/seed_0
+hedge_eta: null
+clip_eps: 0.2
+league_capacity: 16
+device: null
