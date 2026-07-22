@@ -1,10 +1,16 @@
-"""Mirror-vs-league A/B probe (F2): exploitability convergence comparison.
+"""Mirror-vs-league A/B probe (F2): equilibrium-metric convergence comparison.
 
-Arms: {kuhn, brps} x {mirror, league}, N seeds each, paper-faithful ACH
-protocol loaded from configs/exp/<game>_ach_mlp_<mode>.yaml with the step
-budget overridden. Each arm writes runs/league_probe/<game>_<mode>/seed_S
-(+ a DONE marker); --summarize aggregates the TB eval curves into per-arm
-mean/min/max bands (summary.json) and a two-panel figure.
+Arms: all 7 Phase-1 games (AGENTS.md D8) x {mirror, league}, N seeds each,
+paper-faithful ACH protocol loaded from configs/exp/<game>_ach_mlp_<mode>.yaml
+with the step budget overridden. Each arm writes
+runs/league_probe/<game>_<mode>/seed_S (+ a DONE marker); --summarize
+aggregates the TB eval curves into per-arm mean/min/max bands (summary.json)
+and a per-game panel-grid figure.
+
+Equilibrium metric per run follows the fallback chain of
+src/mjai/eval/plots.py (exploitability for sequential games, nash_conv for
+simultaneous ones): eval/exploitability -> eval/nash_conv ->
+eval/exact_nash_distance; the first tag with any points wins.
 
 Usage::
 
@@ -18,27 +24,33 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import math
 import sys
 from pathlib import Path
 
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from tb_eval import read_many  # noqa: E402
+from tb_eval import read_many
 
-from mjai.scripts.experiment import ExperimentConfig, run_experiment  # noqa: E402
+from mjai.scripts.experiment import ExperimentConfig, run_experiment
 
 REPO = Path(__file__).resolve().parents[1]
 PROBE_ROOT = REPO / "runs" / "league_probe"
-GAMES = ("kuhn", "brps")
+# All 7 Phase-1 games (AGENTS.md D8); sequential-metric games first so each
+# figure row shares one equilibrium metric.
+GAMES = ("kuhn", "leduc", "liars_dice1", "ttt", "brps", "goofspiel5_ii", "oshi_zumo")
 MODES = ("mirror", "league")
+# Equilibrium-metric fallback chain, mirroring mjai.eval.plots
+# (metric_key + fallback_keys): the first tag with any points wins per run.
+EVAL_TAG_CHAIN = ("eval/exploitability", "eval/nash_conv", "eval/exact_nash_distance")
 
 
 def parse_seeds(spec: str) -> list[int]:
     """Parse "0-3", "0,2,5" or "3" into a sorted unique seed list."""
     seeds: set[int] = set()
-    for part in spec.split(","):
-        part = part.strip()
+    for raw in spec.split(","):
+        part = raw.strip()
         if not part:
             continue
         if "-" in part:
@@ -118,10 +130,39 @@ def band(curves: list[list[tuple[int, float]]], grid: list[int]) -> dict[str, li
     return {"grid": grid, "mean": mean, "min": lo, "max": hi, "n_seeds": n}
 
 
-def summarize(root: Path = PROBE_ROOT, tag: str = "eval/exploitability") -> dict[str, object]:
+def read_curves_fallback(
+    tb_dirs: list[str | Path], tags: tuple[str, ...] = EVAL_TAG_CHAIN
+) -> tuple[dict[str, list[tuple[int, float]]], dict[str, str]]:
+    """Read each run's eval curve, falling back through ``tags`` per run.
+
+    The first tag yielding any points wins (sequential games log
+    exploitability; simultaneous ones only nash_conv). Returns the curves
+    keyed by tb_dir string plus the winning tag per tb_dir.
+    """
+    curves: dict[str, list[tuple[int, float]]] = {}
+    used_tag: dict[str, str] = {}
+    pending = [str(d) for d in tb_dirs]
+    for tag in tags:
+        if not pending:
+            break
+        batch = read_many(pending, tag=tag)
+        retry = []
+        for d, curve in batch.items():
+            if curve:
+                curves[d] = curve
+                used_tag[d] = tag
+            else:
+                retry.append(d)
+        pending = retry
+    for d in pending:  # no tag produced points — keep as empty (band=None)
+        curves[d] = []
+    return curves, used_tag
+
+
+def summarize(root: Path = PROBE_ROOT, tags: tuple[str, ...] = EVAL_TAG_CHAIN) -> dict[str, object]:
     """Aggregate all finished arms under root into bands + write summary.json."""
     tb_dirs = sorted(root.glob("*_*/seed_*/tb"))
-    curves = read_many(tb_dirs, tag=tag)
+    curves, used_tag = read_curves_fallback(tb_dirs, tags)
     by_arm: dict[str, dict[str, list[tuple[int, float]]]] = {}
     for d, curve in curves.items():
         p = Path(d)
@@ -131,34 +172,55 @@ def summarize(root: Path = PROBE_ROOT, tag: str = "eval/exploitability") -> dict
     for arm, seeds in sorted(by_arm.items()):
         seed_curves = [c for _, c in sorted(seeds.items()) if c]
         grid = sorted({x for c in seed_curves for x, _ in c})
+        arm_tags = sorted({used_tag.get(str(root / arm / s / "tb"), "") for s in seeds} - {""})
         result[arm] = {
             "seeds": sorted(seeds),
-            "done": sorted(
-                s for s in seeds if (root / arm / s / "DONE").exists()
-            ),
+            "done": sorted(s for s in seeds if (root / arm / s / "DONE").exists()),
+            "tag": arm_tags[0] if len(arm_tags) == 1 else arm_tags,
             "final_per_seed": {s: c[-1][1] for s, c in sorted(seeds.items()) if c},
             "band": band(seed_curves, grid) if grid else None,
         }
-    (root / "summary.json").write_text(
-        json.dumps(result, indent=2), encoding="utf-8"
-    )
+    (root / "summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
 
 
+def _arm_metric(arm: object) -> str:
+    """Short equilibrium-metric name recorded for an arm ("" if unknown)."""
+    if not isinstance(arm, dict):
+        return ""
+    tag = arm.get("tag")
+    if isinstance(tag, list):
+        tag = tag[0] if tag else ""
+    return tag.removeprefix("eval/") if isinstance(tag, str) else ""
+
+
 def render_figure(summary: dict[str, object], root: Path = PROBE_ROOT) -> Path | None:
-    """Two-panel mean+min/max-band figure, one panel per game; None if no data."""
+    """Per-game panel grid of mean+min/max bands; empty panels hidden.
+
+    One panel per game in ``GAMES`` (2 rows x 4 cols for 7 games); each
+    panel's title names the equilibrium metric its curves came from.
+    Returns None if no arm has data.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(1, len(GAMES), figsize=(11, 4.2), sharey=False)
+    ncols = 4
+    nrows = math.ceil(len(GAMES) / ncols)
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(ncols * 4.6, nrows * 4.2), sharey=False, squeeze=False
+    )
     drew = False
-    for ax, game in zip(axes, GAMES, strict=True):
+    for idx, game in enumerate(GAMES):
+        ax = axes[idx // ncols][idx % ncols]
+        metric = ""
+        panel_drew = False
         for mode, style in (("mirror", "-"), ("league", "--")):
             arm = summary.get(f"{game}_{mode}")
-            if not arm or not arm.get("band"):
+            if not arm or not isinstance(arm, dict) or not arm.get("band"):
                 continue
+            metric = metric or _arm_metric(arm)
             b = arm["band"]
             grid, mean = b["grid"], b["mean"]
             xs = [g for g, m in zip(grid, mean, strict=True) if m is not None]
@@ -169,12 +231,16 @@ def render_figure(summary: dict[str, object], root: Path = PROBE_ROOT) -> Path |
             hi = [v for v in b["max"] if v is not None]
             ax.plot(xs, ys, style, label=f"{mode} (n={max(b['n_seeds'])})")
             ax.fill_between(xs, lo, hi, alpha=0.2)
-            drew = True
-        ax.set_title(f"{game}: exploitability vs env-steps")
+            drew = panel_drew = True
+        ax.set_title(f"{game}: {metric or 'equilibrium metric'} vs env-steps")
         ax.set_xlabel("env steps (league counts collector-seat decisions)")
-        ax.legend()
+        if panel_drew:  # legend() with no labeled artists warns (tests: -W error)
+            ax.legend()
         ax.grid(alpha=0.3)
-    axes[0].set_ylabel("exploitability")
+        if idx % ncols == 0:
+            ax.set_ylabel(metric or "equilibrium metric")
+    for idx in range(len(GAMES), nrows * ncols):
+        axes[idx // ncols][idx % ncols].set_visible(False)
     if not drew:
         return None
     out = root / "figs" / "ab_exploitability.png"
