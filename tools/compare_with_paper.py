@@ -45,6 +45,13 @@ GAME_TITLES = {
 # Digitized paper JSON keys (docs/figs/fig10_ach_digitized.json) per game dir name.
 PAPER_KEYS = {"kuhn": "kuhn", "leduc": "leduc", "liars_dice1": "liars"}
 GRID_POINTS = 200
+# Run-dir glob suffix under --root; the mirror arm is the default (paper protocol).
+DEFAULT_PATTERN = "*_ach_mlp_mirror"
+
+
+def pattern_suffix(pattern: str) -> str:
+    """Strip the leading ``*`` from a run-dir glob, leaving the name suffix."""
+    return pattern.lstrip("*")
 
 
 def _interp(curve: list[tuple[int, float]], grid: np.ndarray) -> np.ndarray:
@@ -129,6 +136,11 @@ def main() -> int:
     parser.add_argument("--paper", default="docs/figs/fig10_ach_digitized.json")
     parser.add_argument("--out-dir", default="docs/figs")
     parser.add_argument("--json", default="docs/reproduce_comparison.json")
+    parser.add_argument(
+        "--pattern",
+        default=DEFAULT_PATTERN,
+        help="Run-dir glob under --root (default: %(default)s).",
+    )
     args = parser.parse_args()
 
     root = Path(args.root)
@@ -137,8 +149,9 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     report: dict[str, Any] = {}
+    suffix = pattern_suffix(args.pattern)
     for game in GAMES:
-        seed_dirs = sorted(root.glob(f"{game}_ach_mlp_mirror/seed_*"))
+        seed_dirs = sorted(root.glob(f"{game}{suffix}/seed_*"))
         done_dirs = [sd for sd in seed_dirs if (sd / "DONE").exists()]
         curves_map = read_many([sd / "tb" for sd in done_dirs])
         curves_raw = [(sd.name, c) for sd in done_dirs if (c := curves_map.get(str(sd / "tb"), []))]

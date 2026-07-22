@@ -9,6 +9,7 @@ themselves live only in TensorBoard (AGENTS.md §1 D9).
 Usage (repo venv)::
 
     python tools/summarize_reproduce.py --root runs/reproduce --out summary.json
+    python tools/summarize_reproduce.py --pattern '*_ach_mlp_league' --out league.json
 """
 
 from __future__ import annotations
@@ -23,6 +24,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tb_eval import read_many
 
 CHECKPOINT_STEPS = [100_000, 1_000_000, 5_000_000, 10_000_000]
+# Run-dir glob under --root; the mirror arm is the default (paper protocol).
+DEFAULT_PATTERN = "*_ach_mlp_mirror"
+
+
+def pattern_suffix(pattern: str) -> str:
+    """Strip the leading ``*`` from a run-dir glob, leaving the name suffix."""
+    return pattern.lstrip("*")
+
+
+def game_from_dirname(dirname: str, pattern: str = DEFAULT_PATTERN) -> str:
+    """Recover the game name from a run dir like ``kuhn_ach_mlp_mirror``."""
+    suffix = pattern_suffix(pattern)
+    if suffix and dirname.endswith(suffix):
+        return dirname[: -len(suffix)]
+    return dirname
 
 
 def _at(curve: list[tuple[int, float]], target: int) -> float | None:
@@ -36,16 +52,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument("--root", default="runs/reproduce")
     parser.add_argument("--out", required=True)
+    parser.add_argument(
+        "--pattern",
+        default=DEFAULT_PATTERN,
+        help="Run-dir glob under --root (default: %(default)s).",
+    )
     args = parser.parse_args()
 
     root = Path(args.root)
-    seed_dirs = sorted(root.glob("*_ach_mlp_mirror/seed_*"))
+    seed_dirs = sorted(root.glob(f"{args.pattern}/seed_*"))
     done_dirs = [sd for sd in seed_dirs if (sd / "DONE").exists()]
     curves = read_many([sd / "tb" for sd in done_dirs])
 
     runs: dict[str, dict[str, Any]] = {}
     for sd in done_dirs:
-        game = sd.parent.name.replace("_ach_mlp_mirror", "")
+        game = game_from_dirname(sd.parent.name, args.pattern)
         seed = sd.name.replace("seed_", "")
         curve = curves.get(str(sd / "tb"), [])
         entry: dict[str, Any] = {"done": True, "n_evals": len(curve)}
