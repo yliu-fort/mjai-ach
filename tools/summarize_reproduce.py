@@ -1,10 +1,10 @@
 """Summarize ACH paper-reproduction runs into a single JSON (analysis tool).
 
-Walks ``runs/reproduce/*_ach_mlp_mirror/seed_*/tb`` TensorBoard event files and
-aggregates the ``eval/exploitability`` curve of each run: final value, best
+Walks completed (DONE-marked) runs under ``runs/reproduce/*_ach_mlp_mirror/seed_*``
+and aggregates each run's ``eval/exploitability`` curve: final value, best
 (min) value, and values at 1e5 / 1e6 / 5e6 / 1e7 env-steps. Emits per-game
-mean/min/max across seeds. This is a read-only analysis entry point; training
-metrics themselves live only in TensorBoard (AGENTS.md §1 D9).
+mean/min/max across seeds. Read-only analysis entry point; training metrics
+themselves live only in TensorBoard (AGENTS.md §1 D9).
 
 Usage (repo venv)::
 
@@ -15,21 +15,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
-from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tb_eval import read_many
 
 CHECKPOINT_STEPS = [100_000, 1_000_000, 5_000_000, 10_000_000]
-
-
-def _run_curve(tb_dir: Path) -> list[tuple[int, float]]:
-    ea = EventAccumulator(str(tb_dir))
-    ea.Reload()
-    tag = "eval/exploitability"
-    if tag not in ea.Tags()["scalars"]:
-        return []
-    return [(int(s.step), float(s.value)) for s in ea.Scalars(tag)]
 
 
 def _at(curve: list[tuple[int, float]], target: int) -> float | None:
@@ -46,27 +39,29 @@ def main() -> int:
     args = parser.parse_args()
 
     root = Path(args.root)
+    seed_dirs = sorted(root.glob("*_ach_mlp_mirror/seed_*"))
+    done_dirs = [sd for sd in seed_dirs if (sd / "DONE").exists()]
+    curves = read_many([sd / "tb" for sd in done_dirs])
+
     runs: dict[str, dict[str, Any]] = {}
-    for seed_dir in sorted(root.glob("*_ach_mlp_mirror/seed_*")):
-        game = seed_dir.parent.name.replace("_ach_mlp_mirror", "")
-        seed = seed_dir.name.replace("seed_", "")
-        tb = seed_dir / "tb"
-        curve = _run_curve(tb) if tb.exists() else []
-        done = (seed_dir / "DONE").exists()
-        if not curve:
-            runs.setdefault(game, {})[seed] = {"done": done, "n_evals": 0}
-            continue
-        runs.setdefault(game, {})[seed] = {
-            "done": done,
-            "n_evals": len(curve),
-            "final": curve[-1][1],
-            "best": min(v for _, v in curve),
-            "at": {str(t): _at(curve, t) for t in CHECKPOINT_STEPS},
-        }
+    for sd in done_dirs:
+        game = sd.parent.name.replace("_ach_mlp_mirror", "")
+        seed = sd.name.replace("seed_", "")
+        curve = curves.get(str(sd / "tb"), [])
+        entry: dict[str, Any] = {"done": True, "n_evals": len(curve)}
+        if curve:
+            entry.update(
+                {
+                    "final": curve[-1][1],
+                    "best": min(v for _, v in curve),
+                    "at": {str(t): _at(curve, t) for t in CHECKPOINT_STEPS},
+                }
+            )
+        runs.setdefault(game, {})[seed] = entry
 
     per_game: dict[str, Any] = {}
     for game, seeds in runs.items():
-        finals = [r["final"] for r in seeds.values() if r.get("done") and "final" in r]
+        finals = [r["final"] for r in seeds.values() if "final" in r]
         per_game[game] = {
             "n_done": len(finals),
             "final_mean": sum(finals) / len(finals) if finals else None,

@@ -1,9 +1,10 @@
 """Compare ACH reproduction runs against the digitized paper Fig 10 curves.
 
-Reads ``eval/exploitability`` TensorBoard curves from reproduction run dirs,
-aggregates seeds (mean / min / max on a common env-step grid), overlays them
-with the digitized paper curves (``docs/figs/fig10_ach_digitized.json``), and
-emits a per-game pass/fail verdict under the pre-declared D5 criterion:
+Reads ``eval/exploitability`` curves from completed (DONE-marked) reproduction
+run dirs, aggregates seeds (mean / min / max on a common env-step grid),
+overlays them with the digitized paper curves
+(``docs/figs/fig10_ach_digitized.json``), and emits a per-game pass/fail
+verdict under the pre-declared D5 criterion:
 
   pass  <=>  our final mean falls inside the paper's 8-run range at the final
              x, OR |our mean - paper mean| <= half the paper's range width.
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +32,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tb_eval import read_many
 
 GAMES = ["kuhn", "liars_dice1", "leduc"]  # display order: smallest y-range first
 GAME_TITLES = {
@@ -38,19 +42,9 @@ GAME_TITLES = {
     "leduc": "Leduc poker",
     "liars_dice1": "Liar's Dice",
 }
+# Digitized paper JSON keys (docs/figs/fig10_ach_digitized.json) per game dir name.
+PAPER_KEYS = {"kuhn": "kuhn", "leduc": "leduc", "liars_dice1": "liars"}
 GRID_POINTS = 200
-
-
-def _seed_curves(seed_dir: Path) -> list[tuple[int, float]]:
-    tb = seed_dir / "tb"
-    if not tb.exists():
-        return []
-    ea = EventAccumulator(str(tb))
-    ea.Reload()
-    tag = "eval/exploitability"
-    if tag not in ea.Tags()["scalars"]:
-        return []
-    return [(int(s.step), float(s.value)) for s in ea.Scalars(tag)]
 
 
 def _interp(curve: list[tuple[int, float]], grid: np.ndarray) -> np.ndarray:
@@ -91,9 +85,10 @@ def main() -> int:
     report: dict[str, Any] = {}
     for game in GAMES:
         seed_dirs = sorted(root.glob(f"{game}_ach_mlp_mirror/seed_*"))
-        curves_raw = [(sd.name, _seed_curves(sd)) for sd in seed_dirs]
-        curves_raw = [(n, c) for n, c in curves_raw if c]
-        if not curves_raw or game not in paper:
+        done_dirs = [sd for sd in seed_dirs if (sd / "DONE").exists()]
+        curves_map = read_many([sd / "tb" for sd in done_dirs])
+        curves_raw = [(sd.name, c) for sd in done_dirs if (c := curves_map.get(str(sd / "tb"), []))]
+        if not curves_raw or PAPER_KEYS[game] not in paper:
             report[game] = {"status": "no data", "n_seeds": len(curves_raw)}
             continue
 
@@ -102,10 +97,11 @@ def main() -> int:
         ours = [_interp(c, grid) for _, c in curves_raw]
         om, olo, ohi = _band_stats(ours)
 
-        px = np.array(paper[game]["x"], dtype=float)
-        pm = np.array(paper[game]["mean"], dtype=float)
-        plo = np.array(paper[game]["lo"], dtype=float)
-        phi = np.array(paper[game]["hi"], dtype=float)
+        pkey = PAPER_KEYS[game]
+        px = np.array(paper[pkey]["x"], dtype=float)
+        pm = np.array(paper[pkey]["mean"], dtype=float)
+        plo = np.array(paper[pkey]["lo"], dtype=float)
+        phi = np.array(paper[pkey]["hi"], dtype=float)
         pm_g = np.interp(grid, px, pm, left=np.nan, right=np.nan)
         plo_g = np.interp(grid, px, plo, left=np.nan, right=np.nan)
         phi_g = np.interp(grid, px, phi, left=np.nan, right=np.nan)
@@ -122,9 +118,13 @@ def main() -> int:
 
         # --- overlay plot ---
         fig, ax = plt.subplots(figsize=(7, 4.5), dpi=150)
-        ax.fill_between(grid / 1e7, plo_g, phi_g, color="tab:red", alpha=0.15, label="paper 8-run range")
+        ax.fill_between(
+            grid / 1e7, plo_g, phi_g, color="tab:red", alpha=0.15, label="paper 8-run range"
+        )
         ax.plot(grid / 1e7, pm_g, color="tab:red", ls="--", lw=1.5, label="paper ACH mean (Fig 10)")
-        ax.fill_between(grid / 1e7, olo, ohi, color="tab:blue", alpha=0.15, label=f"ours range (n={len(ours)})")
+        ax.fill_between(
+            grid / 1e7, olo, ohi, color="tab:blue", alpha=0.15, label=f"ours range (n={len(ours)})"
+        )
         ax.plot(grid / 1e7, om, color="tab:blue", lw=1.8, label="ours ACH mean")
         ax.set_xlabel("Training Steps (x1e7)")
         ax.set_ylabel("Exploitability")
