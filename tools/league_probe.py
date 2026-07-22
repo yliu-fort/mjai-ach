@@ -262,10 +262,16 @@ def main() -> int:
     parser.add_argument("--total-env-steps", type=int, default=60_000)
     parser.add_argument("--eval-every", type=int, default=5_000)
     parser.add_argument("--summarize", action="store_true")
+    parser.add_argument(
+        "--root",
+        default=str(PROBE_ROOT),
+        help="Probe output root (default: runs/league_probe).",
+    )
     args = parser.parse_args()
+    root = Path(args.root)
     if args.summarize:
-        summary = summarize()
-        fig = render_figure(summary)
+        summary = summarize(root)
+        fig = render_figure(summary, root)
         print(json.dumps({a: v.get("final_per_seed") for a, v in summary.items()}, indent=2))
         if fig:
             print(f"figure: {fig}")
@@ -278,6 +284,7 @@ def main() -> int:
         args.seed,
         total_env_steps=args.total_env_steps,
         eval_every_env_steps=args.eval_every,
+        root=root,
     )
     print(f"DONE {out}")
     return 0
