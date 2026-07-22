@@ -1,4 +1,10 @@
-"""Tic-Tac-Toe renderer: 3x3 grid, perfect info (observer_player unused)."""
+"""Tic-Tac-Toe renderer: 3x3 grid, perfect info (observer_player unused).
+
+OpenSpiel's tic_tac_toe observation tensor is 3 planes of 9, ordered by
+``CellState`` — plane 0 = empty cells, plane 1 = noughts (O, player 1),
+plane 2 = crosses (X, player 0). The tensor is board-absolute (verified
+empirically: identical for both observers), so we always read player 0's.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +13,10 @@ import pyspiel
 from mjai.cli.interfaces import GameRenderer
 
 _MARKS = {0: "X", 1: "O", -1: "."}
+
+# Plane offsets within the 27-element observation tensor (see module docstring).
+_O_PLANE = 9
+_X_PLANE = 18
 
 
 def create() -> GameRenderer:
@@ -18,15 +28,15 @@ class _TTTRenderer:
         if state.is_terminal():
             return self.render_terminal(state)
         board = state.observation_tensor(0)
-        # TTT observation is 3 planes of 9 (one per player's marks); flatten to marks.
         cells = [["."] * 3 for _ in range(3)]
         for r in range(3):
             for c in range(3):
                 idx = r * 3 + c
-                if board[idx] == 1:
+                if board[idx + _X_PLANE] == 1:
                     cells[r][c] = "X"
-                elif board[idx + 9] == 1:
+                elif board[idx + _O_PLANE] == 1:
                     cells[r][c] = "O"
+                # else plane0 (empty) is set -> "."
         rows = ["  0 1 2", "  -----"]
         for r in range(3):
             rows.append(f"{r} " + " ".join(cells[r]))
