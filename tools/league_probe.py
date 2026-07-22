@@ -25,6 +25,7 @@ import argparse
 import dataclasses
 import json
 import math
+import shutil
 import sys
 from pathlib import Path
 
@@ -83,6 +84,7 @@ def run_arm(
     total_env_steps: int,
     eval_every_env_steps: int,
     root: Path = PROBE_ROOT,
+    progress_bar: bool = False,
 ) -> Path:
     out = arm_dir(root, game, mode, seed)
     cfg = dataclasses.replace(
@@ -96,10 +98,51 @@ def run_arm(
         # real main history inside the probe budget (B3).
         league_main_save_every_rounds=25,
         verbose=False,
+        progress_bar=progress_bar,
     )
     run_experiment(cfg)
     (out / "DONE").write_text("ok\n", encoding="utf-8")
+    mark_best_checkpoint(out)
     return out
+
+
+def mark_best_checkpoint(
+    out_dir: Path, tags: tuple[str, ...] = EVAL_TAG_CHAIN
+) -> dict[str, object] | None:
+    """Copy the checkpoint with the best (lowest) eval metric to ``checkpoints/best``.
+
+    Reads ``train_curve.json`` (one row per eval point), picks the row with the
+    lowest value on the first available tag of the fallback chain, copies that
+    ``step_N`` checkpoint dir, and writes ``best.json`` next to it — so the
+    best snapshot is directly loadable (e.g. by the play CLI). Returns the
+    best-row info, or None loudly when no curve/checkpoint exists.
+    """
+    curve_file = out_dir / "train_curve.json"
+    if not curve_file.is_file():
+        return None
+    rows = json.loads(curve_file.read_text(encoding="utf-8"))
+    for tag in tags:
+        scored = [(float(r[tag]), r) for r in rows if tag in r]
+        if scored:
+            break
+    else:
+        return None
+    value, best_row = min(scored, key=lambda t: t[0])
+    src = out_dir / "checkpoints" / f"step_{best_row['step']}"
+    if not src.is_dir():
+        return None
+    dst = out_dir / "checkpoints" / "best"
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst)
+    info: dict[str, object] = {
+        "tag": tag,
+        "value": value,
+        "step": best_row["step"],
+        "env_steps": best_row.get("env_steps"),
+    }
+    (dst / "best.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
+    return info
 
 
 def interp_forward(curve: list[tuple[int, float]], grid: list[int]) -> list[float | None]:

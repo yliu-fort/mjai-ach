@@ -10,6 +10,10 @@ tools/league_probe.py — nothing is reimplemented (AGENTS.md §7).
 Run: uv run python tools/build_league_notebooks.py
 """
 
+# The generated notebooks carry Chinese prose; allow fullwidth punctuation in
+# this file's strings/comments (RUF001/2/3) rather than mangling the text.
+# ruff: noqa: RUF001, RUF002, RUF003
+
 from __future__ import annotations
 
 import json
@@ -77,7 +81,9 @@ CELLS: list[dict] = []
 
 
 def md(text: str) -> None:
-    CELLS.append({"cell_type": "markdown", "metadata": {}, "source": text.splitlines(keepends=True)})
+    CELLS.append(
+        {"cell_type": "markdown", "metadata": {}, "source": text.splitlines(keepends=True)}
+    )
 
 
 def code(text: str) -> None:
@@ -103,6 +109,10 @@ HEADER_MD = """# A/B 验证 · {game}（mirror vs league）
 - 指标：{metric}。
 - 输出目录：`runs/nb_ab/{game}/<mode>/seed_N/`（含 `DONE` 标记；**重复执行训练
   cell 会跳过已完成臂**，中断后续跑即可）。
+- **SOTA checkpoint**：每臂训练完自动把评估指标最优的 checkpoint 复制为
+  `checkpoints/best/`（附 `best.json` 记录指标值与 env_steps）——可直接在
+  `mjai-play` 里加载试玩。
+- **进度**：训练时每个臂有 tqdm 实时进度条（`SHOW_TQDM`）。
 - 注意：{note}
 - 口径脚注：league 的 1 env-step 只计收集角色 seat-0 决策（mirror 计两座），
   横比时同名预算的实际剂量不同（docs/league_investigation.md §2.1）。
@@ -110,16 +120,17 @@ HEADER_MD = """# A/B 验证 · {game}（mirror vs league）
 **直接 Runtime → Run All 即可**；想加深/加宽，改下一格的参数后重跑（已完成的
 臂不会被重训）。"""
 
-PARAMS_CODE = '''# === Parameters ===
+PARAMS_CODE = """# === Parameters ===
 GAME        = "{game}"
 MODES       = ["mirror", "league"]
 SEEDS       = [0, 1, 2, 3]
 TOTAL_ENV_STEPS = {total}   # per-arm budget (probe depth, not the paper's 1e7)
 EVAL_EVERY      = {eval_every}
+SHOW_TQDM   = True          # per-arm tqdm bar over env-steps
 from pathlib import Path
-OUT_ROOT = Path("runs/nb_ab") / GAME'''
+OUT_ROOT = Path("runs/nb_ab") / GAME"""
 
-SETUP_CODE = '''# === Setup: import the probe machinery (no logic reimplemented here) ===
+SETUP_CODE = """# === Setup: import the probe machinery (no logic reimplemented here) ===
 import sys
 from pathlib import Path
 
@@ -147,26 +158,35 @@ def train_all():
                     total_env_steps=TOTAL_ENV_STEPS,
                     eval_every_env_steps=EVAL_EVERY,
                     root=OUT_ROOT,
+                    progress_bar=SHOW_TQDM,
                 )
                 statuses.append((mode, seed, "done"))
             except Exception as e:  # keep going; report at the end
                 statuses.append((mode, seed, f"FAILED: {type(e).__name__}: {e}"))
             print(f"      -> {statuses[-1][2]}", flush=True)
-    return statuses'''
+    return statuses"""
 
 TRAIN_CODE = """# === Train (long cell: arms run sequentially; safe to re-run) ===
 statuses = train_all()
 for mode, seed, st in statuses:
     print(f"{mode:6s} seed={seed}: {st}")"""
 
-SUMMARY_CODE = """# === Aggregate curves + per-arm results table ===
+SUMMARY_CODE = """# === Aggregate curves + per-arm results table (incl. SOTA best ckpt) ===
+import json
+
 summary = league_probe.summarize(OUT_ROOT)
 for arm, data in summary.items():
     finals = data.get("final_per_seed", {})
     tag = data.get("tag", "?")
     vals = [round(v, 4) for v in finals.values()]
     mean = round(sum(finals.values()) / len(finals), 4) if finals else None
-    print(f"{arm:28s} tag={tag:26s} final/seed={vals}  mean={mean}  done={len(data.get('done', []))}/{len(finals)}")"""
+    print(f"{arm:28s} tag={tag:26s} final/seed={vals}  mean={mean}  done={len(data.get('done', []))}/{len(finals)}")
+print()
+print("SOTA best checkpoints (lowest eval point per run, copied to checkpoints/best):")
+for bj in sorted(OUT_ROOT.glob("*_*/seed_*/checkpoints/best/best.json")):
+    info = json.loads(bj.read_text(encoding="utf-8"))
+    rel = bj.parent.parent.parent.relative_to(OUT_ROOT)
+    print(f"  {str(rel):28s} {info['tag']}={info['value']:.4f} @ env_steps={info['env_steps']}")"""
 
 FIGURE_CODE = """# === Comparison figure (mean + min-max band across seeds) ===
 fig_path = league_probe.render_figure(summary, OUT_ROOT)
@@ -175,7 +195,7 @@ if fig_path:
 else:
     print("no curves yet")"""
 
-TELEMETRY_CODE = '''# === League health telemetry (league arms only; B7 scalars) ===
+TELEMETRY_CODE = """# === League health telemetry (league arms only; B7 scalars) ===
 import matplotlib.pyplot as plt
 from tb_eval import read_many
 
@@ -198,7 +218,7 @@ else:
         ax.grid(alpha=0.3)
     axes[0].legend(fontsize=7)
     fig.tight_layout()
-    plt.show()'''
+    plt.show()"""
 
 FOOTER_MD = """## 解读指南
 
@@ -211,6 +231,8 @@ FOOTER_MD = """## 解读指南
   docs/league_health_check.md）。
 - **已知口径**：league env-step 只计 seat-0 决策；exploiter 轮次（~2/3 轮）的
   梯度落在 main 上且 ratio 门控实际生效——结论请带此脚注。
+- **产物用法**：`checkpoints/best/` 是该臂的 SOTA 快照，`uv run mjai-play`
+  的 policy 列表会直接列出它（带 best 字样）；周期快照在 `checkpoints/step_*`。
 - 想更接近论文预算：把 `TOTAL_ENV_STEPS` 提到 1e5–1e6 重跑（已完成的臂会被
   跳过；注意更深的预算需要删除对应臂目录才能重训该臂）。"""
 
@@ -228,14 +250,18 @@ def build(game: str, spec: dict[str, object]) -> Path:
     nb = {
         "cells": list(CELLS),
         "metadata": {
-            "kernelspec": {"display_name": "Python 3 (mjai)", "language": "python", "name": "python3"},
+            "kernelspec": {
+                "display_name": "Python 3 (mjai)",
+                "language": "python",
+                "name": "python3",
+            },
             "language_info": {"name": "python", "version": "3.12"},
         },
         "nbformat": 4,
         "nbformat_minor": 5,
     }
     out = OUT_DIR / f"ab_{game}.ipynb"
-    out.write_text(json.dumps(nb, indent=1, ensure_ascii=False), encoding="utf-8")
+    out.write_text(json.dumps(nb, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
     return out
 
 

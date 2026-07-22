@@ -218,3 +218,47 @@ def test_render_figure_grid_covers_seven_games(tmp_path: Path):
 def test_render_figure_no_data_returns_none(tmp_path: Path):
     assert league_probe.render_figure({}, root=tmp_path) is None
     assert not (tmp_path / "figs" / "ab_exploitability.png").exists()
+
+
+def _fake_run_dir(root: Path, rows: list[dict], ckpt_steps: list[int]) -> Path:
+    """Minimal run dir: train_curve.json + empty step_N checkpoint dirs."""
+    run = root / "game_mode" / "seed_0"
+    (run / "checkpoints").mkdir(parents=True)
+    (run / "train_curve.json").write_text(json.dumps(rows), encoding="utf-8")
+    for s in ckpt_steps:
+        (run / "checkpoints" / f"step_{s}").mkdir()
+        (run / "checkpoints" / f"step_{s}" / "manifest.json").write_text("{}", encoding="utf-8")
+    return run
+
+
+def test_mark_best_checkpoint_picks_lowest_and_copies(tmp_path):
+    rows = [
+        {"step": 10, "env_steps": 5000, "eval/nash_conv": 3.0},
+        {"step": 20, "env_steps": 10000, "eval/nash_conv": 1.5},
+        {"step": 30, "env_steps": 15000, "eval/nash_conv": 2.2},
+    ]
+    run = _fake_run_dir(tmp_path, rows, [10, 20, 30])
+    info = league_probe.mark_best_checkpoint(run)
+    assert info == {"tag": "eval/nash_conv", "value": 1.5, "step": 20, "env_steps": 10000}
+    best = run / "checkpoints" / "best"
+    assert (best / "manifest.json").is_file()
+    assert json.loads((best / "best.json").read_text(encoding="utf-8"))["step"] == 20
+
+
+def test_mark_best_checkpoint_tag_fallback_and_missing_curve(tmp_path):
+    rows = [{"step": 10, "env_steps": 5000, "eval/exploitability": 0.4}]
+    run = _fake_run_dir(tmp_path, rows, [10])
+    info = league_probe.mark_best_checkpoint(run)
+    assert info["tag"] == "eval/exploitability"  # first chain tag present wins
+    # re-run replaces the previous best dir cleanly
+    info2 = league_probe.mark_best_checkpoint(run)
+    assert info2 == info
+    missing = tmp_path / "empty_run"
+    missing.mkdir()
+    assert league_probe.mark_best_checkpoint(missing) is None
+
+
+def test_mark_best_checkpoint_missing_step_dir_returns_none(tmp_path):
+    rows = [{"step": 99, "env_steps": 5000, "eval/nash_conv": 1.0}]
+    run = _fake_run_dir(tmp_path, rows, [10])  # no step_99 dir
+    assert league_probe.mark_best_checkpoint(run) is None

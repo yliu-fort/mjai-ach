@@ -61,6 +61,9 @@ class ExperimentConfig:
     # When True, run_experiment prints per-step training stats and per-eval
     # equilibrium metrics so the notebook / CLI shows live progress.
     verbose: bool = False
+    # tqdm bar over env-steps in the train loop (notebooks); off by default so
+    # batch/CI runs and unit tests stay quiet.
+    progress_bar: bool = False
     seed: int = 0
     out_dir: str = "runs/default"
     # When True, evaluate the current policy every ``eval_every_steps`` and
@@ -311,9 +314,22 @@ def _train_loop(
     next_eval_at = cfg.eval_every_env_steps
     stats: UpdateStats | None = None
     step = 0
+    bar = None
+    if cfg.progress_bar:
+        from tqdm.auto import tqdm  # type: ignore[import-untyped]
+
+        bar = tqdm(
+            total=cfg.total_env_steps,
+            desc=f"{cfg.game}/{cfg.algo}/{cfg.self_play_mode}/s{cfg.seed}",
+            unit="env-step",
+            dynamic_ncols=True,
+        )
     while _should_continue(cfg, step, env_steps):
         step += 1
-        env_steps += trainer.step().batch_size  # 1 env-step = 1 sampled decision point
+        batch_size = trainer.step().batch_size
+        env_steps += batch_size  # 1 env-step = 1 sampled decision point
+        if bar is not None:
+            bar.update(batch_size)
         stats = trainer.last_stats
         if stats:
             _log_stats(writer, step, stats)
@@ -351,6 +367,8 @@ def _train_loop(
                     env_steps,
                     checkpoint=False,
                 )
+    if bar is not None:
+        bar.close()
     return step, env_steps, stats
 
 
