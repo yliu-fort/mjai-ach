@@ -69,6 +69,60 @@ def _final_stats(grid: np.ndarray, values: np.ndarray) -> float:
     return float(np.mean(tail_vals)) if tail_vals.size else float("nan")
 
 
+def _verdict(
+    grid: np.ndarray,
+    om: np.ndarray,
+    pm_g: np.ndarray,
+    plo_g: np.ndarray,
+    phi_g: np.ndarray,
+) -> tuple[str, dict[str, Any]]:
+    ours_final = _final_stats(grid, om)
+    paper_final = _final_stats(grid, pm_g)
+    paper_lo = _final_stats(grid, plo_g)
+    paper_hi = _final_stats(grid, phi_g)
+    half_width = (paper_hi - paper_lo) / 2.0
+    inside = paper_lo <= ours_final <= paper_hi
+    close = abs(ours_final - paper_final) <= half_width
+    verdict = "pass" if (inside or close) else "fail"
+    return verdict, {
+        "ours_final": round(ours_final, 4),
+        "paper_final_mean": round(paper_final, 4),
+        "paper_final_range": [round(paper_lo, 4), round(paper_hi, 4)],
+    }
+
+
+def _plot_overlay(
+    fig_path: Path,
+    game: str,
+    grid: np.ndarray,
+    om: np.ndarray,
+    olo: np.ndarray,
+    ohi: np.ndarray,
+    pm_g: np.ndarray,
+    plo_g: np.ndarray,
+    phi_g: np.ndarray,
+    n: int,
+    verdict: str,
+) -> None:
+    fig, ax = plt.subplots(figsize=(7, 4.5), dpi=150)
+    ax.fill_between(
+        grid / 1e7, plo_g, phi_g, color="tab:red", alpha=0.15, label="paper 8-run range"
+    )
+    ax.plot(grid / 1e7, pm_g, color="tab:red", ls="--", lw=1.5, label="paper ACH mean (Fig 10)")
+    ax.fill_between(grid / 1e7, olo, ohi, color="tab:blue", alpha=0.15, label=f"ours range (n={n})")
+    ax.plot(grid / 1e7, om, color="tab:blue", lw=1.8, label="ours ACH mean")
+    ax.set_xlabel("Training Steps (x1e7)")
+    ax.set_ylabel("Exploitability")
+    ax.set_title(f"{GAME_TITLES[game]} — ACH reproduction vs paper  [{verdict}]")
+    ax.set_xlim(0, grid[-1] / 1e7)
+    ax.set_ylim(bottom=0)
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(fig_path)
+    plt.close(fig)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument("--root", default="runs/reproduce")
@@ -107,44 +161,17 @@ def main() -> int:
         phi_g = np.interp(grid, px, phi, left=np.nan, right=np.nan)
 
         # --- verdict (D5): final = mean over last 10% of x ---
-        ours_final = _final_stats(grid, om)
-        paper_final = _final_stats(grid, pm_g)
-        paper_lo = _final_stats(grid, plo_g)
-        paper_hi = _final_stats(grid, phi_g)
-        half_width = (paper_hi - paper_lo) / 2.0
-        inside = paper_lo <= ours_final <= paper_hi
-        close = abs(ours_final - paper_final) <= half_width
-        verdict = "pass" if (inside or close) else "fail"
+        verdict, verdict_stats = _verdict(grid, om, pm_g, plo_g, phi_g)
 
         # --- overlay plot ---
-        fig, ax = plt.subplots(figsize=(7, 4.5), dpi=150)
-        ax.fill_between(
-            grid / 1e7, plo_g, phi_g, color="tab:red", alpha=0.15, label="paper 8-run range"
-        )
-        ax.plot(grid / 1e7, pm_g, color="tab:red", ls="--", lw=1.5, label="paper ACH mean (Fig 10)")
-        ax.fill_between(
-            grid / 1e7, olo, ohi, color="tab:blue", alpha=0.15, label=f"ours range (n={len(ours)})"
-        )
-        ax.plot(grid / 1e7, om, color="tab:blue", lw=1.8, label="ours ACH mean")
-        ax.set_xlabel("Training Steps (x1e7)")
-        ax.set_ylabel("Exploitability")
-        ax.set_title(f"{GAME_TITLES[game]} — ACH reproduction vs paper  [{verdict}]")
-        ax.set_xlim(0, grid[-1] / 1e7)
-        ax.set_ylim(bottom=0)
-        ax.grid(alpha=0.3)
-        ax.legend(fontsize=8)
-        fig.tight_layout()
         fig_path = out_dir / f"compare_{game}.png"
-        fig.savefig(fig_path)
-        plt.close(fig)
+        _plot_overlay(fig_path, game, grid, om, olo, ohi, pm_g, plo_g, phi_g, len(ours), verdict)
 
         report[game] = {
             "status": "ok",
             "n_seeds": len(ours),
             "x_max_env_steps": x_max,
-            "ours_final": round(ours_final, 4),
-            "paper_final_mean": round(paper_final, 4),
-            "paper_final_range": [round(paper_lo, 4), round(paper_hi, 4)],
+            **verdict_stats,
             "verdict": verdict,
             "figure": str(fig_path),
         }
