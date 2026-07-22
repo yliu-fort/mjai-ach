@@ -53,6 +53,7 @@ def test_league_yamls_carry_explicit_league_knobs():
             "league_exploiter_share",
             "league_promo_window",
             "league_reset_mode",
+            "league_main_save_every_rounds",
         ):
             assert knob in data, f"{name}: missing league knob {knob!r}"
         assert data["self_play_mode"] == "league"

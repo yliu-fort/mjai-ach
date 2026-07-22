@@ -91,6 +91,10 @@ def run_arm(
         out_dir=str(out),
         total_env_steps=total_env_steps,
         eval_every_env_steps=eval_every_env_steps,
+        # Probe-scale pool cadence: at 6e4 env-steps the default 200 main
+        # rounds would yield ~1 snapshot; 25 fills the 16-member pool with
+        # real main history inside the probe budget (B3).
+        league_main_save_every_rounds=25,
         verbose=False,
     )
     run_experiment(cfg)

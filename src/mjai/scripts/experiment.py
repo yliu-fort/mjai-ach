@@ -27,8 +27,6 @@ from mjai.algos.transition import UpdateStats
 from mjai.algos.update_rule import AlgoConfig, UpdateRule
 from mjai.games.loader import GameSpec, load_game
 from mjai.league.league_controller import LeagueSelfPlay
-from mjai.league.manager import LeagueConfig, LeagueManager
-from mjai.league.opponent_sampler import LeagueMix
 from mjai.pipeline.rollout import RolloutConfig, RolloutWorkerCore
 from mjai.scripts.experiment_eval import (
     build_eval_row,
@@ -36,6 +34,7 @@ from mjai.scripts.experiment_eval import (
     print_eval_row,
     write_curve,
 )
+from mjai.scripts.experiment_league import build_league_manager, log_league_health
 
 
 @dataclass(frozen=True)
@@ -85,6 +84,12 @@ class ExperimentConfig:
     league_exploiter_share: float = 0.70  # pool fraction league-exploiter must beat
     league_promo_window: int = 20  # rolling win-rate window size (episodes)
     league_reset_mode: str = "to_main"  # exploiter reset after promotion: to_main|random
+    # Main-snapshot cadence for the league pool, counted in MAIN COLLECT ROUNDS
+    # (B3; under the default 1:2 role schedule, every third collect is a main
+    # round). Independent of ``save_every_steps`` (legacy round-mode disk
+    # checkpoint cadence) — reusing that knob coupled pool history to an
+    # unrelated unit and starved the pool at probe scale.
+    league_main_save_every_rounds: int = 200
     # ---- MLP architecture (paper p25: 1x128 FC + ReLU, two linear heads) ----
     hidden_sizes: list[int] = field(default_factory=lambda: [128])
     activation: str = "relu"  # "relu" | "tanh"
@@ -222,34 +227,9 @@ def build_controller(
         def make_policy() -> Policy:
             return build_policy(spec, cfg, seed=rng.randint(0, 10**9))
 
-        def copy_weights(src: Policy, dst: Policy) -> None:
-            import copy
-
-            if (
-                hasattr(src, "logits")
-                and hasattr(dst, "logits")
-                and hasattr(src, "values")
-                and hasattr(dst, "values")
-            ):
-                dst.logits = copy.deepcopy(src.logits)
-                dst.values = copy.deepcopy(src.values)
-
-        # All league knobs come from the YAML config — no magic numbers (§9).
-        # LeagueMix arg order: current_main, history, exploiter.
-        mix = LeagueMix(
-            cfg.league_mix_current_main, cfg.league_mix_history, cfg.league_mix_exploiter
-        )
-        league_cfg = LeagueConfig(
-            capacity=cfg.league_capacity,
-            main_save_every_steps=cfg.save_every_steps,
-            main_exploiter_promo=cfg.league_main_exploiter_promo,
-            league_exploiter_promo=cfg.league_league_exploiter_promo,
-            league_exploiter_share=cfg.league_exploiter_share,
-            promo_window=cfg.league_promo_window,
-            mix=mix,
-            reset_mode=cfg.league_reset_mode,
-        )
-        mgr = LeagueManager(policy, make_policy, copy_weights, config=league_cfg, rng=rng)
+        # League wiring (incl. the B1-generic weight copy) lives in
+        # experiment_league (§3.1: keeps this module under the line cap).
+        mgr = build_league_manager(policy, make_policy, cfg, rng=rng)
         return LeagueSelfPlay(mgr, runner, episodes_per_round=cfg.episodes_per_round, rng=rng)
     raise ValueError(f"Unknown self_play_mode: {cfg.self_play_mode}")
 
@@ -337,6 +317,7 @@ def _train_loop(
         stats = trainer.last_stats
         if stats:
             _log_stats(writer, step, stats)
+        log_league_health(writer, step, trainer.controller)  # B7: league/* scalars
         if cfg.verbose and step % max(1, cfg.n_steps // 20) == 0:
             _print_progress(cfg, step, stats, env_steps=env_steps)
         if cfg.total_env_steps is not None:

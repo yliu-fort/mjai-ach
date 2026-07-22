@@ -83,6 +83,9 @@ class RolloutWorkerCore:
         self.learner_player = learner_player
         self.config = config or RolloutConfig()
         self._rng = random.Random(self.config.seed)
+        # Episodes played in the most recent run_episode call. The league
+        # controller reads this to keep its promotion windows episode-counted.
+        self.last_episode_count: int = 0
 
     def run_episode(self, learner: Policy, opponent: Policy) -> Batch:
         """Play episodes and return the pooled transitions.
@@ -94,6 +97,7 @@ class RolloutWorkerCore:
         (never truncates an episode mid-game).
         """
         all_transitions: list[Transition] = []
+        self.last_episode_count = 0
         for _ in range(self.config.n_episodes):
             target = self.config.target_samples
             if target is not None and len(all_transitions) >= target:
@@ -102,6 +106,7 @@ class RolloutWorkerCore:
             self._assign_returns(transitions, returns)
             all_transitions.extend(transitions)
             self._last_returns = returns
+            self.last_episode_count += 1
         return make_batch(all_transitions, num_actions=self.game_spec.num_actions)
 
     def _play_one_episode(

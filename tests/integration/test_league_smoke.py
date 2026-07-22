@@ -46,7 +46,7 @@ def _build_trainer(rule_cls, **rule_kwargs):
         dst.logits = copy.deepcopy(src.logits)
         dst.values = copy.deepcopy(src.values)
 
-    cfg = LeagueConfig(main_save_every_steps=2, capacity=8, promo_window=4)
+    cfg = LeagueConfig(main_save_every_rounds=2, capacity=8, promo_window=4)
     mgr = LeagueManager(main, make_policy, copy_weights, config=cfg)
     # ACH (CFR+ wrapper) requires the GameSpec; PPO doesn't.
     if rule_cls is TabularACHUpdate:

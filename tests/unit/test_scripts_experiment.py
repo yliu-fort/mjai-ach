@@ -34,9 +34,12 @@ def _build_league_controller(cfg: ExperimentConfig) -> LeagueSelfPlay:
 def test_defaults_preserve_hardcoded_league_behavior():
     """No knobs passed -> LeagueConfig/LeagueMix identical to the code defaults."""
     league_cfg = _build_league_controller(_base_cfg()).manager.config
-    reference = LeagueConfig(capacity=16, main_save_every_steps=_base_cfg().save_every_steps)
+    reference = LeagueConfig(capacity=16)
     assert league_cfg.capacity == reference.capacity
-    assert league_cfg.main_save_every_steps == reference.main_save_every_steps
+    # B3: the pool cadence is an independent knob counted in main rounds;
+    # the default matches LeagueConfig's, NOT save_every_steps.
+    assert _base_cfg().league_main_save_every_rounds == 200
+    assert league_cfg.main_save_every_rounds == reference.main_save_every_rounds == 200
     assert league_cfg.main_exploiter_promo == reference.main_exploiter_promo
     assert league_cfg.league_exploiter_promo == reference.league_exploiter_promo
     assert league_cfg.league_exploiter_share == reference.league_exploiter_share
@@ -56,6 +59,7 @@ def test_league_knobs_reach_manager_and_sampler():
         league_exploiter_share=0.8,
         league_promo_window=10,
         league_reset_mode="random",
+        league_main_save_every_rounds=7,
     )
     manager = _build_league_controller(cfg).manager
     assert manager.config.mix == LeagueMix(0.6, 0.25, 0.15)
@@ -65,6 +69,7 @@ def test_league_knobs_reach_manager_and_sampler():
     assert manager.config.league_exploiter_share == 0.8
     assert manager.config.promo_window == 10
     assert manager.config.reset_mode == "random"
+    assert manager.config.main_save_every_rounds == 7
 
 
 def test_mix_weights_not_summing_to_one_raise():

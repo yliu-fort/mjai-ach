@@ -140,6 +140,12 @@ class RolloutRunnerProtocol(Protocol):
 
     Implemented by :class:`mjai.pipeline.rollout.RolloutWorkerCore` (Step 4).
     Kept here (not imported) so this module has no downward dep into pipeline.
+
+    ``last_episode_count`` is an optional capability: back-ends that expose it
+    let controllers keep episode-accurate statistics; controllers must fall
+    back gracefully when it is absent.
     """
+
+    last_episode_count: int
 
     def run_episode(self, learner: Policy, opponent: Policy) -> Batch: ...
