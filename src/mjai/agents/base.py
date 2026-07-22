@@ -151,6 +151,19 @@ class Policy(ABC):
     # no need for these hooks.
 
 
+def copy_weights(src: Policy, dst: Policy) -> None:
+    """Copy trainable state ``src`` -> ``dst`` via the Policy snapshot interface.
+
+    This is the single generic weight-copy path (AGENTS.md §3.3: behavior lives
+    on the base-class interface, never in isinstance branches). It works for
+    every Policy subclass — tabular and NN alike — and fails loudly
+    (``ValueError`` from :meth:`Policy.restore_state`) if the two policies'
+    snapshot kinds are incompatible. A silent no-op is impossible by
+    construction: both methods are abstract, so every concrete policy has them.
+    """
+    dst.restore_state(src.snapshot_state())
+
+
 def entropy_of_probs(probs: list[float]) -> float:
     """Shannon entropy in nats of a probability vector (used by both algos).
 

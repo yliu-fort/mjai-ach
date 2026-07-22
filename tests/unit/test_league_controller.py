@@ -6,6 +6,7 @@ import random
 
 import pytest
 
+from mjai.agents.base import copy_weights
 from mjai.agents.tabular import TabularPolicy
 from mjai.algos.transition import Batch
 from mjai.games.loader import load_game
@@ -31,14 +32,8 @@ def _make_league(game_name: str = "brps", **cfg_kwargs):
     def make_policy() -> TabularPolicy:
         return TabularPolicy(num_actions=spec.num_actions, seed=1)
 
-    def copy_weights(src: TabularPolicy, dst: TabularPolicy) -> None:
-        import copy
-
-        dst.logits = copy.deepcopy(src.logits)
-        dst.values = copy.deepcopy(src.values)
-
-    # Default main_save_every_steps=2; caller can override via cfg_kwargs.
-    cfg_kwargs.setdefault("main_save_every_steps", 2)
+    # Default main_save_every_rounds=2; caller can override via cfg_kwargs.
+    cfg_kwargs.setdefault("main_save_every_rounds", 2)
     cfg = LeagueConfig(**cfg_kwargs)
     mgr = LeagueManager(main, make_policy, copy_weights, config=cfg, rng=random.Random(0))
     runner = RolloutWorkerCore(spec, learner_player=0, config=RolloutConfig(n_episodes=10, seed=42))
@@ -81,7 +76,7 @@ def test_collect_rotates_through_roles():
 
 
 def test_main_rounds_accumulate_snapshots():
-    ctrl, mgr, main = _make_league(main_save_every_steps=2)
+    ctrl, mgr, main = _make_league(main_save_every_rounds=2)
     ctrl.set_learner(main)
     # MAIN is collected every 3rd round; force two MAIN rounds to trigger a snapshot.
     for _ in range(6):
@@ -107,7 +102,7 @@ def test_collect_filters_to_learner_seat_only():
 
 
 def test_league_runs_full_loop_on_kuhn():
-    ctrl, _mgr, main = _make_league("kuhn", main_save_every_steps=2)
+    ctrl, _mgr, main = _make_league("kuhn", main_save_every_rounds=2)
     ctrl.set_learner(main)
     for _ in range(6):
         batch = ctrl.collect()

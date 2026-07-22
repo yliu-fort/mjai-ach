@@ -27,8 +27,14 @@ from mjai.algos.transition import UpdateStats
 from mjai.algos.update_rule import AlgoConfig, UpdateRule
 from mjai.games.loader import GameSpec, load_game
 from mjai.league.league_controller import LeagueSelfPlay
-from mjai.league.manager import LeagueConfig, LeagueManager
 from mjai.pipeline.rollout import RolloutConfig, RolloutWorkerCore
+from mjai.scripts.experiment_eval import (
+    build_eval_row,
+    log_eval_scalars,
+    print_eval_row,
+    write_curve,
+)
+from mjai.scripts.experiment_league import build_league_manager, log_league_health
 
 
 @dataclass(frozen=True)
@@ -55,6 +61,9 @@ class ExperimentConfig:
     # When True, run_experiment prints per-step training stats and per-eval
     # equilibrium metrics so the notebook / CLI shows live progress.
     verbose: bool = False
+    # tqdm bar over env-steps in the train loop (notebooks); off by default so
+    # batch/CI runs and unit tests stay quiet.
+    progress_bar: bool = False
     seed: int = 0
     out_dir: str = "runs/default"
     # When True, evaluate the current policy every ``eval_every_steps`` and
@@ -69,6 +78,21 @@ class ExperimentConfig:
     hedge_eta: float | None = None  # tabular ACH (CFR+ wrapper) only
     clip_eps: float = 0.2  # PPO only
     league_capacity: int = 16
+    # ---- League strategy knobs (defaults mirror LeagueConfig/LeagueMix; F2) ----
+    league_mix_current_main: float = 0.5  # P(opponent = live main), main + league-exploiter
+    league_mix_history: float = 0.3  # P(opponent = past main snapshot from pool)
+    league_mix_exploiter: float = 0.2  # P(opponent = promoted exploiter from pool)
+    league_main_exploiter_promo: float = 0.55  # promote main-exploiter at this WR vs main
+    league_league_exploiter_promo: float = 0.55  # promote league-exploiter at this WR
+    league_exploiter_share: float = 0.70  # pool fraction league-exploiter must beat
+    league_promo_window: int = 20  # rolling win-rate window size (episodes)
+    league_reset_mode: str = "to_main"  # exploiter reset after promotion: to_main|random
+    # Main-snapshot cadence for the league pool, counted in MAIN COLLECT ROUNDS
+    # (B3; under the default 1:2 role schedule, every third collect is a main
+    # round). Independent of ``save_every_steps`` (legacy round-mode disk
+    # checkpoint cadence) — reusing that knob coupled pool history to an
+    # unrelated unit and starved the pool at probe scale.
+    league_main_save_every_rounds: int = 200
     # ---- MLP architecture (paper p25: 1x128 FC + ReLU, two linear heads) ----
     hidden_sizes: list[int] = field(default_factory=lambda: [128])
     activation: str = "relu"  # "relu" | "tanh"
@@ -88,6 +112,31 @@ class ExperimentConfig:
     target_samples: int | None = None  # per-round batch size in samples (p28: 64)
     total_env_steps: int | None = None  # set -> env-step mode (paper: 1e7)
     eval_every_env_steps: int = 100000  # paper p25: evaluate every 1e5 steps
+    # ---- Equilibrium eval estimator (AGENTS.md §9; mjai.eval.sampled_nash) ----
+    # "exact" walks the full game tree (open_spiel nash_conv) — infeasible for
+    # oshi_zumo-scale games; "sampled" uses a Monte-Carlo approximate best
+    # response with a per-player budget of eval_mc_samples episodes per eval.
+    # The eval seed is cfg.seed itself (common random numbers across the curve
+    # => reproducible, lower-variance eval-to-eval comparisons).
+    eval_estimator: str = "exact"
+    eval_mc_samples: int = 400
+
+    def __post_init__(self) -> None:
+        # League knob validation (AGENTS.md §9: invalid config fails loudly).
+        total = self.league_mix_current_main + self.league_mix_history + self.league_mix_exploiter
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(f"league mix weights must sum to 1.0 (tolerance 1e-6), got {total}")
+        if self.league_reset_mode not in ("to_main", "random"):
+            raise ValueError(
+                f"bad league_reset_mode {self.league_reset_mode!r}; want to_main|random"
+            )
+        if self.eval_estimator not in ("exact", "sampled"):
+            raise ValueError(f"bad eval_estimator {self.eval_estimator!r}; want exact|sampled")
+        if self.eval_mc_samples < 16:
+            raise ValueError(
+                f"eval_mc_samples must be >= 16 for the derived probe/match budgets, "
+                f"got {self.eval_mc_samples}"
+            )
 
 
 def build_policy(spec: GameSpec, cfg: ExperimentConfig, *, seed: int) -> Policy:
@@ -178,22 +227,9 @@ def build_controller(
         def make_policy() -> Policy:
             return build_policy(spec, cfg, seed=rng.randint(0, 10**9))
 
-        def copy_weights(src: Policy, dst: Policy) -> None:
-            import copy
-
-            if (
-                hasattr(src, "logits")
-                and hasattr(dst, "logits")
-                and hasattr(src, "values")
-                and hasattr(dst, "values")
-            ):
-                dst.logits = copy.deepcopy(src.logits)
-                dst.values = copy.deepcopy(src.values)
-
-        league_cfg = LeagueConfig(
-            capacity=cfg.league_capacity, main_save_every_steps=cfg.save_every_steps
-        )
-        mgr = LeagueManager(policy, make_policy, copy_weights, config=league_cfg, rng=rng)
+        # League wiring (incl. the B1-generic weight copy) lives in
+        # experiment_league (§3.1: keeps this module under the line cap).
+        mgr = build_league_manager(policy, make_policy, cfg, rng=rng)
         return LeagueSelfPlay(mgr, runner, episodes_per_round=cfg.episodes_per_round, rng=rng)
     raise ValueError(f"Unknown self_play_mode: {cfg.self_play_mode}")
 
@@ -275,12 +311,26 @@ def _train_loop(
     next_eval_at = cfg.eval_every_env_steps
     stats: UpdateStats | None = None
     step = 0
+    bar = None
+    if cfg.progress_bar:
+        from tqdm.auto import tqdm  # type: ignore[import-untyped]
+
+        bar = tqdm(
+            total=cfg.total_env_steps,
+            desc=f"{cfg.game}/{cfg.algo}/{cfg.self_play_mode}/s{cfg.seed}",
+            unit="env-step",
+            dynamic_ncols=True,
+        )
     while _should_continue(cfg, step, env_steps):
         step += 1
-        env_steps += trainer.step().batch_size  # 1 env-step = 1 sampled decision point
+        batch_size = trainer.step().batch_size
+        env_steps += batch_size  # 1 env-step = 1 sampled decision point
+        if bar is not None:
+            bar.update(batch_size)
         stats = trainer.last_stats
         if stats:
             _log_stats(writer, step, stats)
+        log_league_health(writer, step, trainer.controller)  # B7: league/* scalars
         if cfg.verbose and step % max(1, cfg.n_steps // 20) == 0:
             _print_progress(cfg, step, stats, env_steps=env_steps)
         if cfg.total_env_steps is not None:
@@ -314,6 +364,8 @@ def _train_loop(
                     env_steps,
                     checkpoint=False,
                 )
+    if bar is not None:
+        bar.close()
     return step, env_steps, stats
 
 
@@ -340,23 +392,21 @@ def _eval_and_record(
     """Evaluate the current policy, append the curve row, log to TensorBoard."""
     if checkpoint:
         _save_checkpoint(Path(cfg.out_dir), spec, cfg, policy, step)
-    row = _eval_during_training(spec, policy, stats, step, env_steps)
+    row = build_eval_row(
+        spec,
+        policy,
+        stats,
+        step,
+        env_steps,
+        eval_estimator=cfg.eval_estimator,
+        eval_mc_samples=cfg.eval_mc_samples,
+        seed=cfg.seed,
+    )
     curve_rows.append(row)
-    _write_curve(curve_path, curve_rows)
-    _log_eval_scalars(writer, row, env_steps)
+    write_curve(curve_path, curve_rows)
+    log_eval_scalars(writer, row, env_steps)
     if cfg.verbose:
-        _print_eval_row(row)
-
-
-def _log_eval_scalars(writer: SummaryWriter, row: dict[str, object], env_steps: int) -> None:
-    """Log equilibrium metrics to TensorBoard keyed by env-steps (AGENTS.md D9).
-
-    The paper's Fig 10 x-axis is training steps (p25-26), so eval curves live
-    on the env-step axis; ``train_curve.json`` remains for the notebook.
-    """
-    for k, v in row.items():
-        if k.startswith("eval/") and isinstance(v, int | float):
-            writer.add_scalar(k, float(v), env_steps)
+        print_eval_row(row)
 
 
 def _print_progress(
@@ -386,82 +436,6 @@ def _print_progress(
     if stats.explained_variance:
         parts.append(f"vR2={stats.explained_variance:.2f}")
     print(f"  [{cfg.game}/{cfg.algo}/{cfg.self_play_mode}] " + " ".join(parts))
-
-
-def _print_eval_row(row: dict[str, object]) -> None:
-    """Pretty-print an eval row's equilibrium metrics + BRPS probe."""
-    bits = [f"step={row['step']}"]
-    for k in ("eval/exploitability", "eval/nash_conv", "eval/exact_nash_distance"):
-        if k in row:
-            bits.append(f"{k.removeprefix('eval/')}={float(row[k]):.4g}")  # type: ignore[arg-type]
-    if "brps/nash_distance" in row:
-        bits.append(f"brps_nash_d={float(row['brps/nash_distance']):.4g}")  # type: ignore[arg-type]
-        bits.append(
-            f"P(R,P,S)="
-            f"({float(row['brps/P_R']):.3f},{float(row['brps/P_P']):.3f},{float(row['brps/P_S']):.3f})"  # type: ignore[arg-type]
-        )
-    print("    eval: " + " ".join(bits))
-
-
-def _eval_during_training(
-    spec: GameSpec, policy: Policy, stats: UpdateStats | None, step: int, env_steps: int
-) -> dict[str, object]:
-    """Compute equilibrium metrics + per-action BRPS probe for the curve row.
-
-    Metric failures are NOT silently swallowed (AGENTS.md: no silent fallback):
-    they emit a ``warnings.warn`` and leave an ``eval/error`` field in the row,
-    so a missing column in the curve is always traceable.
-    """
-    import warnings
-
-    row: dict[str, object] = {"step": step, "env_steps": env_steps}
-    if stats is not None:
-        for k in (
-            "policy_loss",
-            "value_loss",
-            "entropy",
-            "approx_kl",
-            "clip_frac",
-            "explained_variance",
-        ):
-            v = getattr(stats, k, None)
-            if v is not None:
-                row[k] = float(v)
-    # Equilibrium metrics (best available for this game).
-    from mjai.eval.nash import evaluate_equilibrium
-
-    try:
-        row.update({f"eval/{k}": v for k, v in evaluate_equilibrium(spec, policy).items()})
-    except Exception as e:
-        warnings.warn(f"equilibrium eval failed at step {step}: {e}", stacklevel=2)
-        row["eval/error"] = str(e)
-    # BRPS-specific probe: P(R), P(P), P(S) at the trivial observation, so the
-    # notebook can plot the policy trajectory (AGENTS.md Fig 1).
-    if spec.name == "brps":
-        try:
-            from mjai.eval.nash import distance_to_brps_nash
-
-            obs = [0.0]
-            legal = list(range(spec.num_actions))
-            logits = policy.action_logits(obs, legal)
-            import math
-
-            mx = max(logits)
-            exps = [math.exp(x - mx) for x in logits]
-            s = sum(exps) or 1.0
-            probs = [e / s for e in exps]
-            padded = [*probs, 0.0, 0.0, 0.0]
-            row["brps/P_R"], row["brps/P_P"], row["brps/P_S"] = padded[:3]
-            row["brps/nash_distance"] = distance_to_brps_nash(policy, num_actions=spec.num_actions)
-        except Exception as e:
-            warnings.warn(f"BRPS probe failed at step {step}: {e}", stacklevel=2)
-            row["brps/error"] = str(e)
-    return row
-
-
-def _write_curve(path: Path, rows: list[dict[str, object]]) -> None:
-    """Persist the training-curve rows as JSON (overwritten each eval)."""
-    path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
 
 
 def _log_stats(writer: SummaryWriter, step: int, stats: UpdateStats) -> None:

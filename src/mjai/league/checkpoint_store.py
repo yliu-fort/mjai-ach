@@ -50,15 +50,12 @@ class CheckpointStore:
 
     Args:
         capacity: max pool size (AGENTS.md Step 6: default 16).
-        exploiter_keep: how many exploiters of each kind to keep when over
-            capacity (we evict the lowest-win-rate ones above this count).
     """
 
-    def __init__(self, *, capacity: int = 16, exploiter_keep: int = 4) -> None:
+    def __init__(self, *, capacity: int = 16) -> None:
         if capacity <= 0:
             raise ValueError(f"capacity must be positive, got {capacity}")
         self.capacity = capacity
-        self.exploiter_keep = exploiter_keep
         self._members: list[PoolMember] = []
         self._next_id: int = 0
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 
+from mjai.agents.base import copy_weights
 from mjai.agents.tabular import TabularPolicy
 from mjai.league.checkpoint_store import Role
 from mjai.league.manager import LeagueConfig, LeagueManager
@@ -11,7 +12,7 @@ from mjai.league.manager import LeagueConfig, LeagueManager
 
 def _make_manager(
     *,
-    main_save_every_steps: int = 2,
+    main_save_every_rounds: int = 2,
     main_exploiter_promo: float = 0.55,
     league_exploiter_promo: float = 0.55,
     league_exploiter_share: float = 0.70,
@@ -24,14 +25,8 @@ def _make_manager(
     def make_policy() -> TabularPolicy:
         return TabularPolicy(num_actions=3, seed=1)
 
-    def copy_weights(src: TabularPolicy, dst: TabularPolicy) -> None:
-        import copy
-
-        dst.logits = copy.deepcopy(src.logits)
-        dst.values = copy.deepcopy(src.values)
-
     cfg = LeagueConfig(
-        main_save_every_steps=main_save_every_steps,
+        main_save_every_rounds=main_save_every_rounds,
         main_exploiter_promo=main_exploiter_promo,
         league_exploiter_promo=league_exploiter_promo,
         league_exploiter_share=league_exploiter_share,
@@ -51,7 +46,7 @@ def test_construction_warm_starts_exploiters_from_main():
 
 
 def test_record_main_round_snapshots_periodically():
-    mgr, _ = _make_manager(main_save_every_steps=3)
+    mgr, _ = _make_manager(main_save_every_rounds=3)
     assert len(mgr.store) == 0
     mgr.record_main_round()
     mgr.record_main_round()
@@ -129,14 +124,14 @@ def test_opponent_for_main_exploiter_is_current_main():
 
 
 def test_pool_grows_with_main_snapshots_and_promotions():
-    mgr, _ = _make_manager(main_save_every_steps=1)
+    mgr, _ = _make_manager(main_save_every_rounds=1)
     for _ in range(5):
         mgr.record_main_round()
     assert len(mgr.store.by_role(Role.MAIN)) == 5
 
 
 def test_capacity_bounds_pool_size():
-    mgr, _ = _make_manager(main_save_every_steps=1, capacity=4)
+    mgr, _ = _make_manager(main_save_every_rounds=1, capacity=4)
     for _ in range(10):
         mgr.record_main_round()
     assert len(mgr.store) <= 4
