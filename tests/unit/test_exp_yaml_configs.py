@@ -31,14 +31,17 @@ def test_exp_yaml_parses_into_experiment_config(path: Path):
     cfg = ExperimentConfig(**data)
     assert cfg.game, f"{path.name}: empty game"
     assert cfg.algo in ("ppo", "ach"), f"{path.name}: bad algo {cfg.algo!r}"
-    assert cfg.self_play_mode in ("mirror", "league"), (
-        f"{path.name}: bad self_play_mode {cfg.self_play_mode!r}"
-    )
+    assert cfg.self_play_mode in (
+        "mirror",
+        "league",
+    ), f"{path.name}: bad self_play_mode {cfg.self_play_mode!r}"
 
 
 def test_league_yamls_carry_explicit_league_knobs():
     """The MLP league arms list every league knob explicitly (sweep-ready)."""
-    for name in ("kuhn_ach_mlp_league.yaml", "oshi_zumo_ach_mlp_league.yaml"):
+    names = sorted(p.name for p in EXP_DIR.glob("*_mlp_league.yaml"))
+    assert names, "no *_mlp_league.yaml found — the A/B arms are missing"
+    for name in names:
         data = yaml.safe_load((EXP_DIR / name).read_text(encoding="utf-8"))
         for knob in (
             "league_capacity",

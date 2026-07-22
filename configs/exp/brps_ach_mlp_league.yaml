@@ -1,0 +1,54 @@
+# Paper-faithful ACH protocol: BRPS (biased rock-paper-scissors), LEAGUE self-play.
+# A/B arm vs brps_ach_mlp_mirror.yaml; only the self-play topology differs.
+# BRPS is the cheapest cycling game (exact NE known, eval trivial), standing in
+# for oshi_zumo whose exact NashConv eval is infeasible at size (2026-07-22).
+# All league strategy knobs are listed explicitly at their code defaults
+# (LeagueConfig/LeagueMix) so sweeps edit this file only (AGENTS.md §9).
+game: brps
+algo: ach
+self_play_mode: league
+policy_kind: mlp
+# Network (p25): 1 hidden FC layer of 128 units + ReLU, then two linear heads.
+hidden_sizes: [128]
+activation: relu
+# Optimization (H.3, p27): SGD with constant learning rate, best lr=1e-3.
+optimizer: sgd
+learning_rate: 0.001
+value_coef: 1.0
+entropy_coef: 0.01     # β = 1e-2 (p28 Table 8)
+gae_lambda: 0.95
+max_grad_norm: 0.0     # disabled — the paper mentions no grad clipping
+eta: 1.0               # hedge coefficient η(s) (p27 Table 7)
+l_th: 2.0              # one-sided logit gate threshold (p28 Table 8)
+ratio_eps: 0.5         # ratio gate; vacuous under synchronous single-thread (p28)
+# Batch = 64 samples (p28 Table 8): whole episodes until ≥64 transitions.
+target_samples: 64
+episodes_per_round: 200  # safety cap only (target_samples stops first)
+# Env-step protocol (p25-26): evaluate every 1e5 steps, train to 1e7 steps.
+total_env_steps: 10000000
+eval_every_env_steps: 100000
+# Legacy round-mode fields (unused while total_env_steps is set).
+n_steps: 1000000
+save_every_steps: 1000
+eval_every_steps: 1000
+eval_during_training: true
+verbose: false
+seed: 0
+out_dir: runs/reproduce/brps_ach_mlp_league/seed_0
+hedge_eta: null
+clip_eps: 0.2
+device: null
+# ---- League knobs (defaults = LeagueConfig/LeagueMix code defaults) ----
+league_capacity: 16            # opponent-pool size bound (FIFO-evict mains first)
+# Opponent mix for the main + league-exploiter roles; the three weights must
+# sum to 1.0 (±1e-6, validated loudly). PFSP picks within the drawn bucket.
+league_mix_current_main: 0.5   # P(opponent = live main policy)
+league_mix_history: 0.3        # P(opponent = past main snapshot from the pool)
+league_mix_exploiter: 0.2      # P(opponent = promoted exploiter from the pool)
+# Promotion thresholds (rolling win-rates over league_promo_window episodes).
+league_main_exploiter_promo: 0.55    # promote main-exploiter at this WR vs main
+league_league_exploiter_promo: 0.55  # promote league-exploiter at this WR vs pool
+league_exploiter_share: 0.70         # pool fraction league-exploiter must beat
+league_promo_window: 20              # rolling win-rate window size (episodes)
+# Exploiter weight reset after promotion: "to_main" (locked default) | "random".
+league_reset_mode: to_main
