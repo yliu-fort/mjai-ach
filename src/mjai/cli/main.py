@@ -8,6 +8,12 @@ replay/quit. Launched via the ``mjai-play`` console-script or
 The per-game renderer/parser is resolved from the game short name; if a game
 lacks either, the CLI refuses to start it (AGENTS.md §4 — adding a game
 requires both). Simultaneous-move games use blind human entry.
+
+Checkpoint loading is metadata-driven via
+:func:`mjai.agents.policy_factory.load_policy_from_checkpoint` (F1); the CLI
+never reconstructs architectures itself and never downcasts the returned
+Policy (§3.3). Load failures surface as one-line errors with a retry/quit
+prompt — no tracebacks.
 """
 
 from __future__ import annotations
@@ -16,13 +22,23 @@ import importlib
 import random
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 from mjai.agents.base import Policy
+from mjai.agents.policy_factory import CheckpointLoadError, load_policy_from_checkpoint
 from mjai.cli.game_registry import list_games
 from mjai.cli.interfaces import GameRenderer, HumanInputParser
 from mjai.cli.match_runner import MatchRunner, Seat, random_policy_for
-from mjai.cli.policy_registry import list_policies
-from mjai.games.loader import load_game
+from mjai.cli.policy_registry import (
+    compatible_with,
+    filter_labels,
+    list_policies,
+    page,
+)
+from mjai.games.loader import GameSpec, load_game
+from mjai.utils import gpu_assert
+
+RUNS_ROOT = Path("runs")
 
 
 def _load_renderer(game_name: str) -> GameRenderer:
@@ -43,29 +59,83 @@ def _load_parser(game_name: str) -> HumanInputParser:
     return parser
 
 
-def _load_policy_from_manifest(ckpt_dir: Path) -> Policy:
-    """Reconstruct a policy from a checkpoint dir."""
-    from mjai.agents.ckpt_io import read_manifest
+def _pick_policy(spec: GameSpec) -> Policy | None:
+    """Interactive checkpoint picker for one seat (F5); None = back to seat menu.
 
-    manifest = read_manifest(ckpt_dir)
-    p: Policy
-    if manifest.policy_kind == "tabular":
-        from mjai.agents.tabular import TabularPolicy
-
-        p = TabularPolicy(num_actions=manifest.num_actions, seed=0)
-    elif manifest.policy_kind == "mlp":
-        from mjai.utils import gpu_assert
-
-        gpu_assert.require_cpu()
-        from mjai.agents.mlp import MLPSharedActorCritic
-
-        p = MLPSharedActorCritic(
-            obs_size=manifest.obs_size, num_actions=manifest.num_actions, seed=0
+    Shows only checkpoints trained on ``spec`` with a matching obs/action
+    space, newest ~20 first; any non-numeric input substring-filters the list.
+    'q' (or EOF) quits the CLI cleanly. A failed load prints a one-line error
+    and re-prompts instead of raising (F1).
+    """
+    entries = list_policies(RUNS_ROOT, game=spec.name)
+    compatible, incompatible = compatible_with(
+        entries, obs_size=spec.obs_size, num_actions=spec.num_actions
+    )
+    if not compatible:
+        print(
+            f"No usable checkpoints for {spec.name!r} under {RUNS_ROOT}/ "
+            f"({len(entries)} found, {len(incompatible)} with a mismatched obs/action space)."
         )
-    else:
-        raise SystemExit(f"Unknown policy_kind: {manifest.policy_kind}")
-    p.load(str(ckpt_dir / manifest.weight_filename()))
-    return p
+        print("Pick a different seat type instead (human or random).")
+        return None
+    if incompatible:
+        print(
+            f"Note: skipped {len(incompatible)} {spec.name} checkpoint(s) whose "
+            f"obs/action space does not match this game."
+        )
+    # Playing a neural policy is inference-only; the CLI deliberately uses CPU
+    # (explicit opt-in per AGENTS.md §1 D6, not a silent fallback).
+    gpu_assert.require_cpu()
+
+    filtered = compatible
+    while True:
+        shown, remaining = page(filtered)
+        for i, pe in enumerate(shown):
+            print(f"  [{i}] {pe.label}")
+        if remaining:
+            print(f"  … and {remaining} more — type any text to filter the full list.")
+        raw = _read_line(f"Select policy [0-{len(shown) - 1}], filter text, or 'q' to quit: ")
+        if raw.lower() == "q":
+            _quit()
+        if raw.isdigit():
+            idx = int(raw)
+            if not 0 <= idx < len(shown):
+                print(f"  must be in [0, {len(shown) - 1}]")
+                continue
+            chosen = shown[idx]
+            try:
+                policy = load_policy_from_checkpoint(chosen.path)
+            except CheckpointLoadError as e:
+                print(f"  Could not load that checkpoint: {e}")
+                print("  Pick another one, or 'q' to quit.")
+                continue
+            print(f"Loaded: {chosen.label}")
+            return policy
+        # Non-numeric input narrows the list; empty result restores it.
+        narrowed = filter_labels(compatible, raw)
+        if not narrowed:
+            print(f"  No checkpoints match {raw!r}; showing the full list again.")
+            filtered = compatible
+        else:
+            filtered = narrowed
+
+
+def _assign_seat(spec: GameSpec, seat_idx: int) -> Seat:
+    """Prompt for one seat; loops until a usable seat is chosen."""
+    while True:
+        print(f"\n-- Seat {seat_idx} --")
+        print("  [0] Human")
+        print("  [1] Load saved policy")
+        print("  [2] Random policy")
+        kind = _read_int("Choose: ", 0, 2)
+        if kind == 0:
+            return "human"
+        if kind == 2:
+            return random_policy_for(spec)
+        policy = _pick_policy(spec)
+        if policy is not None:
+            return policy
+        # No usable checkpoint for this game: re-offer the seat menu.
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -87,27 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _load_parser(chosen.name)
 
     # Seat assignment.
-    seats: list[Seat] = []
-    for seat_idx in range(2):
-        print(f"\n-- Seat {seat_idx} --")
-        print("  [0] Human")
-        print("  [1] Load saved policy")
-        print("  [2] Random policy")
-        kind = _read_int("Choose: ", 0, 2)
-        if kind == 0:
-            seats.append("human")
-        elif kind == 1:
-            pols = list_policies()
-            if not pols:
-                print("No saved policies found under runs/. Using random.")
-                seats.append(random_policy_for(spec))
-                continue
-            for i, pe in enumerate(pols):
-                print(f"  [{i}] {pe.label}")
-            pi = _read_int("Select policy: ", 0, len(pols) - 1)
-            seats.append(_load_policy_from_manifest(pols[pi].path))
-        else:
-            seats.append(random_policy_for(spec))
+    seats: list[Seat] = [_assign_seat(spec, seat_idx) for seat_idx in range(2)]
 
     print("\n-- Mode --")
     print("  [0] interactive (step through, render each turn)")
@@ -131,14 +181,29 @@ def main(argv: list[str] | None = None) -> int:
 
 def _read_int(prompt: str, lo: int, hi: int) -> int:
     while True:
+        raw = _read_line(prompt)
         try:
-            v = int(input(prompt))
-        except (ValueError, EOFError):
+            v = int(raw)
+        except ValueError:
             print(f"  enter a number in [{lo}, {hi}]")
             continue
         if lo <= v <= hi:
             return v
         print(f"  must be in [{lo}, {hi}]")
+
+
+def _read_line(prompt: str) -> str:
+    """input() that treats EOF (scripted stdin exhausted) as a clean exit."""
+    try:
+        return input(prompt).strip()
+    except EOFError:
+        print("\nEnd of input; exiting.")
+        _quit()
+
+
+def _quit() -> NoReturn:
+    print("Bye.")
+    raise SystemExit(0)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,15 @@ from mjai.utils.gpu_assert import resolve_device
 # so gradients stay finite if an illegal action somehow leaks into a loss.
 MASK_VALUE = -1e9
 
+# Activation registry keyed by lowercase name (e.g. "relu"). Single source of
+# truth shared by the experiment runner (build by config string) and the
+# checkpoint factory (rebuild from the sidecar's recorded name). An activation
+# missing here fails loudly at reconstruction time — never silently swapped.
+ACTIVATIONS: dict[str, type[nn.Module]] = {
+    "relu": nn.ReLU,
+    "tanh": nn.Tanh,
+}
+
 
 class MLPSharedActorCritic(nn.Module, Policy):
     """Shared-torso MLP with separate policy and value heads.
@@ -72,6 +81,9 @@ class MLPSharedActorCritic(nn.Module, Policy):
         self.torso = nn.Sequential(*layers)
         self.policy_head = nn.Linear(last, num_actions)
         self.value_head = nn.Linear(last, 1)
+        # Kept for save(): the sidecar records the activation name so the
+        # checkpoint factory can rebuild the exact architecture (F1).
+        self._activation_name = activation.__name__.lower()
 
         # Device resolution: explicit override wins; else gpu_assert (raises on
         # silent-degradation risk).
@@ -201,8 +213,9 @@ class MLPSharedActorCritic(nn.Module, Policy):
         """Save the torch state_dict (+ metadata) to ``path``.
 
         ``path`` should end in ``.pt``. A sibling ``.pt.meta.json`` is written
-        with obs_size/num_actions/hidden_sizes so :meth:`load` can reconstruct
-        the architecture without the caller passing it back.
+        with obs_size/num_actions/hidden_sizes/activation so the checkpoint
+        factory can reconstruct the architecture without the caller passing
+        it back.
         """
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -216,6 +229,10 @@ class MLPSharedActorCritic(nn.Module, Policy):
                 for m in self.torso
                 if isinstance(m, nn.Linear)
             ],
+            # Registry key (mlp.ACTIVATIONS) for the torso activation. Older
+            # sidecars predate this key; the factory then derives it from the
+            # run's dumped config.json or fails loudly (no silent default).
+            "activation": self._activation_name,
             "device": str(self.device),
             "init_seed": self._init_seed,
         }

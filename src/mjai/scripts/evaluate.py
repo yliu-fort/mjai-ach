@@ -19,6 +19,7 @@ from pathlib import Path
 
 from mjai.agents.base import Policy
 from mjai.agents.ckpt_io import CheckpointManifest, discover_checkpoints, read_manifest
+from mjai.agents.policy_factory import load_policy_from_checkpoint
 from mjai.eval.crossplay import (
     cross_play_matrix,
     forgetting_metric,
@@ -31,26 +32,14 @@ from mjai.pipeline.rollout import RolloutConfig, RolloutWorkerCore
 
 
 def _load_policy(ckpt_dir: Path) -> tuple[Policy, CheckpointManifest]:
-    """Reconstruct the policy stored at ``ckpt_dir`` from its manifest."""
-    manifest = read_manifest(ckpt_dir)
-    p: Policy
-    if manifest.policy_kind == "tabular":
-        from mjai.agents.tabular import TabularPolicy
+    """Rebuild the policy stored at ``ckpt_dir`` via the shared factory (F1).
 
-        p = TabularPolicy(num_actions=manifest.num_actions, seed=0)
-    elif manifest.policy_kind == "mlp":
-        from mjai.utils import gpu_assert
-
-        gpu_assert.require_cpu()
-        from mjai.agents.mlp import MLPSharedActorCritic
-
-        p = MLPSharedActorCritic(
-            obs_size=manifest.obs_size, num_actions=manifest.num_actions, seed=0
-        )
-    else:
-        raise ValueError(f"Unknown policy_kind in manifest: {manifest.policy_kind}")
-    p.load(str(ckpt_dir / manifest.weight_filename()))
-    return p, manifest
+    Architecture provenance (sidecar first, run config.json second) and
+    user-readable error wrapping live in policy_factory; eval always plays
+    on CPU, so the device is pinned here instead of relying on gpu_assert.
+    """
+    p = load_policy_from_checkpoint(ckpt_dir, device="cpu")
+    return p, read_manifest(ckpt_dir)
 
 
 def main(argv: list[str] | None = None) -> int:

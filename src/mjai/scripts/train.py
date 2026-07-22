@@ -23,6 +23,24 @@ def _load_config(path: str) -> ExperimentConfig:
     return ExperimentConfig(**data)
 
 
+def _bare_defaults_warning() -> str:
+    """Loud notice for the no-``--config`` path (audit Q1, docs/audit_4q_2026-07-22.md).
+
+    The dataclass defaults are the NN-tuned 2x2-matrix defaults, not the ACH
+    paper reproduction settings, and the two silently differ. Warn instead of
+    switching silently (AGENTS.md §11) — the matrix experiments rely on them.
+    """
+    return (
+        "*** WARNING: no --config given; using ExperimentConfig built-in defaults.\n"
+        "*** These are NN-tuned matrix defaults, NOT the ACH paper reproduction\n"
+        "*** settings — they differ in policy_kind, learning_rate, value_coef,\n"
+        "*** entropy_coef, max_grad_norm, and batch/run-length accounting.\n"
+        "*** For paper reproduction use:\n"
+        "***   uv run mjai-train --config configs/exp/<game>_ach_mlp_mirror.yaml\n"
+        "***   uv run python -m mjai.scripts.reproduce_paper   # full 24-run protocol"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Train one mjai experiment.")
     parser.add_argument("--config", help="Path to a YAML experiment config.")
@@ -44,6 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         if not (args.game and args.algo and args.mode):
             parser.error("Either --config or all of --game/--algo/--mode must be given.")
+        print(_bare_defaults_warning(), file=sys.stderr)
         cfg = ExperimentConfig(
             game=args.game,
             algo=args.algo,
