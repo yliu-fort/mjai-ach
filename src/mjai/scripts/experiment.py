@@ -104,6 +104,14 @@ class ExperimentConfig:
     target_samples: int | None = None  # per-round batch size in samples (p28: 64)
     total_env_steps: int | None = None  # set -> env-step mode (paper: 1e7)
     eval_every_env_steps: int = 100000  # paper p25: evaluate every 1e5 steps
+    # ---- Equilibrium eval estimator (AGENTS.md §9; mjai.eval.sampled_nash) ----
+    # "exact" walks the full game tree (open_spiel nash_conv) — infeasible for
+    # oshi_zumo-scale games; "sampled" uses a Monte-Carlo approximate best
+    # response with a per-player budget of eval_mc_samples episodes per eval.
+    # The eval seed is cfg.seed itself (common random numbers across the curve
+    # => reproducible, lower-variance eval-to-eval comparisons).
+    eval_estimator: str = "exact"
+    eval_mc_samples: int = 400
 
     def __post_init__(self) -> None:
         # League knob validation (AGENTS.md §9: invalid config fails loudly).
@@ -113,6 +121,13 @@ class ExperimentConfig:
         if self.league_reset_mode not in ("to_main", "random"):
             raise ValueError(
                 f"bad league_reset_mode {self.league_reset_mode!r}; want to_main|random"
+            )
+        if self.eval_estimator not in ("exact", "sampled"):
+            raise ValueError(f"bad eval_estimator {self.eval_estimator!r}; want exact|sampled")
+        if self.eval_mc_samples < 16:
+            raise ValueError(
+                f"eval_mc_samples must be >= 16 for the derived probe/match budgets, "
+                f"got {self.eval_mc_samples}"
             )
 
 
@@ -381,7 +396,16 @@ def _eval_and_record(
     """Evaluate the current policy, append the curve row, log to TensorBoard."""
     if checkpoint:
         _save_checkpoint(Path(cfg.out_dir), spec, cfg, policy, step)
-    row = build_eval_row(spec, policy, stats, step, env_steps)
+    row = build_eval_row(
+        spec,
+        policy,
+        stats,
+        step,
+        env_steps,
+        eval_estimator=cfg.eval_estimator,
+        eval_mc_samples=cfg.eval_mc_samples,
+        seed=cfg.seed,
+    )
     curve_rows.append(row)
     write_curve(curve_path, curve_rows)
     log_eval_scalars(writer, row, env_steps)

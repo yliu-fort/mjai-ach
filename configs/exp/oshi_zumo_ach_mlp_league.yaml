@@ -4,14 +4,15 @@
 # differ. Oshi-Zumo is the recommended first league experiment (strategy-cycle
 # game; configs/games/oshi_zumo.yaml). All league strategy knobs are listed
 # explicitly at their code defaults so sweeps edit this file only (AGENTS.md §9).
-# WARNING: exact NashConv eval traverses the full game tree and is infeasible at
-# this game size — the first eval at eval_every_env_steps hangs (verified
-# 2026-07-22). Training itself runs fine. Do not launch long runs until a
-# sampled NashConv estimator is available in mjai.eval.nash.
+# Equilibrium eval: exact NashConv full-tree traversal is INFEASIBLE at this game
+# size (hangs; verified 2026-07-22), so eval uses the sampled Monte-Carlo
+# estimator (mjai.eval.sampled_nash; ~5 s/eval measured, MLP on CPU @400).
 game: oshi_zumo
 algo: ach
 self_play_mode: league
 policy_kind: mlp
+eval_estimator: sampled
+eval_mc_samples: 400
 # Network (p25): 1 hidden FC layer of 128 units + ReLU, then two linear heads.
 hidden_sizes: [128]
 activation: relu

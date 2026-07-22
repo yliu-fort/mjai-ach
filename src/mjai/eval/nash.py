@@ -113,19 +113,51 @@ def best_metric_for(spec: GameSpec) -> str:
     return "nash_conv"
 
 
-def evaluate_equilibrium(spec: GameSpec, policy: Policy) -> dict[str, float]:
+def evaluate_equilibrium(
+    spec: GameSpec,
+    policy: Policy,
+    *,
+    estimator: str = "exact",
+    mc_samples: int = 400,
+    seed: int = 0,
+) -> dict[str, float]:
     """Run whichever equilibrium metric(s) apply, return as a dict.
 
     Always returns nash_conv when computable; adds exploitability for
     turn-based games and exact_nash_distance for BRPS. A metric that raises
     (unsupported game/policy combo) is skipped WITH a warning — never silently
     (AGENTS.md: no silent fallback).
+
+    ``estimator`` selects the NashConv backend (AGENTS.md §9, config knob
+    ``eval_estimator``): "exact" walks the full game tree via OpenSpiel —
+    infeasible for oshi_zumo-scale games; "sampled" uses the Monte-Carlo
+    approximate-BR estimator in :mod:`mjai.eval.sampled_nash` with a
+    per-player budget of ``mc_samples`` episodes and additionally reports
+    ``nash_conv_std`` (plus ``exploitability_std`` for 2p0-sum turn-based
+    games, where exploitability = nash_conv / 2 is an exact identity that
+    carries over to the estimates). Unknown estimators raise ValueError
+    loudly.
     """
     import warnings
 
+    if estimator not in ("exact", "sampled"):
+        raise ValueError(f"unknown eval estimator {estimator!r}; want 'exact' | 'sampled'")
     out: dict[str, float] = {}
     if spec.name == "brps":
         out["exact_nash_distance"] = distance_to_brps_nash(policy, num_actions=spec.num_actions)
+    if estimator == "sampled":
+        from mjai.eval.sampled_nash import sampled_nash_conv
+
+        try:
+            res = sampled_nash_conv(spec, policy, mc_samples=mc_samples, seed=seed)
+            out["nash_conv"] = res.nash_conv
+            out["nash_conv_std"] = res.nash_conv_std
+            if not spec.is_simultaneous and spec.num_players == 2 and spec.is_zero_sum:
+                out["exploitability"] = res.nash_conv / 2.0
+                out["exploitability_std"] = res.nash_conv_std / 2.0
+        except Exception as e:
+            warnings.warn(f"sampled nash_conv not computable for {spec.name}: {e}", stacklevel=2)
+        return out
     try:
         out["nash_conv"] = nash_conv_of(spec, policy)
     except Exception as e:

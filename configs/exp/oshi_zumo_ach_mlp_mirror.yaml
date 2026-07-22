@@ -2,14 +2,15 @@
 # 2022, Appendix G p25-26 + H.3 p27-28). A/B control arm for
 # oshi_zumo_ach_mlp_league.yaml. Game params: configs/games/oshi_zumo.yaml
 # (5 coins, size-3 ring, horizon 20; observation_tensor, evaluated via NashConv).
-# WARNING: exact NashConv eval traverses the full game tree and is infeasible at
-# this game size — the first eval at eval_every_env_steps hangs (verified
-# 2026-07-22). Training itself runs fine. Do not launch long runs until a
-# sampled NashConv estimator is available in mjai.eval.nash.
+# Equilibrium eval: exact NashConv full-tree traversal is INFEASIBLE at this game
+# size (hangs; verified 2026-07-22), so eval uses the sampled Monte-Carlo
+# estimator (mjai.eval.sampled_nash; ~5 s/eval measured, MLP on CPU @400).
 game: oshi_zumo
 algo: ach
 self_play_mode: mirror
 policy_kind: mlp
+eval_estimator: sampled
+eval_mc_samples: 400
 # Network (p25): 1 hidden FC layer of 128 units + ReLU, then two linear heads.
 hidden_sizes: [128]
 activation: relu

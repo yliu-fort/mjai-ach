@@ -23,13 +23,24 @@ from mjai.games.loader import GameSpec
 
 
 def build_eval_row(
-    spec: GameSpec, policy: Policy, stats: UpdateStats | None, step: int, env_steps: int
+    spec: GameSpec,
+    policy: Policy,
+    stats: UpdateStats | None,
+    step: int,
+    env_steps: int,
+    *,
+    eval_estimator: str = "exact",
+    eval_mc_samples: int = 400,
+    seed: int = 0,
 ) -> dict[str, object]:
     """Compute equilibrium metrics + per-action BRPS probe for the curve row.
 
-    Metric failures are NOT silently swallowed (AGENTS.md: no silent fallback):
-    they emit a ``warnings.warn`` and leave an ``eval/error`` field in the row,
-    so a missing column in the curve is always traceable.
+    ``eval_estimator`` / ``eval_mc_samples`` select the NashConv backend
+    ("exact" full-tree vs "sampled" Monte-Carlo approximate BR; see
+    :func:`mjai.eval.nash.evaluate_equilibrium`). Metric failures are NOT
+    silently swallowed (AGENTS.md: no silent fallback): they emit a
+    ``warnings.warn`` and leave an ``eval/error`` field in the row, so a
+    missing column in the curve is always traceable.
     """
     row: dict[str, object] = {"step": step, "env_steps": env_steps}
     if stats is not None:
@@ -48,7 +59,10 @@ def build_eval_row(
     from mjai.eval.nash import evaluate_equilibrium
 
     try:
-        row.update({f"eval/{k}": v for k, v in evaluate_equilibrium(spec, policy).items()})
+        metrics = evaluate_equilibrium(
+            spec, policy, estimator=eval_estimator, mc_samples=eval_mc_samples, seed=seed
+        )
+        row.update({f"eval/{k}": v for k, v in metrics.items()})
     except Exception as e:
         warnings.warn(f"equilibrium eval failed at step {step}: {e}", stacklevel=2)
         row["eval/error"] = str(e)
@@ -90,7 +104,10 @@ def print_eval_row(row: dict[str, object]) -> None:
     bits = [f"step={row['step']}"]
     for k in ("eval/exploitability", "eval/nash_conv", "eval/exact_nash_distance"):
         if k in row:
-            bits.append(f"{k.removeprefix('eval/')}={float(row[k]):.4g}")  # type: ignore[arg-type]
+            text = f"{k.removeprefix('eval/')}={float(row[k]):.4g}"  # type: ignore[arg-type]
+            if f"{k}_std" in row:  # sampled estimator reports a standard error
+                text += f"±{float(row[f'{k}_std']):.2g}"  # type: ignore[arg-type]
+            bits.append(text)
     if "brps/nash_distance" in row:
         bits.append(f"brps_nash_d={float(row['brps/nash_distance']):.4g}")  # type: ignore[arg-type]
         bits.append(
