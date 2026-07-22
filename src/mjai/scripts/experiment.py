@@ -102,20 +102,17 @@ def build_policy(spec: GameSpec, cfg: ExperimentConfig, *, seed: int) -> Policy:
 
         return TabularPolicy(num_actions=spec.num_actions, seed=seed, temperature=1.0)
     if cfg.policy_kind == "mlp":
-        from torch import nn
+        from mjai.agents.mlp import ACTIVATIONS, MLPSharedActorCritic
 
-        from mjai.agents.mlp import MLPSharedActorCritic
-
-        activations: dict[str, type[nn.Module]] = {"relu": nn.ReLU, "tanh": nn.Tanh}
-        if cfg.activation not in activations:
+        if cfg.activation not in ACTIVATIONS:
             raise ValueError(
-                f"Unknown activation {cfg.activation!r}; expected one of {sorted(activations)}"
+                f"Unknown activation {cfg.activation!r}; expected one of {sorted(ACTIVATIONS)}"
             )
         return MLPSharedActorCritic(
             obs_size=spec.obs_size,
             num_actions=spec.num_actions,
             hidden_sizes=tuple(cfg.hidden_sizes),
-            activation=activations[cfg.activation],
+            activation=ACTIVATIONS[cfg.activation],
             device=cfg.device,
             seed=seed,
         )
