@@ -1,0 +1,41 @@
+{
+  "kuhn": {
+    "status": "ok",
+    "n_seeds": 8,
+    "x_max_env_steps": 10000041,
+    "ours_final": 0.0205,
+    "paper_final_mean": 0.0211,
+    "paper_final_range": [
+      0.0146,
+      0.1892
+    ],
+    "verdict": "pass",
+    "figure": "docs\\figs\\compare_kuhn.png"
+  },
+  "liars_dice1": {
+    "status": "ok",
+    "n_seeds": 8,
+    "x_max_env_steps": 10000059,
+    "ours_final": 0.3205,
+    "paper_final_mean": 0.1712,
+    "paper_final_range": [
+      0.1541,
+      0.7833
+    ],
+    "verdict": "pass",
+    "figure": "docs\\figs\\compare_liars_dice1.png"
+  },
+  "leduc": {
+    "status": "ok",
+    "n_seeds": 8,
+    "x_max_env_steps": 10000058,
+    "ours_final": 0.4061,
+    "paper_final_mean": 0.4749,
+    "paper_final_range": [
+      0.3468,
+      0.7531
+    ],
+    "verdict": "pass",
+    "figure": "docs\\figs\\compare_leduc.png"
+  }
+}
