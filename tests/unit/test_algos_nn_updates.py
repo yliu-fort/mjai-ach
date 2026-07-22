@@ -259,6 +259,38 @@ def test_ppo_constant_advantages_give_zero_policy_loss():
     assert stats.policy_loss == 0.0
 
 
+# ---- ACH: A3 toggle (centered vs raw logit in the loss body) ----
+
+
+def test_loss_body_logit_toggle_centered_vs_raw():
+    """A3/U1 probe toggle: the gate stays on the centered logit while the loss
+    body switches between centered (default) and raw logit. For a single
+    on-policy sample, policy_loss == -eta * y_used * c * A / pi_old."""
+    adv = 1.5
+    losses: dict[bool, float] = {}
+    for flag in (True, False):
+        p = _policy(seed=3)
+        _shift_logit(p, 1, +2.0)  # non-uniform policy -> raw logit != centered logit
+        batch = _onpolicy_single_batch(p, 1, adv)
+        losses[flag] = _ach(p, loss_centered_logits=flag).step(batch).policy_loss
+
+    p = _policy(seed=3)
+    _shift_logit(p, 1, +2.0)
+    with torch.no_grad():
+        obs_t = torch.as_tensor(OBS, dtype=torch.float32, device=p.device).unsqueeze(0)
+        logits, _ = p.forward(obs_t)
+    pi_old = float(torch.softmax(logits[0], dim=-1)[1].item())
+    y_raw = float(logits[0, 1].item())
+    y_cen = float((logits[0, 1] - logits[0].mean()).item())
+    assert losses[False] == pytest.approx(-y_raw * adv / pi_old, rel=1e-4)
+    assert losses[True] == pytest.approx(-y_cen * adv / pi_old, rel=1e-4)
+    assert losses[False] != losses[True]
+
+
+def test_loss_centered_logits_defaults_true():
+    assert AlgoConfig().loss_centered_logits is True
+
+
 # ---- value head / persistence ----
 
 

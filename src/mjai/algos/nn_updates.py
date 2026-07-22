@@ -236,11 +236,13 @@ class NNACHUpdate(_NNUpdateBase):
         pushes; the corrective direction is always allowed. A symmetric
         |y|<=l_th gate would also zero the gradient that pulls an overshot
         logit back -- a different algorithm (see docs/audit_report.md F1).
-      - **Ambiguity A3 (resolved)**: the mean-centered logit ``y - y_mean`` is
-        used both in the gate AND in the loss body. The paper's text subtracts
-        the mean from the policy output (p24) while Algorithm 2 writes raw
-        ``y``; mean-subtraction leaves softmax unchanged but spreads the
-        gradient across actions (``g_a - mean_b g_b``).
+      - **Ambiguity A3 (gate centered; loss body toggleable)**: the gate always
+        thresholds the mean-centered logit ``y - y_mean`` (paper is explicit:
+        "the mean is subtracted from the policy output", p24). The loss body
+        uses the centered logit by default (paper text); set
+        ``AlgoConfig.loss_centered_logits=False`` for the literal Algorithm 2
+        raw-logit reading. Mean-subtraction leaves softmax unchanged but
+        spreads the gradient across actions (``g_a - mean_b g_b``).
       - **No advantage normalization** (the paper has none; eta=1.0 is the
         hedge learning rate, p27 Table 7).
       - **SGD with constant LR** (H.3, p27: "stochastic gradient descent with
@@ -281,14 +283,19 @@ class NNACHUpdate(_NNUpdateBase):
         new_logp = logp_all.gather(1, actions.unsqueeze(1)).squeeze(1)
         ratio = torch.exp(new_logp - old_logp)
 
-        # Mean-centered logit of the sampled action (gate + loss body; A3).
+        # Gate logit: always mean-centered (paper is explicit: the gate
+        # thresholds on y(a) - y_mean, p24 Algorithm 2).
         centered = logits - logits.mean(dim=-1, keepdim=True)
-        y_a = centered.gather(1, actions.unsqueeze(1)).squeeze(1)
+        y_gate = centered.gather(1, actions.unsqueeze(1)).squeeze(1)
+        # Loss-body logit: centered (paper text, default) or raw (literal
+        # Algorithm 2) per AlgoConfig.loss_centered_logits -- A3/U1 probe toggle.
+        y_loss_src = centered if self.config.loss_centered_logits else logits
+        y_loss = y_loss_src.gather(1, actions.unsqueeze(1)).squeeze(1)
         # Advantage-sign-dependent one-sided gates (p24 Algorithm 2).
-        gate_pos = (y_a < self.config.l_th) & (ratio < 1.0 + self.config.ratio_eps)
-        gate_neg = (y_a > -self.config.l_th) & (ratio > 1.0 - self.config.ratio_eps)
+        gate_pos = (y_gate < self.config.l_th) & (ratio < 1.0 + self.config.ratio_eps)
+        gate_neg = (y_gate > -self.config.l_th) & (ratio > 1.0 - self.config.ratio_eps)
         c = torch.where(adv >= 0, gate_pos, gate_neg).float()
-        policy_loss = -(self.config.eta * y_a * c * adv / (old_probs + 1e-8)).mean()
+        policy_loss = -(self.config.eta * y_loss * c * adv / (old_probs + 1e-8)).mean()
 
         value_loss, entropy = self._value_and_entropy(logits, values, returns, mask)
         loss = (

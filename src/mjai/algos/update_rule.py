@@ -55,6 +55,10 @@ class AlgoConfig:
     eta: float = 1.0
     l_th: float = 2.0
     ratio_eps: float = 0.5
+    # ACH loss body uses the mean-centered logit (paper text, p24) when True;
+    # False = raw logit (literal Algorithm 2). Probe toggle for spec ambiguity
+    # A3/U1; the gate always uses the centered logit (paper is explicit there).
+    loss_centered_logits: bool = True
 
 
 class UpdateRule(ABC):
