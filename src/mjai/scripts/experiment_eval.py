@@ -55,6 +55,11 @@ def build_eval_row(
             v = getattr(stats, k, None)
             if v is not None:
                 row[k] = float(v)
+        # Rule-specific telemetry (ACH gate/importance-weight probes). This is
+        # the last update's snapshot, not an interval aggregate — TensorBoard
+        # holds the full-resolution series; these are for quick curve reads.
+        for k, v in stats.extra.items():
+            row[k] = float(v)
     # Equilibrium metrics (best available for this game).
     from mjai.eval.nash import evaluate_equilibrium
 

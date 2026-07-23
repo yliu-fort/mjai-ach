@@ -453,6 +453,11 @@ def _log_stats(writer: SummaryWriter, step: int, stats: UpdateStats) -> None:
         val = getattr(stats, key, None)
         if val is not None:
             writer.add_scalar(f"train/{key}", float(val), step)
+    # Rule-specific telemetry (ACH: gate_off_frac, iw_max/iw_mean, pterm_max,
+    # grad_norm). Previously computed and dropped; needed at full update
+    # resolution because the blow-ups being probed are intermittent.
+    for key, val in stats.extra.items():
+        writer.add_scalar(f"train/{key}", float(val), step)
 
 
 def _save_checkpoint(

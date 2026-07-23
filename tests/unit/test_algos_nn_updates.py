@@ -341,6 +341,55 @@ def test_centered_mean_legal_only_defaults_false():
     assert AlgoConfig().centered_mean_legal_only is False
 
 
+# ---- ACH: importance-weight / grad-norm telemetry (1/pi_old probe) ----
+
+
+def test_ach_reports_importance_weight_and_grad_norm_telemetry():
+    """The unbounded 1/pi_old probe needs iw/pterm/grad_norm on every update."""
+    p = _policy()
+    stats = _ach(p).step(_batch(8, advantages=MIXED_ADVS))
+    for key in ("iw_max", "iw_mean", "pterm_max", "grad_norm"):
+        assert key in stats.extra, key
+        assert stats.extra[key] >= 0.0
+
+
+def test_iw_max_tracks_the_rarest_sampled_action():
+    """iw_max must equal 1/min(pi_old) over the batch — the blow-up driver."""
+    p = _policy(seed=7)
+    rare_lp = math.log(0.01)  # a very rare sampled action
+    t_rare = Transition(
+        obs=OBS,
+        legal_actions=list(range(NUM_ACTIONS)),
+        action=0,
+        logprob=rare_lp,
+        value=0.0,
+        reward=0.0,
+        return_=0.0,
+        advantage=1.0,
+    )
+    t_common = Transition(
+        obs=OBS,
+        legal_actions=list(range(NUM_ACTIONS)),
+        action=1,
+        logprob=math.log(0.5),
+        value=0.0,
+        reward=0.0,
+        return_=0.0,
+        advantage=1.0,
+    )
+    stats = _ach(p).step(make_batch([t_rare, t_common], num_actions=NUM_ACTIONS))
+    assert stats.extra["iw_max"] == pytest.approx(1.0 / 0.01, rel=1e-3)
+    assert stats.extra["iw_mean"] == pytest.approx((1.0 / 0.01 + 1.0 / 0.5) / 2, rel=1e-3)
+
+
+def test_grad_norm_is_pre_clip():
+    """grad_norm reports the raw norm even when clipping would shrink it."""
+    batch = _batch(8, advantages=MIXED_ADVS)
+    unclipped = _ach(_policy(seed=11), max_grad_norm=0.0).step(batch).extra["grad_norm"]
+    clipped = _ach(_policy(seed=11), max_grad_norm=1e-6).step(batch).extra["grad_norm"]
+    assert clipped == pytest.approx(unclipped, rel=1e-6)
+
+
 # ---- value head / persistence ----
 
 

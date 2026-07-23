@@ -316,15 +316,52 @@ class NNACHUpdate(_NNUpdateBase):
         )
         self.optimizer.zero_grad()
         loss.backward()
+        # Raw (pre-clip) grad norm — telemetry for the unbounded-1/pi_old probe.
+        # Read before _clip_grads so it reflects the gradient the paper's
+        # unclipped setting actually applies (reproduction sets max_grad_norm=0).
+        with torch.no_grad():
+            grad_sqs = [
+                (p.grad.detach() ** 2).sum() for p in self.policy.parameters() if p.grad is not None
+            ]
+            grad_norm = (
+                torch.sqrt(torch.stack(grad_sqs).sum())
+                if grad_sqs
+                else torch.zeros((), device=self.policy.device)
+            )
         self._clip_grads()
         self.optimizer.step()
 
         with torch.no_grad():
             gate_off_frac = 1.0 - c.mean()
+            # Importance weight 1/pi_old(a|s) from Eq. 29. The ratio gate is
+            # vacuous under synchronous self-play (p28), so nothing bounds this;
+            # these scalars let a run be checked for gradient blow-up driven by
+            # rare sampled actions.
+            iw = 1.0 / (old_probs + 1e-8)
+            # Magnitude of the per-sample policy term actually applied.
+            pterm = (self.config.eta * y_loss * c * adv / (old_probs + 1e-8)).abs()
             stats_t = torch.stack(
-                [policy_loss.detach(), value_loss.detach(), entropy.detach(), gate_off_frac]
+                [
+                    policy_loss.detach(),
+                    value_loss.detach(),
+                    entropy.detach(),
+                    gate_off_frac,
+                    iw.max(),
+                    iw.mean(),
+                    pterm.max(),
+                    grad_norm,
+                ]
             )
-        total_pol, total_val, total_ent, gate_off = stats_t.cpu().tolist()
+        (
+            total_pol,
+            total_val,
+            total_ent,
+            gate_off,
+            iw_max,
+            iw_mean,
+            pterm_max,
+            gnorm,
+        ) = stats_t.cpu().tolist()
         approx_kl = float((old_logp - new_logp.detach()).mean().item())
         ev = _explained_variance_torch(returns, values.detach())
         return UpdateStats(
@@ -333,7 +370,13 @@ class NNACHUpdate(_NNUpdateBase):
             entropy=total_ent,
             approx_kl=approx_kl,
             explained_variance=ev,
-            extra={"gate_off_frac": gate_off},
+            extra={
+                "gate_off_frac": gate_off,
+                "iw_max": iw_max,
+                "iw_mean": iw_mean,
+                "pterm_max": pterm_max,
+                "grad_norm": gnorm,
+            },
         )
 
 
