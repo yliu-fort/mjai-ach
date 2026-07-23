@@ -282,5 +282,7 @@ nb = {
 
 out = Path("notebooks/phase1_one_click.ipynb")
 out.parent.mkdir(parents=True, exist_ok=True)
-out.write_text(json.dumps(nb, indent=1), encoding="utf-8")
+# Trailing newline so the end-of-file pre-commit hook does not rewrite the
+# generated notebook after every regeneration (the other two builders match).
+out.write_text(json.dumps(nb, indent=1) + "\n", encoding="utf-8")
 print(f"wrote {out} ({len(CELLS)} cells)")
