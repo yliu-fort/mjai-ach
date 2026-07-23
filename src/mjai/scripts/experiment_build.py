@@ -115,6 +115,10 @@ class ExperimentConfig:
     normalize_advantages: bool = False  # per-batch advantage normalization (PPO term)
     n_epochs: int = 1  # gradient steps per collected batch (paper: 1, p24)
     adam_eps: float = 1e-5  # Adam epsilon (37-details); ignored under SGD
+    # Log the PPO and ACH policy terms' gradient norms separately (+ their
+    # cosine) as train/grad_norm_{ppo,ach}[_scaled] and train/grad_cos_ppo_ach.
+    # Two extra backward passes per update; the update itself is unchanged.
+    probe_term_grad_norms: bool = False
     # ---- Sampling / env-step protocol (paper: batch 64, 1e5 eval, 1e7 total) ----
     target_samples: int | None = None  # per-round batch size in samples (p28: 64)
     total_env_steps: int | None = None  # set -> env-step mode (paper: 1e7)
@@ -241,6 +245,7 @@ def build_update_rule(policy: Policy, cfg: ExperimentConfig, spec: GameSpec) -> 
         normalize_advantages=cfg.normalize_advantages,
         n_epochs=cfg.n_epochs,
         adam_eps=cfg.adam_eps,
+        probe_term_grad_norms=cfg.probe_term_grad_norms,
     )
     if cfg.policy_kind == "tabular":
         # The tabular pair predates the interpolation and stays discrete: PPO

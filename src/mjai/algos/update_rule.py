@@ -120,6 +120,16 @@ class AlgoConfig:
     normalize_advantages: bool = False
     n_epochs: int = 1
     adam_eps: float = 1e-5
+    # Debug probe: measure the PPO and ACH policy terms' gradient norms
+    # SEPARATELY (plus their cosine), so a mixed-theta run says out loud which
+    # term is actually driving the update. Two extra backward passes per
+    # gradient step; measured on Liar's Dice (CPU, batch 64, theta=0.5) at
+    # 2.29 -> 3.96 ms per update, which is +8.5% on a full train round since
+    # the rollout dominates. Off by default anyway: it is a debug instrument,
+    # not part of the protocol. It reads the graph through torch.autograd.grad
+    # and never writes .grad, so the optimizer trajectory is bit-identical
+    # either way (pinned by test_algos_nn_theta).
+    probe_term_grad_norms: bool = False
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.theta <= 1.0:
