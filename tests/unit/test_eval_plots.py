@@ -77,6 +77,23 @@ def test_equilibrium_curves_fallback_metric():
     plt.close(fig)
 
 
+def test_helpers_draw_into_a_caller_supplied_axes():
+    """``ax=`` composes into the caller's grid instead of making a new figure.
+
+    The notebook's side-by-side panels depend on this: a helper that always
+    calls plt.subplots forces the notebook to flush the empty grid as its own
+    image, which is exactly the bug this parameter removes.
+    """
+    fig, axes = plt.subplots(1, 2)
+    before = set(plt.get_fignums())
+    out_a = plot_brps_trajectory(_brps_curve(4), ax=axes[0])
+    out_b = plot_equilibrium_curves({"ACH/mirror": _brps_curve(4)}, ax=axes[1])
+    assert out_a is fig and out_b is fig  # no new figure was created
+    assert set(plt.get_fignums()) == before
+    assert axes[0].get_lines() and axes[1].get_lines()  # both panels got content
+    plt.close(fig)
+
+
 def test_final_metric_bars_returns_figure(tmp_path):
     results = {
         ("brps", "ppo", "mirror"): 0.12,

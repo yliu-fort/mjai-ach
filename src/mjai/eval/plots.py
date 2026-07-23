@@ -51,6 +51,23 @@ def _save_fig(fig: Any, save_path: str | Path | None) -> None:
     fig.savefig(p, dpi=110, bbox_inches="tight")
 
 
+def _axes(ax: Any, figsize: tuple[float, float]) -> tuple[Any, Any, bool]:
+    """Resolve the (figure, axes, owned) triple for a plot helper.
+
+    ``ax=None`` means "make your own figure" (the standalone call the notebook
+    saves to disk). Passing an axes means the CALLER owns the figure and is
+    composing a grid, so the helper must not lay out or close it — a helper
+    that always calls ``plt.subplots`` cannot be composed, and a notebook that
+    tries anyway ends up flushing an empty grid alongside the real plots.
+    """
+    import matplotlib.pyplot as plt
+
+    if ax is not None:
+        return ax.figure, ax, False
+    fig, own_ax = plt.subplots(figsize=figsize)
+    return fig, own_ax, True
+
+
 # matplotlib imported lazily inside each plot function so importing this module
 # is cheap and tests don't need a display backend configured.
 
@@ -65,21 +82,19 @@ def plot_brps_trajectory(
     *,
     title: str = "Biased-RPS policy trajectory",
     save_path: str | Path | None = None,
+    ax: Any = None,
 ) -> Any:
     """Plot P(R)/P(P)/P(S) over training steps with the Nash levels dashed.
 
-    One subplot per curve_rows list passed (caller passes one list per algo/mode
-    to overlay on shared axes by calling this per-cell and composing externally,
-    OR a single cell's curve).
+    Pass ``ax`` to draw one cell into a caller-owned grid (the notebook's
+    PPO-vs-ACH side-by-side panel); omit it for a standalone figure to save.
     """
-    import matplotlib.pyplot as plt
-
     steps = [_i(r, "step") for r in curve_rows if "brps/P_R" in r]
     p_r = [_f(r, "brps/P_R") for r in curve_rows if "brps/P_R" in r]
     p_p = [_f(r, "brps/P_P") for r in curve_rows if "brps/P_P" in r]
     p_s = [_f(r, "brps/P_S") for r in curve_rows if "brps/P_S" in r]
 
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    fig, ax, owned = _axes(ax, (7, 4.5))
     if steps:
         ax.plot(steps, p_r, label="P(Rock)", color="tab:red")
         ax.plot(steps, p_p, label="P(Paper)", color="tab:blue")
@@ -97,7 +112,8 @@ def plot_brps_trajectory(
     ax.set_ylim(0, 1)
     ax.legend(loc="best", fontsize=8)
     ax.grid(True, alpha=0.3)
-    fig.tight_layout()
+    if owned:
+        fig.tight_layout()
     _save_fig(fig, save_path)
     return fig
 
@@ -115,6 +131,7 @@ def plot_equilibrium_curves(
     title: str = "Equilibrium distance over training",
     log_y: bool = True,
     save_path: str | Path | None = None,
+    ax: Any = None,
 ) -> Any:
     """Plot the equilibrium metric vs step, one line per (algo, mode) cell.
 
@@ -123,10 +140,10 @@ def plot_equilibrium_curves(
             The label becomes the legend entry (e.g. ``"ACH / mirror"``).
         metric_key: preferred metric; falls back through ``fallback_keys`` per
             cell if absent.
+        ax: draw into this axes (one panel of a caller-owned per-game grid)
+            instead of making a standalone figure.
     """
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    fig, ax, owned = _axes(ax, (7, 4.5))
     for label, rows in curves.items():
         # Pick the first available metric.
         keys = (metric_key, *fallback_keys)
@@ -144,7 +161,8 @@ def plot_equilibrium_curves(
     ax.set_title(title)
     ax.legend(loc="best", fontsize=8)
     ax.grid(True, which="both", alpha=0.3)
-    fig.tight_layout()
+    if owned:
+        fig.tight_layout()
     _save_fig(fig, save_path)
     return fig
 
@@ -256,11 +274,10 @@ def plot_nontransitivity_over_training(
     curves: dict[str, list[dict[str, object]]],
     *,
     save_path: str | Path | None = None,
+    ax: Any = None,
 ) -> Any:
     """Nontransitivity per cell over training (detail). Returns a Figure."""
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(7, 4))
+    fig, ax, owned = _axes(ax, (7, 4))
     for label, rows in curves.items():
         xs = [_i(r, "step") for r in rows if "nontransitivity" in r]
         ys = [_f(r, "nontransitivity") for r in rows if "nontransitivity" in r]
@@ -271,7 +288,8 @@ def plot_nontransitivity_over_training(
     ax.set_title("Non-transitivity over training (higher = more RPS-like cycling)")
     ax.legend(loc="best", fontsize=8)
     ax.grid(True, alpha=0.3)
-    fig.tight_layout()
+    if owned:
+        fig.tight_layout()
     _save_fig(fig, save_path)
     return fig
 
