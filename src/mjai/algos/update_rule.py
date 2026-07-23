@@ -59,6 +59,13 @@ class AlgoConfig:
     # False = raw logit (literal Algorithm 2). Probe toggle for spec ambiguity
     # A3/U1; the gate always uses the centered logit (paper is explicit there).
     loss_centered_logits: bool = True
+    # ACH centered-logit mean y_bar over LEGAL actions only when True; False =
+    # mean over all actions (historical behavior). The paper never discusses
+    # action masking (spec assumption A5), so which actions enter y_bar is
+    # ambiguous; illegal-logit drift distorts the gate most in games with
+    # shrinking legal sets (Liar's Dice). Probe toggle for the gap
+    # investigation (docs/reproduce_report.md liars +0.15 bias).
+    centered_mean_legal_only: bool = False
 
 
 class UpdateRule(ABC):

@@ -7,6 +7,9 @@ reproduction seeds serve as the baseline reference):
   lam1 : gae_lambda=1.0 (spec assumption A1; H.3 unspecified)
   rawy : loss_centered_logits=False (literal Algorithm 2 raw logit; spec A3/U1)
   ent3 : entropy_coef=0.03 (the paper's own ACH beta on FHP, p27 Table 6)
+  legalmean : centered_mean_legal_only=True (y_bar over legal actions only;
+      A5-adjacent — final-checkpoint diagnostic showed illegal-logit drift
+      shifting the gate by up to +/-4 on Liar's Dice)
 
 Each arm: seed 11, 2e6 env-steps, eval every 2e5. Usage::
 
@@ -35,6 +38,7 @@ ARMS: dict[str, dict[str, object]] = {
     "lam1": {"gae_lambda": 1.0},
     "rawy": {"loss_centered_logits": False},
     "ent3": {"entropy_coef": 0.03},
+    "legalmean": {"centered_mean_legal_only": True},
 }
 
 

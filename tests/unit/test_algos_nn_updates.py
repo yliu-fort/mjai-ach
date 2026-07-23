@@ -291,6 +291,56 @@ def test_loss_centered_logits_defaults_true():
     assert AlgoConfig().loss_centered_logits is True
 
 
+# ---- ACH: A5 toggle (centered mean over legal actions only) ----
+
+
+def _partial_legal_single_batch(p: MLPSharedActorCritic, action: int, legal: list[int]) -> Batch:
+    """One on-policy sample where only ``legal`` actions are legal."""
+    with torch.no_grad():
+        obs_t = torch.as_tensor(OBS, dtype=torch.float32, device=p.device).unsqueeze(0)
+        logits, _ = p.forward(obs_t)
+        masked = logits[0].clone()
+        for a in range(NUM_ACTIONS):
+            if a not in legal:
+                masked[a] = -torch.inf
+        logprob = float(torch.log_softmax(masked, dim=-1)[action].item())
+    t = Transition(
+        obs=OBS,
+        legal_actions=legal,
+        action=action,
+        logprob=logprob,
+        value=0.0,
+        reward=0.0,
+        return_=p.value(OBS),
+        advantage=1.5,
+    )
+    return make_batch([t], num_actions=NUM_ACTIONS)
+
+
+def test_centered_mean_legal_only_changes_loss_only_with_illegal_actions():
+    """A5 probe toggle: y_bar over legal actions only. With a partially-legal
+    state the two means differ (so the loss differs); with all actions legal
+    the toggle is a no-op."""
+    losses: dict[bool, float] = {}
+    for flag in (True, False):
+        p = _policy(seed=5)
+        _shift_logit(p, 3, +2.0)  # make the excluded illegal logit off-mean
+        batch = _partial_legal_single_batch(p, 1, legal=[0, 1, 2])
+        losses[flag] = _ach(p, centered_mean_legal_only=flag).step(batch).policy_loss
+    assert losses[True] != losses[False]
+
+    all_legal: dict[bool, float] = {}
+    for flag in (True, False):
+        p = _policy(seed=5)
+        batch = _onpolicy_single_batch(p, 1, 1.5)
+        all_legal[flag] = _ach(p, centered_mean_legal_only=flag).step(batch).policy_loss
+    assert all_legal[True] == pytest.approx(all_legal[False], rel=1e-6)
+
+
+def test_centered_mean_legal_only_defaults_false():
+    assert AlgoConfig().centered_mean_legal_only is False
+
+
 # ---- value head / persistence ----
 
 

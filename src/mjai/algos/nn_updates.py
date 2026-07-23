@@ -250,6 +250,11 @@ class NNACHUpdate(_NNUpdateBase):
       - **Ratio gate kept but vacuous** under synchronous single-threaded
         self-play, where pi == pi_old (p28 note); it only bites under async
         IMPALA-style sampling.
+      - **Centered-mean action set toggleable** (A5-adjacent ambiguity): by
+        default ``y_mean`` averages ALL logits; with
+        ``AlgoConfig.centered_mean_legal_only=True`` it averages legal-action
+        logits only, shielding the gate and the centered loss body from
+        illegal-logit drift (matters when legal sets shrink, e.g. Liar's Dice).
       - **One gradient step per mini-batch** (p24: "we update theta and omega
         once using a single mini-batch at each iteration").
     """
@@ -284,8 +289,16 @@ class NNACHUpdate(_NNUpdateBase):
         ratio = torch.exp(new_logp - old_logp)
 
         # Gate logit: always mean-centered (paper is explicit: the gate
-        # thresholds on y(a) - y_mean, p24 Algorithm 2).
-        centered = logits - logits.mean(dim=-1, keepdim=True)
+        # thresholds on y(a) - y_mean, p24 Algorithm 2). Which actions enter
+        # y_mean is ambiguous (masking is never discussed, A5): all actions
+        # (historical default) or legal-only (centered_mean_legal_only probe —
+        # illegal logits are untrained and their drift distorts the gate).
+        if self.config.centered_mean_legal_only:
+            n_legal = mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+            y_mean = (logits * mask).sum(dim=-1, keepdim=True) / n_legal
+        else:
+            y_mean = logits.mean(dim=-1, keepdim=True)
+        centered = logits - y_mean
         y_gate = centered.gather(1, actions.unsqueeze(1)).squeeze(1)
         # Loss-body logit: centered (paper text, default) or raw (literal
         # Algorithm 2) per AlgoConfig.loss_centered_logits -- A3/U1 probe toggle.
