@@ -104,6 +104,30 @@ def test_unknown_config_key_fails_loudly():
         )  # type: ignore[call-arg]
 
 
+# ---- seat shuffle + identity routing knobs ----
+
+
+def test_routing_knobs_default_and_reach_controller():
+    """Seat shuffle defaults ON for league; live-opponent routing defaults OFF."""
+    ctrl = _build_league_controller(_base_cfg())
+    assert ctrl.runner.config.shuffle_seats is True
+    assert ctrl.train_live_opponents is False
+    cfg = _base_cfg(league_seat_shuffle=False, league_train_live_opponents=True)
+    ctrl = _build_league_controller(cfg)
+    assert ctrl.runner.config.shuffle_seats is False
+    assert ctrl.train_live_opponents is True
+
+
+def test_mirror_mode_never_shuffles_seats():
+    """Mirror plays one policy in both seats; shuffling would only perturb its RNG."""
+    cfg = ExperimentConfig(
+        game="kuhn", algo="ach", self_play_mode="mirror", league_seat_shuffle=True
+    )
+    spec = load_game("kuhn")
+    controller = build_controller(spec, build_policy(spec, cfg, seed=0), cfg, rng=random.Random(0))
+    assert controller._runner.config.shuffle_seats is False
+
+
 # ---- algo <-> theta resolution (the unified NN update rule) ----
 
 
@@ -157,3 +181,51 @@ def test_mlp_theta_reaches_the_update_rule():
             assert rule.config.theta == want
     finally:
         gpu_assert.reset_for_tests()
+
+
+# ---- per-label train stat logging (identity routing, D5 of the fix) ----
+
+
+class _FakeWriter:
+    """SummaryWriter stand-in capturing the last value per tag (AGENTS.md §6)."""
+
+    def __init__(self) -> None:
+        self.scalars: dict[str, float] = {}
+
+    def add_scalar(self, tag: str, scalar_value: float, global_step: int) -> None:
+        self.scalars[tag] = float(scalar_value)
+
+
+def test_log_train_stats_namespaces_non_main_learners():
+    """The main line keeps plain train/*; other learners log per label."""
+    from types import SimpleNamespace
+
+    from mjai.algos.transition import UpdateStats
+    from mjai.scripts.experiment import _log_train_stats
+
+    main_stats = UpdateStats(policy_loss=1.0, value_loss=0.5, entropy=0.3)
+    me_stats = UpdateStats(policy_loss=2.0, value_loss=0.6, entropy=0.4)
+    trainer = SimpleNamespace(
+        last_stats=main_stats,
+        last_stats_by_label={"main": main_stats, "main_exploiter": me_stats},
+    )
+    writer = _FakeWriter()
+    _log_train_stats(writer, 7, trainer)  # type: ignore[arg-type]
+    assert writer.scalars["train/policy_loss"] == 1.0
+    assert writer.scalars["train/main_exploiter/policy_loss"] == 2.0
+    assert "train/main/policy_loss" not in writer.scalars  # identity skip: no double-log
+
+
+def test_log_train_stats_handles_main_free_rounds():
+    """On exploiter-only rounds nothing logs under plain train/* (sparse, not wrong)."""
+    from types import SimpleNamespace
+
+    from mjai.algos.transition import UpdateStats
+    from mjai.scripts.experiment import _log_train_stats
+
+    me_stats = UpdateStats(policy_loss=2.0, value_loss=0.6, entropy=0.4)
+    trainer = SimpleNamespace(last_stats=None, last_stats_by_label={"main_exploiter": me_stats})
+    writer = _FakeWriter()
+    _log_train_stats(writer, 3, trainer)  # type: ignore[arg-type]
+    assert "train/policy_loss" not in writer.scalars
+    assert writer.scalars["train/main_exploiter/policy_loss"] == 2.0

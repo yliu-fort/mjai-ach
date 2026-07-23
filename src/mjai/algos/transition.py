@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from mjai.agents.base import Policy
+
 
 @dataclass
 class Transition:
@@ -32,6 +34,11 @@ class Transition:
     return_: float  # Monte-Carlo (or bootstrapped) return-to-go
     advantage: float = 0.0  # GAE/return - value; filled in by the UpdateRule
     player: int = 0  # which player this transition belongs to
+    # WHICH POLICY produced this transition (the behavior policy that acted at
+    # the decision point). Tagged by the rollout runner; routes the sample to
+    # the right UpdateRule regardless of the physical seat it came from —
+    # seat numbers stop identifying learners once seats are shuffled.
+    producer: Policy | None = None
 
 
 @dataclass
@@ -52,6 +59,11 @@ class Batch:
     legal_mask: np.ndarray  # (B, num_actions) bool — True where legal
     players: np.ndarray  # (B,) int8 — which seat each transition belongs to
     num_actions: int  # action-space width (for mask shape)
+    # Producer identity table: producer_idx[i] indexes ``producers`` to name
+    # the Policy that generated transition i. Empty/None for hand-built
+    # batches that predate tagging; the rollout runner always populates both.
+    producers: tuple[Policy, ...] = ()
+    producer_idx: np.ndarray | None = None  # (B,) int8
 
     @property
     def size(self) -> int:
@@ -60,8 +72,8 @@ class Batch:
     def for_player(self, player: int) -> Batch:
         """Return a new Batch containing only transitions of ``player``.
 
-        Used by the league controller to train each learner on its own seat's
-        transitions only (the opponent seat belongs to a different learner).
+        Seat-based filter used by eval (cross-play payoff of a fixed seat).
+        Training routes by producer identity instead — see :meth:`for_producer`.
         """
         if self.size == 0:
             return self
@@ -70,7 +82,34 @@ class Batch:
             return self
         import numpy as np
 
-        idx = np.nonzero(mask)[0]
+        return self._take(np.nonzero(mask)[0])
+
+    def for_producer(self, policy: Policy) -> Batch:
+        """Return a new Batch containing only transitions produced by ``policy``.
+
+        Identity-based routing: a learner trains on the samples ITS OWN policy
+        generated, whichever physical seat it occupied (seat shuffle) and
+        whoever else acted in the same episodes (frozen opponents are simply
+        never selected). Matched by object identity, not equality.
+        """
+        if self.producer_idx is None or not self.producers:
+            raise RuntimeError(
+                "Batch.for_producer on a batch without producer tags: the rollout "
+                "runner tags every transition with the acting policy; hand-built "
+                "batches must set Transition.producer too (AGENTS.md §11: no "
+                "silent fallback)."
+            )
+        idx = next((i for i, p in enumerate(self.producers) if p is policy), None)
+        import numpy as np
+
+        if idx is None:
+            # The policy produced nothing in this batch — an empty selection is
+            # the honest answer (mirrors for_player on a seat with no rows).
+            return self._take(np.zeros((0,), dtype=np.int64))
+        return self._take(np.nonzero(self.producer_idx == idx)[0])
+
+    def _take(self, idx: np.ndarray) -> Batch:
+        """Row-select into a new Batch, preserving the producer table."""
         return Batch(
             obs=self.obs[idx],
             legal_actions=[self.legal_actions[i] for i in idx],
@@ -82,6 +121,8 @@ class Batch:
             legal_mask=self.legal_mask[idx],
             players=self.players[idx],
             num_actions=self.num_actions,
+            producers=self.producers,
+            producer_idx=None if self.producer_idx is None else self.producer_idx[idx],
         )
 
 
@@ -91,6 +132,10 @@ def make_batch(transitions: Sequence[Transition], num_actions: int) -> Batch:
     Args:
         transitions: the records to stack (may be empty).
         num_actions: width of the action space; drives the legal_mask shape.
+
+    Producer tags are deduplicated BY IDENTITY into ``Batch.producers`` +
+    ``producer_idx``. Tags are all-or-nothing: a batch mixing tagged and
+    untagged transitions is a caller bug and fails loudly (§11).
     """
     n = len(transitions)
     if n == 0:
@@ -105,6 +150,24 @@ def make_batch(transitions: Sequence[Transition], num_actions: int) -> Batch:
             legal_mask=np.zeros((0, num_actions), dtype=bool),
             players=np.zeros((0,), dtype=np.int8),
             num_actions=num_actions,
+        )
+    producers: list[Policy] = []
+    producer_idx = np.full((n,), -1, dtype=np.int8)
+    for i, t in enumerate(transitions):
+        if t.producer is None:
+            continue
+        for j, p in enumerate(producers):
+            if p is t.producer:
+                producer_idx[i] = j
+                break
+        else:
+            producers.append(t.producer)
+            producer_idx[i] = len(producers) - 1
+    n_tagged = int((producer_idx >= 0).sum())
+    if 0 < n_tagged < n:
+        raise ValueError(
+            f"mixed producer tags: {n_tagged}/{n} transitions tagged; "
+            "tag every transition or none (AGENTS.md §11)"
         )
     legal_mask = np.zeros((n, num_actions), dtype=bool)
     for i, t in enumerate(transitions):
@@ -121,6 +184,8 @@ def make_batch(transitions: Sequence[Transition], num_actions: int) -> Batch:
         legal_mask=legal_mask,
         players=np.asarray([t.player for t in transitions], dtype=np.int8),
         num_actions=num_actions,
+        producers=tuple(producers),
+        producer_idx=producer_idx if n_tagged == n else None,
     )
 
 

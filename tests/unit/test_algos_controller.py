@@ -8,6 +8,7 @@ from mjai.agents.base import Policy
 from mjai.agents.tabular import TabularPolicy
 from mjai.algos.controller import (
     Collected,
+    LearnerBatch,
     MirrorSelfPlay,
     RolloutRunnerProtocol,
     SelfPlayController,
@@ -41,7 +42,9 @@ class _ScriptedRunner:
         self.calls: list[tuple[Policy, Policy]] = []
         self._batch = batch or _toy_batch()
 
-    def run_episode(self, learner: Policy, opponent: Policy) -> Batch:
+    def run_episode(
+        self, learner: Policy, opponent: Policy, *, keep: tuple[Policy, ...] | None = None
+    ) -> Batch:
         self.calls.append((learner, opponent))
         return self._batch
 
@@ -130,7 +133,9 @@ class _RotatingController(SelfPlayController):
     def collect(self) -> Collected:
         learner = self._learners[self._i % len(self._learners)]
         self._i += 1
-        return Collected(batch=_toy_batch(), learner=learner, sampled_steps=8)
+        label = "main" if learner is self._learners[0] else "other"
+        part = LearnerBatch(batch=_toy_batch(), learner=learner, label=label)
+        return Collected(parts=(part,), sampled_steps=8)
 
     @property
     def name(self) -> str:
@@ -179,3 +184,74 @@ def test_round_reports_simulated_cost_separately_from_batch_size():
     round_ = Trainer(policy=main, update_rule=TabularPPOUpdate(main), controller=ctrl).step()
     assert round_.batch_size == 4  # retained
     assert round_.env_steps == 8  # simulated, including the discarded seat
+
+
+class _DualPartController(SelfPlayController):
+    """One round producing a part for EACH of two learners (league-style)."""
+
+    def __init__(self, main: Policy, other: Policy) -> None:
+        self._main, self._other = main, other
+
+    def set_learner(self, policy: Policy) -> None:
+        pass
+
+    def collect(self) -> Collected:
+        return Collected(
+            parts=(
+                LearnerBatch(batch=_toy_batch(2), learner=self._main, label="main"),
+                LearnerBatch(batch=_toy_batch(3), learner=self._other, label="other"),
+            ),
+            sampled_steps=10,
+        )
+
+    @property
+    def name(self) -> str:
+        return "dual"
+
+    def learners(self) -> tuple[Policy, ...]:
+        return (self._main, self._other)
+
+
+def test_trainer_dispatches_every_part_to_its_own_rule():
+    """A multi-part round updates every kept learner on ITS OWN samples."""
+    obs = [0.0, 0.0]
+    main = TabularPolicy(num_actions=2, seed=0)
+    other = TabularPolicy(num_actions=2, seed=0)
+    trainer = Trainer(
+        policy=main,
+        update_rule=TabularPPOUpdate(main),
+        controller=_DualPartController(main, other),
+        extra_rules=[TabularPPOUpdate(other)],
+    )
+    main_before, other_before = main.get_logits(obs)[0], other.get_logits(obs)[0]
+    round_ = trainer.step()
+    assert main.get_logits(obs)[0] != main_before  # main's part updated main
+    assert other.get_logits(obs)[0] != other_before  # other's part updated other
+    assert round_.batch_size == 5  # 2 + 3 across parts
+    assert round_.env_steps == 10
+    assert trainer.last_stats is not None  # the main line's stats
+    assert set(trainer.last_stats_by_label) == {"main", "other"}
+
+
+def test_trainer_fails_loudly_when_every_part_is_empty():
+    """Routing that drops everything is a controller bug, not a slow round (§11)."""
+    from mjai.algos.transition import make_batch
+
+    class _EmptyController(_DualPartController):
+        def collect(self) -> Collected:
+            empty = make_batch([], num_actions=2)
+            return Collected(
+                parts=(LearnerBatch(batch=empty, learner=self._main, label="main"),),
+                sampled_steps=0,
+            )
+
+    main = TabularPolicy(num_actions=2, seed=0)
+    other = TabularPolicy(num_actions=2, seed=0)
+    trainer = Trainer(
+        policy=main,
+        update_rule=TabularPPOUpdate(main),
+        controller=_EmptyController(main, other),
+        extra_rules=[TabularPPOUpdate(other)],
+    )
+    with pytest.raises(RuntimeError, match="no trainable transitions"):
+        trainer.step()

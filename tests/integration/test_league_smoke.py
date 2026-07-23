@@ -72,8 +72,11 @@ def test_league_loop_runs_and_pool_grows():
     for _ in range(12):  # 12 rounds => 4 MAIN rounds => >=1 snapshot at save_every=2
         trainer.step()
     assert len(mgr.store) >= 1
-    s = trainer.last_stats
-    assert math.isfinite(s.policy_loss)
+    # last_stats tracks the MAIN line only (None right after an exploiter
+    # round); the round's updates are all in last_stats_by_label.
+    stats = trainer.last_stats_by_label
+    assert stats
+    assert all(math.isfinite(s.policy_loss) for s in stats.values())
 
 
 @pytest.mark.slow
@@ -81,8 +84,10 @@ def test_league_loop_ppo_survives():
     trainer, _mgr, _ = _build_trainer(TabularPPOUpdate, clip_eps=0.2)
     for _ in range(12):
         trainer.step()
-    assert math.isfinite(trainer.last_stats.policy_loss)
-    assert math.isfinite(trainer.last_stats.value_loss)
+    stats = trainer.last_stats_by_label
+    assert stats
+    assert all(math.isfinite(s.policy_loss) for s in stats.values())
+    assert all(math.isfinite(s.value_loss) for s in stats.values())
 
 
 @pytest.mark.slow

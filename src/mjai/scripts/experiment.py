@@ -165,8 +165,7 @@ def _train_loop(
         if bar is not None:
             bar.update(round_.env_steps)
         stats = trainer.last_stats
-        if stats:
-            _log_stats(writer, step, stats)
+        _log_train_stats(writer, step, trainer)
         # The round's two costs, logged separately so an audit never has to
         # infer one from the other (tools/league_diagnose.py reads both).
         writer.add_scalar("train/sampled_steps", float(round_.env_steps), step)
@@ -280,8 +279,24 @@ def _print_progress(
     print(f"  [{cfg.game}/{cfg.algo}/{cfg.self_play_mode}] " + " ".join(parts))
 
 
-def _log_stats(writer: SummaryWriter, step: int, stats: UpdateStats) -> None:
-    """Push scalar stats to TensorBoard (AGENTS.md §1 D9)."""
+def _log_train_stats(writer: SummaryWriter, step: int, trainer: Trainer) -> None:
+    """Log one round's update stats: the main line under ``train/*``, every
+    other learner updated this round under its own ``train/<label>/*``
+    namespace (identity-matched skip, so the main line never double-logs).
+    """
+    stats = trainer.last_stats
+    if stats:
+        _log_stats(writer, step, stats)
+    for label, label_stats in trainer.last_stats_by_label.items():
+        if stats is not None and label_stats is stats:
+            continue
+        _log_stats(writer, step, label_stats, prefix=f"train/{label}")
+
+
+def _log_stats(
+    writer: SummaryWriter, step: int, stats: UpdateStats, *, prefix: str = "train"
+) -> None:
+    """Push scalar stats to TensorBoard under ``prefix`` (AGENTS.md §1 D9)."""
     for key in (
         "policy_loss",
         "value_loss",
@@ -292,12 +307,12 @@ def _log_stats(writer: SummaryWriter, step: int, stats: UpdateStats) -> None:
     ):
         val = getattr(stats, key, None)
         if val is not None:
-            writer.add_scalar(f"train/{key}", float(val), step)
+            writer.add_scalar(f"{prefix}/{key}", float(val), step)
     # Rule-specific telemetry (ACH: gate_off_frac, iw_max/iw_mean, pterm_max,
     # grad_norm). Previously computed and dropped; needed at full update
     # resolution because the blow-ups being probed are intermittent.
     for key, val in stats.extra.items():
-        writer.add_scalar(f"train/{key}", float(val), step)
+        writer.add_scalar(f"{prefix}/{key}", float(val), step)
 
 
 def _save_checkpoint(

@@ -78,6 +78,18 @@ class ExperimentConfig:
     league_exploiter_share: float = 0.70  # pool fraction league-exploiter must beat
     league_promo_window: int = 20  # rolling win-rate window size (episodes)
     league_reset_mode: str = "to_main"  # exploiter reset after promotion: to_main|random
+    # Per-episode seat shuffle for the collecting role (perspective coverage):
+    # without it a learner only ever sees the game from seat 0, so frozen
+    # opponents are never faced from seat 1 — the policy is half-blind. Routing
+    # is by producer identity, so shuffled episodes still train the right rule.
+    league_seat_shuffle: bool = True
+    # When True, a round whose opponent is itself a live learner (every
+    # main-exploiter round faces the live main; ~half of league-exploiter
+    # rounds too) also routes that opponent's transitions to ITS OWN update
+    # rule — on-policy anti-exploiter data instead of dropped samples. This
+    # changes the league dynamics (the main line patches exploiter-found holes
+    # faster), so it is an explicit knob, off by default.
+    league_train_live_opponents: bool = False
     # Main-snapshot cadence for the league pool, counted in MAIN COLLECT ROUNDS
     # (B3; under the default 1:2 role schedule, every third collect is a main
     # round). Independent of ``save_every_steps`` (legacy round-mode disk
@@ -278,11 +290,12 @@ def build_controller(
             gae_lambda=cfg.gae_lambda,
             seed=cfg.seed,
             target_samples=cfg.target_samples,
-            # League keeps only the collecting role's seat, so only that seat
-            # may count toward the target — otherwise its batches come out at
-            # half the protocol's size while mirror's are full (AGENTS.md §9:
-            # the batch size is a config value, not a mode side effect).
-            target_seat=0 if cfg.self_play_mode == "league" else None,
+            # League rounds shuffle the collector's seat per episode so every
+            # opponent is faced from both perspectives; routing by producer
+            # identity keeps each learner's dose exact regardless of seat.
+            # Mirror plays the same policy in both seats, so shuffling would
+            # only perturb its RNG stream — it stays off there.
+            shuffle_seats=cfg.league_seat_shuffle if cfg.self_play_mode == "league" else False,
         ),
     )
     if cfg.self_play_mode == "mirror":
@@ -295,7 +308,13 @@ def build_controller(
         # League wiring (incl. the B1-generic weight copy) lives in
         # experiment_league (§3.1: keeps this module under the line cap).
         mgr = build_league_manager(policy, make_policy, cfg, rng=rng)
-        return LeagueSelfPlay(mgr, runner, episodes_per_round=cfg.episodes_per_round, rng=rng)
+        return LeagueSelfPlay(
+            mgr,
+            runner,
+            episodes_per_round=cfg.episodes_per_round,
+            train_live_opponents=cfg.league_train_live_opponents,
+            rng=rng,
+        )
     raise ValueError(f"Unknown self_play_mode: {cfg.self_play_mode}")
 
 

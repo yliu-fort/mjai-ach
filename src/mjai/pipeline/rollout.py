@@ -35,24 +35,28 @@ class RolloutConfig:
             it unspecified — spec assumption A1 follows the paper's other
             experiments at 0.95). Episodes are undiscounted (gamma=1): all Phase-1
             games are short with terminal-only rewards.
-        seed: RNG seed for chance-node sampling.
+        seed: RNG seed for chance-node sampling (and seat shuffling, when on).
         target_samples: stop collecting whole episodes once the batch holds at
-            least this many transitions (decision points). The paper's batch
-            size is 64 samples (p28 Table 8); episodes are never truncated
-            mid-game. ``None`` disables (collect exactly ``n_episodes``).
-        target_seat: which seat's transitions count toward ``target_samples``.
-            ``None`` (default) counts both seats — right for mirror self-play,
-            where the shared policy trains on every transition. A controller
-            that keeps only one seat must set this to that seat, or the batch
-            it actually trains on comes out at roughly half ``target_samples``
-            and its updates are quietly weaker than the protocol's.
+            least this many counted transitions (decision points). The paper's
+            batch size is 64 samples (p28 Table 8); episodes are never truncated
+            mid-game. ``None`` disables (collect exactly ``n_episodes``). Which
+            transitions COUNT is decided per call by ``run_episode``'s ``keep``
+            argument — not by physical seat, so the dose stays exact under seat
+            shuffle (AGENTS.md §9: batch size is a config value, not a mode
+            side effect).
+        shuffle_seats: when True, each episode independently flips a fair coin
+            (seeded) to decide which physical seat the ``learner`` occupies, so
+            a learner sees BOTH perspectives against every opponent across
+            episodes. Routing stays correct because every transition is tagged
+            with the policy that produced it. Off by default: mirror self-play
+            (same policy in both seats) would only perturb the RNG stream.
     """
 
     n_episodes: int = 1
     gae_lambda: float = 0.95
     seed: int | None = None
     target_samples: int | None = 64
-    target_seat: int | None = None
+    shuffle_seats: bool = False
 
 
 @dataclass
@@ -69,13 +73,15 @@ class RolloutWorkerCore:
 
     Args:
         game_spec: the loaded :class:`GameSpec`.
-        learner_player: which seat (0 or 1) the ``learner`` argument controls.
-            The opponent occupies the other seat. (For mirror self-play both
-            seats get the same policy; ``learner_player`` still selects whose
-            transitions get the "learner" tag. Transitions from BOTH players
-            are always pooled — the paper trains the shared theta,omega on both seats'
-            samples (p24); the league controller filters by seat afterwards
-            via :meth:`Batch.for_player`.)
+        learner_player: the BASE seat (0 or 1) the ``learner`` argument controls.
+            The opponent occupies the other seat. With ``shuffle_seats`` on, the
+            learner's actual seat is re-drawn per episode (this value is what a
+            coin-toss loss falls back to); transitions stay attributable via
+            their ``producer`` tags, never via seat numbers. (For mirror
+            self-play both seats get the same policy; transitions from BOTH
+            players are always pooled — the paper trains the shared theta,omega
+            on both seats' samples (p24); controllers route by producer
+            afterwards via :meth:`Batch.for_producer`.)
         config: rollout hyperparameters.
     """
 
@@ -89,46 +95,75 @@ class RolloutWorkerCore:
         self.game_spec = game_spec
         self.learner_player = learner_player
         self.config = config or RolloutConfig()
+        if self.config.shuffle_seats and game_spec.num_players != 2:
+            raise ValueError(
+                f"shuffle_seats is defined for 2-player games; "
+                f"{game_spec.name} has {game_spec.num_players} (Phase-2 "
+                "generalization would draw a seat permutation instead of a coin)"
+            )
         self._rng = random.Random(self.config.seed)
         # Episodes played in the most recent run_episode call. The league
         # controller reads this to keep its promotion windows episode-counted.
         self.last_episode_count: int = 0
 
-    def run_episode(self, learner: Policy, opponent: Policy) -> Batch:
-        """Play episodes and return the pooled transitions.
+    def run_episode(
+        self, learner: Policy, opponent: Policy, *, keep: tuple[Policy, ...] | None = None
+    ) -> Batch:
+        """Play episodes and return the pooled, producer-tagged transitions.
 
         Implements RolloutRunnerProtocol: the controller calls this with the
-        learner in the ``learner`` seat and (for mirror) the same policy as the
-        opponent. Plays whole episodes until ``n_episodes`` is reached OR
-        ``config.target_samples`` counted transitions have accumulated (never
-        truncates an episode mid-game). ``config.target_seat`` decides which
-        transitions count; the returned batch always holds both seats, and the
-        caller filters.
+        learner in the (possibly shuffled) ``learner`` seat and (for mirror)
+        the same policy as the opponent. Plays whole episodes until
+        ``n_episodes`` is reached OR ``config.target_samples`` counted
+        transitions have accumulated (never truncates an episode mid-game).
+
+        ``keep`` decides which transitions count toward ``target_samples``:
+          - ``None`` (mirror/tools default): every transition counts.
+          - a tuple of live-learner policies: count per producer, and stop only
+            when EVERY one of them has >= ``target_samples`` transitions, so
+            each kept learner's update meets the protocol's batch size even
+            when several learners share the round's episodes.
+        The returned batch always holds ALL producers' transitions; the caller
+        routes with :meth:`Batch.for_producer`.
         """
+        if keep is not None and len(keep) == 0:
+            raise ValueError("keep must be None (count all) or a non-empty tuple")
+        keep_ids = {id(p) for p in keep} if keep else set()
         all_transitions: list[Transition] = []
         counted = 0
+        per_producer: dict[int, int] = {}
         self.last_episode_count = 0
         for _ in range(self.config.n_episodes):
             target = self.config.target_samples
-            if target is not None and counted >= target:
-                break
-            transitions, returns = self._play_one_episode(learner, opponent)
+            if target is not None:
+                if keep is None and counted >= target:
+                    break
+                if keep is not None and all(per_producer.get(pid, 0) >= target for pid in keep_ids):
+                    break
+            learner_seat = self._draw_learner_seat()
+            transitions, returns = self._play_one_episode(learner, opponent, learner_seat)
             self._assign_returns(transitions, returns)
             all_transitions.extend(transitions)
-            counted += self._count_toward_target(transitions)
+            if keep is None:
+                counted += len(transitions)
+            else:
+                for t in transitions:
+                    pid = id(t.producer)
+                    if pid in keep_ids:
+                        per_producer[pid] = per_producer.get(pid, 0) + 1
             self._last_returns = returns
             self.last_episode_count += 1
         return make_batch(all_transitions, num_actions=self.game_spec.num_actions)
 
-    def _count_toward_target(self, transitions: list[Transition]) -> int:
-        """How many of ``transitions`` count against ``target_samples``."""
-        seat = self.config.target_seat
-        if seat is None:
-            return len(transitions)
-        return sum(1 for t in transitions if t.player == seat)
+    def _draw_learner_seat(self) -> int:
+        """This episode's learner seat: the base seat, or a coin-flip away."""
+        if not self.config.shuffle_seats:
+            return self.learner_player
+        flip = self._rng.random() < 0.5
+        return 1 - self.learner_player if flip else self.learner_player
 
     def _play_one_episode(
-        self, learner: Policy, opponent: Policy
+        self, learner: Policy, opponent: Policy, learner_seat: int
     ) -> tuple[list[Transition], list[float]]:
         """Play one episode, recording (action, logprob, value) per decision point.
 
@@ -136,38 +171,42 @@ class RolloutWorkerCore:
         via ``act_with_value`` (single forward for NN; single masked-softmax for
         tabular). The behavior-policy logprob recorded here is exact — it is the
         same value the old two-pass implementation recomputed in a second loop.
+        Every recorded step carries the acting policy itself, so the pooled
+        batch can be routed by producer identity afterwards.
         """
         state = self.game_spec.new_state()
-        # Record (player, obs, legal, action, logprob, value) at each decision
-        # point in a single pass — no post-episode recompute loop.
-        steps: list[tuple[int, list[float], list[int], int, float, float]] = []
+        # Record (player, producer, obs, legal, action, logprob, value) at each
+        # decision point in a single pass — no post-episode recompute loop.
+        steps: list[tuple[int, Policy, list[float], list[int], int, float, float]] = []
 
         while not state.is_terminal():
             if state.is_chance_node():
                 self._sample_chance(state)
                 continue
             if state.is_simultaneous_node():
-                joint, lps, per_player_values = self._simultaneous_actions(state, learner, opponent)
+                joint, lps, per_player_values, actors = self._simultaneous_actions(
+                    state, learner, opponent, learner_seat
+                )
                 # Record both players' transitions BEFORE applying (so obs is
                 # the pre-step observation).
                 for p in range(self.game_spec.num_players):
                     obs = self.game_spec.obs_tensor(state, p)
                     # Per-player legal set (positional id; kw form rejected by pyspiel).
                     legal = list(state.legal_actions(p))
-                    steps.append((p, obs, legal, joint[p], lps[p], per_player_values[p]))
+                    steps.append((p, actors[p], obs, legal, joint[p], lps[p], per_player_values[p]))
                 state.apply_actions(joint)
             else:
                 p = state.current_player()
                 obs = self.game_spec.obs_tensor(state, p)
                 legal = list(state.legal_actions())
-                policy = self._policy_for(p, learner, opponent)
+                policy = self._policy_for(p, learner, opponent, learner_seat)
                 a, lp, v = policy.act_with_value(obs, legal, eval=False)
-                steps.append((p, obs, legal, a, lp, v))
+                steps.append((p, policy, obs, legal, a, lp, v))
                 state.apply_action(a)
 
         returns = list(state.returns())
         transitions: list[Transition] = []
-        for p, obs, legal, a, lp, v in steps:
+        for p, policy, obs, legal, a, lp, v in steps:
             reward = returns[p]  # terminal-only rewards for these games
             transitions.append(
                 Transition(
@@ -180,6 +219,7 @@ class RolloutWorkerCore:
                     return_=reward,  # overwritten by _assign_returns below
                     advantage=0.0,
                     player=p,
+                    producer=policy,
                 )
             )
         return transitions, returns
@@ -220,8 +260,10 @@ class RolloutWorkerCore:
                 gae = delta + lam * gae
                 t.advantage = gae
 
-    def _policy_for(self, player: int, learner: Policy, opponent: Policy) -> Policy:
-        return learner if player == self.learner_player else opponent
+    def _policy_for(
+        self, player: int, learner: Policy, opponent: Policy, learner_seat: int
+    ) -> Policy:
+        return learner if player == learner_seat else opponent
 
     def _sample_chance(self, state: pyspiel.State) -> None:
         outcomes = state.chance_outcomes()
@@ -230,27 +272,30 @@ class RolloutWorkerCore:
         state.apply_action(actions[idx])
 
     def _simultaneous_actions(
-        self, state: pyspiel.State, learner: Policy, opponent: Policy
-    ) -> tuple[list[int], list[float], list[float]]:
-        """Choose each player's action independently; return (actions, logprobs, values).
+        self, state: pyspiel.State, learner: Policy, opponent: Policy, learner_seat: int
+    ) -> tuple[list[int], list[float], list[float], list[Policy]]:
+        """Choose each player's action independently; return (actions, logprobs, values, actors).
 
         Each player gets exactly one fused ``act_with_value`` call — the
         behavior-policy logprob and value baseline are captured here in the same
         call that samples the action, so the caller records them without a
-        second forward (AGENTS.md §8).
+        second forward (AGENTS.md §8). ``actors[p]`` is the policy that produced
+        player p's action, for the producer tag.
         """
         n = self.game_spec.num_players
         actions: list[int] = []
         logprobs: list[float] = []
         values: list[float] = []
+        actors: list[Policy] = []
         for p in range(n):
             obs = self.game_spec.obs_tensor(state, p)
             # legal_actions accepts the player id positionally (kw form rejected
             # by pyspiel's pybind for matrix games).
             legal = list(state.legal_actions(p))
-            policy = self._policy_for(p, learner, opponent)
+            policy = self._policy_for(p, learner, opponent, learner_seat)
             a, lp, v = policy.act_with_value(obs, legal, eval=False)
             actions.append(a)
             logprobs.append(lp)
             values.append(v)
-        return actions, logprobs, values
+            actors.append(policy)
+        return actions, logprobs, values, actors

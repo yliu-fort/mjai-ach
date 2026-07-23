@@ -16,6 +16,7 @@ Each test names the bug it pins down:
 
 from __future__ import annotations
 
+import dataclasses
 import random
 
 import pytest
@@ -126,8 +127,8 @@ def test_b1_promotion_reset_makes_exploiter_identical_to_main():
 # ---- B2: win signal = mean real seat-0 return ----
 
 
-def _fixed_batch(seat0_returns: list[float], seat1_return: float, adv: float) -> Batch:
-    """Two-seat batch with known returns; advantages set to a misleading constant."""
+def _fixed_batch(seat0_returns: list[float], seat1_return: float, adv: float) -> list[Transition]:
+    """Two-seat transitions with known returns; advantages set to a misleading constant."""
     ts: list[Transition] = []
     for r in seat0_returns:
         ts.append(
@@ -156,25 +157,35 @@ def _fixed_batch(seat0_returns: list[float], seat1_return: float, adv: float) ->
             player=1,
         )
     )
-    return make_batch(ts, num_actions=1)
+    return ts
 
 
 class _FixedRunner:
-    """RolloutRunnerProtocol double: replays one fixed batch per collect."""
+    """RolloutRunnerProtocol double: replays fixed transitions per collect.
 
-    def __init__(self, batch: Batch, n_episodes: int) -> None:
-        self._batch = batch
+    Tags producers the way the real runner would without seat shuffle: seat 0
+    acted the learner, seat 1 the opponent.
+    """
+
+    def __init__(self, transitions: list[Transition], n_episodes: int) -> None:
+        self._transitions = transitions
         self.last_episode_count = n_episodes
 
-    def run_episode(self, learner: Policy, opponent: Policy) -> Batch:
-        return self._batch
+    def run_episode(
+        self, learner: Policy, opponent: Policy, *, keep: tuple[Policy, ...] | None = None
+    ) -> Batch:
+        tagged = [
+            dataclasses.replace(t, producer=learner if t.player == 0 else opponent)
+            for t in self._transitions
+        ]
+        return make_batch(tagged, num_actions=1)
 
 
 def _controller_against_fixed_batch(
-    batch: Batch, n_episodes: int
+    transitions: list[Transition], n_episodes: int
 ) -> tuple[LeagueSelfPlay, LeagueManager]:
     mgr, main = _make_manager(promo_window=20)
-    runner = _FixedRunner(batch, n_episodes)
+    runner = _FixedRunner(transitions, n_episodes)
     ctrl = LeagueSelfPlay(
         mgr,
         runner,
