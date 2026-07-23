@@ -211,17 +211,21 @@ def _all_positive(ordered_arms: list[tuple[str, dict]]) -> bool:
 
 
 def render_curves(summary: dict[str, object], game: str, root: Path = PROBE_ROOT) -> Path | None:
-    """Figure 1: every theta's metric-vs-env-steps curve, overlaid with bands."""
-    import matplotlib
+    """Figure 1: every theta's metric-vs-env-steps curve, overlaid with bands.
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    Pyplot-free (see :func:`league_probe.build_figure`): ``matplotlib.use()``
+    from a notebook-imported helper kills the kernel's inline backend for the
+    rest of the session.
+    """
+    from matplotlib import colormaps
+    from matplotlib.figure import Figure
 
     thetas, metric = _game_entry(summary, game)
     if not thetas:
         return None
-    fig, ax = plt.subplots(figsize=(8, 5))
-    cmap = plt.get_cmap("viridis")
+    fig = Figure(figsize=(8, 5))
+    ax = fig.subplots()
+    cmap = colormaps["viridis"]
     ordered = sorted(thetas.items(), key=lambda kv: kv[1]["theta"])
     drew = False
     for _tag, arm in ordered:
@@ -254,7 +258,6 @@ def render_curves(summary: dict[str, object], game: str, root: Path = PROBE_ROOT
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(out, dpi=150)
-    plt.close(fig)
     return out
 
 
@@ -262,10 +265,7 @@ def render_theta_final(
     summary: dict[str, object], game: str, root: Path = PROBE_ROOT
 ) -> Path | None:
     """Figure 2: final metric vs theta, with a min-max error bar across seeds."""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
 
     thetas, metric = _game_entry(summary, game)
     if not thetas:
@@ -288,7 +288,8 @@ def render_theta_final(
     if not xs:
         return None
     frac = summary.get(game, {}).get("final_frac", 0.1)  # type: ignore[union-attr]
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    fig = Figure(figsize=(7, 4.5))
+    ax = fig.subplots()
     ax.errorbar(xs, means, yerr=[lo_err, hi_err], marker="o", capsize=4, lw=1.6, color="tab:purple")
     for x, m, n in zip(xs, means, n_seeds, strict=True):
         ax.annotate(f"n={n}", (x, m), textcoords="offset points", xytext=(0, 8), fontsize=7)
@@ -304,7 +305,6 @@ def render_theta_final(
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(out, dpi=150)
-    plt.close(fig)
     return out
 
 
@@ -317,17 +317,16 @@ def render_telemetry(game: str, root: Path = PROBE_ROOT) -> Path | None:
     makes that confounder visible instead of leaving it to be inferred from the
     curves.
     """
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    from matplotlib import colormaps
+    from matplotlib.figure import Figure
     from tb_eval import read_many
 
     arm_dirs = sorted((root / game).glob("theta_*/seed_0/tb"))
     if not arm_dirs:
         return None
-    fig, axes = plt.subplots(1, len(TELEMETRY_TAGS), figsize=(5 * len(TELEMETRY_TAGS), 3.8))
-    cmap = plt.get_cmap("viridis")
+    fig = Figure(figsize=(5 * len(TELEMETRY_TAGS), 3.8))
+    axes = fig.subplots(1, len(TELEMETRY_TAGS), squeeze=False)[0]
+    cmap = colormaps["viridis"]
     drew = False
     for ax, tag in zip(axes, TELEMETRY_TAGS, strict=True):
         for d, curve in sorted(read_many(list(arm_dirs), tag=tag).items()):
@@ -346,7 +345,6 @@ def render_telemetry(game: str, root: Path = PROBE_ROOT) -> Path | None:
         ax.set_xlabel("update")
         ax.grid(alpha=0.3)
     if not drew:
-        plt.close(fig)
         return None
     axes[0].set_yscale("log")
     axes[0].legend(fontsize=7)
@@ -354,7 +352,6 @@ def render_telemetry(game: str, root: Path = PROBE_ROOT) -> Path | None:
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(out, dpi=150)
-    plt.close(fig)
     return out
 
 

@@ -27,6 +27,7 @@ import json
 import math
 import shutil
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 import yaml
@@ -251,25 +252,32 @@ def _arm_metric(arm: object) -> str:
     return tag.removeprefix("eval/") if isinstance(tag, str) else ""
 
 
-def render_figure(summary: dict[str, object], root: Path = PROBE_ROOT) -> Path | None:
-    """Per-game panel grid of mean+min/max bands; empty panels hidden.
+def build_figure(
+    summary: dict[str, object], games: Sequence[str] | None = None
+) -> tuple[object, bool]:
+    """Build the per-game panel grid; returns ``(figure, drew_anything)``.
 
-    One panel per game in ``GAMES`` (2 rows x 4 cols for 7 games); each
-    panel's title names the equilibrium metric its curves came from.
-    Returns None if no arm has data.
+    ``games`` selects the panel set: None keeps all of :data:`GAMES` (the
+    whole-probe view, where an empty panel means "that arm has not run yet"),
+    while a single-game list is what a per-game ``ab_<game>.ipynb`` wants —
+    otherwise its figure is 7 panels of which 6 are permanently blank.
+
+    Built through the pyplot-free Figure API on purpose. ``matplotlib.use()``
+    mutates GLOBAL state: calling it from a helper a notebook imports switches
+    the kernel off the inline backend for good, and every later plt.show() in
+    that notebook silently renders nothing (verified: the A/B notebook's league
+    telemetry panel). A bare Figure also never enters pyplot's registry, so
+    nothing leaks.
     """
-    import matplotlib
+    from matplotlib.figure import Figure
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    ncols = 4
-    nrows = math.ceil(len(GAMES) / ncols)
-    fig, axes = plt.subplots(
-        nrows, ncols, figsize=(ncols * 4.6, nrows * 4.2), sharey=False, squeeze=False
-    )
+    panels = list(GAMES if games is None else games)
+    ncols = min(4, len(panels))
+    nrows = math.ceil(len(panels) / ncols)
+    fig = Figure(figsize=(ncols * 4.6, nrows * 4.2))
+    axes = fig.subplots(nrows, ncols, sharey=False, squeeze=False)
     drew = False
-    for idx, game in enumerate(GAMES):
+    for idx, game in enumerate(panels):
         ax = axes[idx // ncols][idx % ncols]
         metric = ""
         panel_drew = False
@@ -296,14 +304,23 @@ def render_figure(summary: dict[str, object], root: Path = PROBE_ROOT) -> Path |
         ax.grid(alpha=0.3)
         if idx % ncols == 0:
             ax.set_ylabel(metric or "equilibrium metric")
-    for idx in range(len(GAMES), nrows * ncols):
+    for idx in range(len(panels), nrows * ncols):
         axes[idx // ncols][idx % ncols].set_visible(False)
+    fig.tight_layout()
+    return fig, drew
+
+
+def render_figure(
+    summary: dict[str, object], root: Path = PROBE_ROOT, games: Sequence[str] | None = None
+) -> Path | None:
+    """Save the panel grid under ``root/figs``; None when no arm has data."""
+    fig, drew = build_figure(summary, games)
     if not drew:
         return None
-    out = root / "figs" / "ab_exploitability.png"
+    stem = "ab_exploitability" if games is None else f"ab_{'_'.join(games)}"
+    out = root / "figs" / f"{stem}.png"
     out.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=150)  # type: ignore[attr-defined]
     return out
 
 

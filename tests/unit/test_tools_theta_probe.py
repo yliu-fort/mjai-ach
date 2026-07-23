@@ -122,6 +122,18 @@ def test_render_curves_and_final_write_pngs(tmp_path: Path):
     assert finals.name == "theta_final_kuhn.png"
 
 
+def test_renderers_never_touch_the_global_matplotlib_backend(tmp_path: Path):
+    """See the twin test in test_tools_league_probe: matplotlib.use() from a
+    helper the notebook imports switches the kernel off the inline backend and
+    every later plt.show() renders nothing."""
+    before = matplotlib.get_backend()
+    summary = _summary({0.0: [0.4], 1.0: [0.2]})
+    theta_probe.render_curves(summary, "kuhn", tmp_path)
+    theta_probe.render_theta_final(summary, "kuhn", tmp_path)
+    assert matplotlib.get_backend() == before
+    assert not plt.get_fignums()
+
+
 def test_renderers_return_none_without_data(tmp_path: Path):
     """An empty probe root must not raise or emit an empty figure."""
     assert theta_probe.render_curves({}, "kuhn", tmp_path) is None

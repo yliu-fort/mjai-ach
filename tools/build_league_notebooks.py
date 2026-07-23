@@ -207,7 +207,9 @@ for bj in sorted(OUT_ROOT.glob("*_*/seed_*/checkpoints/best/best.json")):
     print(f"  {str(rel):28s} {info['tag']}={info['value']:.4f} @ env_steps={info['env_steps']}")"""
 
 FIGURE_CODE = """# === Comparison figure (mean + min-max band across seeds) ===
-fig_path = league_probe.render_figure(summary, OUT_ROOT)
+# games=[GAME] keeps this to ONE panel; the default panel set is all 7 games,
+# which in a per-game notebook renders 6 permanently blank panels.
+fig_path = league_probe.render_figure(summary, OUT_ROOT, games=[GAME])
 if fig_path:
     display(Image(filename=str(fig_path)))
 else:

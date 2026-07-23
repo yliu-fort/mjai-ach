@@ -205,7 +205,8 @@ def test_render_figure_grid_covers_seven_games(tmp_path: Path):
     }
     out = league_probe.render_figure(summary, root=tmp_path)
     assert out is not None and out.is_file()
-    fig = plt.gcf()
+    fig, drew = league_probe.build_figure(summary)
+    assert drew
     visible = [ax for ax in fig.axes if ax.get_visible()]
     assert len(visible) == len(league_probe.GAMES) == 7
     titles = {ax.get_title() for ax in visible}
@@ -213,6 +214,31 @@ def test_render_figure_grid_covers_seven_games(tmp_path: Path):
     assert any("brps: nash_conv" in t for t in titles)
     # Games without data still get panels (grid slot), just no curves.
     assert any(t.startswith("ttt: ") for t in titles)
+
+
+def test_render_figure_games_filter_gives_one_panel_per_game(tmp_path: Path):
+    """A per-game ab_<game> notebook must not get 7 panels with 6 blank."""
+    summary = {"kuhn_mirror": _synthetic_arm("eval/exploitability", 0.05)}
+    fig, drew = league_probe.build_figure(summary, games=["kuhn"])
+    assert drew
+    assert [ax.get_title() for ax in fig.axes if ax.get_visible()] == [
+        "kuhn: exploitability vs env-steps"
+    ]
+    out = league_probe.render_figure(summary, root=tmp_path, games=["kuhn"])
+    assert out is not None and out.name == "ab_kuhn.png"
+
+
+def test_renderers_never_touch_the_global_matplotlib_backend(tmp_path: Path):
+    """matplotlib.use() from a notebook-imported helper kills inline plotting.
+
+    The A/B notebook plots league telemetry inline AFTER calling render_figure;
+    when this regresses, that cell silently emits no image at all.
+    """
+    before = matplotlib.get_backend()
+    summary = {"kuhn_mirror": _synthetic_arm("eval/exploitability", 0.05)}
+    league_probe.render_figure(summary, root=tmp_path)
+    assert matplotlib.get_backend() == before
+    assert not plt.get_fignums()  # and no figure leaked into pyplot's registry
 
 
 def test_render_figure_no_data_returns_none(tmp_path: Path):
