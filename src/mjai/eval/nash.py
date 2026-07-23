@@ -25,6 +25,15 @@ uses different BLAS blocking than a one-row forward, so the logits differ in
 the last ulp. That is far below the metric's seed-to-seed noise, but it does
 mean eval values are not comparable bit-for-bit with runs from before this
 change. ``tests/unit/test_eval_nash.py`` pins the agreement.
+
+**Reproducibility caveat.** The fast route's default best-response solver is
+OpenSpiel's C++ ``TabularBestResponseMDP`` (7.9x on Liar's Dice), which sums
+over a hash-map iteration order that is not stable across processes: repeating
+the same eval in a fresh process moved nash_conv by 1 ulp in 1 run out of 5.
+That is ~1e-16 relative — nothing against seed-to-seed spread — but it means
+"same seed, same eval bits" holds only under ``eval_exact_backend="python"``.
+Set that when you need exactly-reproducible curves; the default trades those
+last two digits for the speedup.
 """
 
 from __future__ import annotations
@@ -154,7 +163,58 @@ def tabular_view_of(spec: GameSpec, policy: Policy) -> ospolicy.TabularPolicy:
     return tabular
 
 
-def equilibrium_metrics_exact(spec: GameSpec, policy: Policy) -> dict[str, float]:
+EXACT_BACKENDS = ("auto", "python", "cpp")
+
+
+def _cpp_policy(tabular: ospolicy.TabularPolicy) -> pyspiel.Policy:
+    """Convert a materialized TabularPolicy into OpenSpiel's C++ policy type."""
+    probs = tabular.action_probability_array
+    return pyspiel.TabularPolicy(
+        {
+            info: [
+                (int(a), float(probs[row][a]))
+                for a in np.flatnonzero(tabular.legal_actions_mask[row])
+            ]
+            for info, row in tabular.state_lookup.items()
+        }
+    )
+
+
+def use_cpp_backend(spec: GameSpec, backend: str = "auto") -> bool:
+    """Whether to solve ``spec`` with OpenSpiel's C++ best-response MDP.
+
+    ``auto`` means "turn-based games only", which is a statement about where
+    the C++ solver both works and wins, measured 2026-07-23:
+
+      - turn-based: Liar's Dice 14.2 s -> 1.8 s (7.9x), Leduc 6.1x, Kuhn 12x,
+        values identical or within 1e-15;
+      - simultaneous: the C++ solver raises ``prob <= 1`` (an exact-1.0
+        probability tripping a strict assertion) for EVERY trained MLP policy
+        tried on Goofspiel-5, while accepting uniform tabular ones — i.e. it
+        fails precisely on the policies we train. BRPS is also slower there,
+        being tiny enough that the policy conversion dominates. Both games are
+        cheap in Python anyway (0.00 s and 2.6 s).
+
+    Where the C++ solver does answer it agrees with the Python route, on
+    simultaneous games too; it never silently returns something different. So
+    ``cpp`` is a safe thing to force — it either matches or raises.
+
+    Dispatch is by game type, not by try/except: which backend ran is a
+    property of the config, knowable before the run (AGENTS.md: no silent
+    fallbacks).
+    """
+    if backend not in EXACT_BACKENDS:
+        raise ValueError(f"unknown exact backend {backend!r}; want {' | '.join(EXACT_BACKENDS)}")
+    if backend == "python":
+        return False
+    if backend == "cpp":
+        return True
+    return not spec.is_simultaneous
+
+
+def equilibrium_metrics_exact(
+    spec: GameSpec, policy: Policy, *, backend: str = "auto"
+) -> dict[str, float]:
     """Exact ``nash_conv`` (+ ``exploitability`` when defined) in ONE traversal.
 
     OpenSpiel's own ``exploitability`` docstring states it "is equivalent to
@@ -162,11 +222,26 @@ def equilibrium_metrics_exact(spec: GameSpec, policy: Policy) -> dict[str, float
     metrics separately walks the same tree twice for no extra information —
     roughly 44% of the old eval cost. Here exploitability is derived from
     nash_conv; games outside that identity fall back to the reference call.
+
+    ``backend`` selects the best-response solver (see :func:`use_cpp_backend`).
+    Note that the C++ solver's own ``exploitability`` field is NOT used — it
+    reports 0 for these games — so both routes derive it from nash_conv.
     """
     tabular = tabular_view_of(spec, policy)
-    from open_spiel.python.algorithms import exploitability
+    if use_cpp_backend(spec, backend):
+        # LIFETIME: pyspiel.TabularBestResponseMDP keeps a raw reference to the
+        # policy without extending its lifetime, so the C++ policy MUST stay in
+        # a live Python local for as long as the solver is used. Passing it as
+        # a temporary (`TabularBestResponseMDP(game, _cpp_policy(t)).nash_conv()`)
+        # segfaults the interpreter — no exception, no traceback.
+        cpp_policy = _cpp_policy(tabular)
+        solver = pyspiel.TabularBestResponseMDP(spec.game, cpp_policy)
+        nash_conv = float(solver.nash_conv().nash_conv)
+        del solver, cpp_policy
+    else:
+        from open_spiel.python.algorithms import exploitability
 
-    nash_conv = float(exploitability.nash_conv(spec.game, tabular))
+        nash_conv = float(exploitability.nash_conv(spec.game, tabular))
     out = {"nash_conv": nash_conv}
     if spec.num_players != 2 or spec.is_simultaneous:
         return out
@@ -243,6 +318,7 @@ def evaluate_equilibrium(
     estimator: str = "exact",
     mc_samples: int = 400,
     seed: int = 0,
+    exact_backend: str = "auto",
 ) -> dict[str, float]:
     """Run whichever equilibrium metric(s) apply, return as a dict.
 
@@ -282,7 +358,7 @@ def evaluate_equilibrium(
             warnings.warn(f"sampled nash_conv not computable for {spec.name}: {e}", stacklevel=2)
         return out
     try:
-        out.update(equilibrium_metrics_exact(spec, policy))
+        out.update(equilibrium_metrics_exact(spec, policy, backend=exact_backend))
     except Exception as e:
         warnings.warn(f"exact equilibrium eval failed for {spec.name}: {e}", stacklevel=2)
     return out

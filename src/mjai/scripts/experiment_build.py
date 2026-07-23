@@ -127,6 +127,14 @@ class ExperimentConfig:
     # => reproducible, lower-variance eval-to-eval comparisons).
     eval_estimator: str = "exact"
     eval_mc_samples: int = 400
+    # Best-response solver for the "exact" estimator (mjai.eval.nash):
+    # "auto" = OpenSpiel's C++ MDP solver on turn-based games (7.9x on Liar's
+    # Dice) and the Python traversal on simultaneous ones, where the C++ solver
+    # raises on trained MLP policies; "python" / "cpp" force one route.
+    # NOTE: the C++ solver is only reproducible to ~1 ulp across processes (its
+    # summation order follows a hash map). Use "python" when eval curves must
+    # be bit-identical run to run.
+    eval_exact_backend: str = "auto"
 
     def __post_init__(self) -> None:
         # League knob validation (AGENTS.md §9: invalid config fails loudly).
@@ -139,6 +147,10 @@ class ExperimentConfig:
             )
         if self.eval_estimator not in ("exact", "sampled"):
             raise ValueError(f"bad eval_estimator {self.eval_estimator!r}; want exact|sampled")
+        if self.eval_exact_backend not in ("auto", "python", "cpp"):
+            raise ValueError(
+                f"bad eval_exact_backend {self.eval_exact_backend!r}; want auto|python|cpp"
+            )
         if self.eval_mc_samples < 16:
             raise ValueError(
                 f"eval_mc_samples must be >= 16 for the derived probe/match budgets, "

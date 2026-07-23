@@ -222,6 +222,7 @@ def _eval_and_record(
         eval_estimator=cfg.eval_estimator,
         eval_mc_samples=cfg.eval_mc_samples,
         seed=cfg.seed,
+        eval_exact_backend=cfg.eval_exact_backend,
     )
     curve_rows.append(row)
     write_curve(curve_path, curve_rows)

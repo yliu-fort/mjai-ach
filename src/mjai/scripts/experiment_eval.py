@@ -32,6 +32,7 @@ def build_eval_row(
     eval_estimator: str = "exact",
     eval_mc_samples: int = 400,
     seed: int = 0,
+    eval_exact_backend: str = "auto",
 ) -> dict[str, object]:
     """Compute equilibrium metrics + per-action BRPS probe for the curve row.
 
@@ -65,7 +66,12 @@ def build_eval_row(
 
     try:
         metrics = evaluate_equilibrium(
-            spec, policy, estimator=eval_estimator, mc_samples=eval_mc_samples, seed=seed
+            spec,
+            policy,
+            estimator=eval_estimator,
+            mc_samples=eval_mc_samples,
+            seed=seed,
+            exact_backend=eval_exact_backend,
         )
         row.update({f"eval/{k}": v for k, v in metrics.items()})
     except Exception as e:
