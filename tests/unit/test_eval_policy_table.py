@@ -11,13 +11,13 @@ import numpy as np
 import pytest
 
 matplotlib.use("Agg")
-from matplotlib.figure import Figure  # noqa: E402
+from matplotlib.figure import Figure
 
-from mjai.agents.ckpt_io import CheckpointManifest, write_checkpoint  # noqa: E402
-from mjai.agents.mlp import MLPSharedActorCritic  # noqa: E402
-from mjai.eval import policy_table as pt  # noqa: E402
-from mjai.games.loader import load_game  # noqa: E402
-from mjai.utils import gpu_assert  # noqa: E402
+from mjai.agents.ckpt_io import CheckpointManifest, write_checkpoint
+from mjai.agents.mlp import MLPSharedActorCritic
+from mjai.eval import policy_table as pt
+from mjai.games.loader import load_game
+from mjai.utils import gpu_assert
 
 TOOLS_DIR = Path(__file__).resolve().parents[2] / "tools"
 if str(TOOLS_DIR) not in sys.path:

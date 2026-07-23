@@ -170,6 +170,7 @@ if not (REPO / "tools" / "theta_probe.py").is_file():
 sys.path.insert(0, str(REPO / "tools"))
 
 import arm_cache     # config-fingerprint cache (hit / stale / missing)
+import policy_view   # final-policy view (rollout + mjai.eval.policy_table)
 import theta_probe   # run_arm / arm_status / summarize / render_* helpers
 from IPython.display import Image, display
 
@@ -255,6 +256,61 @@ TELEMETRY_CODE = """# === Diagnostic: gradient scale / per-term split / gate / c
 fig3 = theta_probe.render_telemetry(GAME, OUT_ROOT)
 display(Image(filename=str(fig3))) if fig3 else print("no telemetry yet")"""
 
+POLICY_MD = """## 最终策略（每个 theta 学到了什么）
+
+图 1/2 只说「离 Nash 多远」，不说「到底怎么打」。这一格把每个 theta 训练完的
+**策略本身**物化出来。展示形式由游戏规模决定（实测枚举成本见
+`src/mjai/eval/policy_table.py` 的模块 docstring）：
+
+- **brps**（2 个信息集）：柱状图 + 与解析 NE (1/16, 10/16, 5/16) 的 TV 距离。
+  这是最直观的一格——PPO 端（theta=0）绕圈时这里会明显偏离，ACH 端应该贴上去。
+- **kuhn**（12）：完整表格。
+- **liars_dice1**（24576）：动作边缘分布 + **按自博弈访问频率排序的 Top-K 信息集**，
+  外加完整 CSV 落盘。
+
+访问频率来自用该臂自己的策略自博弈 `POLICY_EPISODES` 局，按 observation 向量
+join 回枚举出来的行。"""
+
+POLICY_CODE = """# === Final policy per theta ===
+POLICY_PICK     = "best"   # "best" (SOTA snapshot) | "last" | "step_N"
+POLICY_SEED     = 0        # which seed's arm to show
+POLICY_EPISODES = 400      # self-play episodes used to rank info states (0 = skip)
+POLICY_TOP_K    = 12       # rows in the printed table
+
+import pandas as pd
+from mjai.eval.policy_table import brps_nash_gap, to_records
+
+policy_arms = [
+    (f"theta={theta:g}", theta_probe.arm_dir(OUT_ROOT, GAME, theta, POLICY_SEED))
+    for theta in THETAS
+]
+policy_arms = [(lab, run) for lab, run in policy_arms if (run / "checkpoints").is_dir()]
+
+if not policy_arms:
+    print("no trained arms yet")
+else:
+    fig_path, views, skipped = policy_view.render_arms(
+        policy_arms, OUT_ROOT / "figs" / f"policy_{GAME}.png",
+        checkpoint=POLICY_PICK, episodes=POLICY_EPISODES, player=0,
+    )
+    for lab, why in skipped.items():
+        print(f"[{lab}] no policy table: {why}")
+    if fig_path:
+        display(Image(filename=str(fig_path)))
+    if GAME == "brps":
+        print("\\nDistance to the analytic BRPS equilibrium (lower = closer):")
+        for lab, view in views.items():
+            probs, tv = brps_nash_gap(view)
+            print(f"  {lab:<12s} P(R,P,S) = {probs.round(4)}   TV = {tv:.4f}")
+    for lab, view in views.items():
+        print(f"\\n--- {lab} --- {view.checkpoint}")
+        rows = view.top_rows(POLICY_TOP_K, player=0)
+        df = pd.DataFrame(to_records(view, rows=rows)).set_index("info_state")
+        display(df.style.format(precision=3, na_rep="-"))
+        csv = OUT_ROOT / "figs" / f"policy_{GAME}_{policy_view.slug(lab)}.csv"
+        print(f"    full table ({len(view.labels)} rows) -> "
+              f"{policy_view.write_csv(view, csv)}")"""
+
 FOOTER_MD = """## 解读指南
 
 - **图 1（叠加曲线）**：同预算下谁低谁好。带宽是 {n_seeds} 个 seed 的 min–max，不是
@@ -294,6 +350,8 @@ def build(game: str, spec: dict[str, object]) -> Path:
     code(FIGURE_CODE)
     code(FINAL_FIG_CODE)
     code(TELEMETRY_CODE)
+    md(POLICY_MD)
+    code(POLICY_CODE)
     md(FOOTER_MD.format(n_seeds=3, final_pct="10%"))
     nb = {
         "cells": list(CELLS),

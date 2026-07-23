@@ -9,7 +9,7 @@ import matplotlib
 import pytest
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.pyplot as plt
 
 TOOLS_DIR = Path(__file__).resolve().parents[2] / "tools"
 if str(TOOLS_DIR) not in sys.path:
@@ -29,6 +29,14 @@ def _cpu_mode():
     yield
     gpu_assert.reset_for_tests()
     plt.close("all")
+
+
+def test_slug_makes_an_arm_label_filename_safe():
+    assert policy_view.slug("mirror theta=0.5   seed=0") == "mirror_theta0p5_seed0"
+    assert policy_view.slug("theta=1") == "theta1"
+    assert policy_view.slug("league") == "league"
+    # distinct labels must not collapse onto one filename
+    assert policy_view.slug("theta=0.5") != policy_view.slug("theta=0")
 
 
 def test_view_for_arm_carries_visits_end_to_end(tmp_path: Path):

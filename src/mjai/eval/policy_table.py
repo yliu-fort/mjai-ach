@@ -209,9 +209,7 @@ def resolve_checkpoint(run_dir: str | Path, checkpoint: str = "best") -> Path:
     return target
 
 
-def load_run_policy(
-    run_dir: str | Path, checkpoint: str = "best"
-) -> tuple[Policy, GameSpec, Path]:
+def load_run_policy(run_dir: str | Path, checkpoint: str = "best") -> tuple[Policy, GameSpec, Path]:
     """Rebuild a run's policy plus its game spec. Eval always plays on CPU."""
     ckpt = resolve_checkpoint(run_dir, checkpoint)
     policy = load_policy_from_checkpoint(ckpt, device="cpu")
@@ -288,9 +286,7 @@ def policy_view(
         # on (cached per game), so rows join to visits without re-walking the
         # tree and without a second notion of state identity.
         obs = state_observations(spec)
-        visits = np.asarray(
-            [visit_counts.get(row.tobytes(), 0) for row in obs], dtype=np.int64
-        )
+        visits = np.asarray([visit_counts.get(row.tobytes(), 0) for row in obs], dtype=np.int64)
 
     return PolicyView(
         game=spec.name,
@@ -324,9 +320,7 @@ def root_policy(run_dir: str | Path, *, checkpoint: str = "best") -> dict[int, d
         arr = np.asarray(logits, dtype=np.float64)
         arr -= arr.max()
         exps = np.exp(arr)
-        out[player] = {
-            names[a]: float(p) for a, p in zip(legal, exps / exps.sum(), strict=True)
-        }
+        out[player] = {names[a]: float(p) for a, p in zip(legal, exps / exps.sum(), strict=True)}
     return out
 
 
@@ -384,10 +378,14 @@ def _plot_per_state_bars(view: PolicyView, ax: Any, rows: np.ndarray) -> None:
         vals = [view.probs[i][a] if view.legal[i][a] else 0.0 for i in rows]
         ax.bar(x + a * width - 0.4 + width / 2, vals, width, label=name)
     if view.game == "brps":  # analytic NE is known exactly -- show the target
-        for value, color in zip(BRPS_EXACT_NASH, ("tab:blue", "tab:orange", "tab:green"), strict=False):
+        for value, color in zip(
+            BRPS_EXACT_NASH, ("tab:blue", "tab:orange", "tab:green"), strict=False
+        ):
             ax.axhline(value, color=color, ls="--", lw=1, alpha=0.6)
     ax.set_xticks(x)
-    ax.set_xticklabels([view.labels[i] or "(root)" for i in rows], rotation=45, ha="right", fontsize=7)
+    ax.set_xticklabels(
+        [view.labels[i] or "(root)" for i in rows], rotation=45, ha="right", fontsize=7
+    )
     ax.set_ylim(0, 1)
     ax.set_ylabel("action probability")
     ax.legend(fontsize=7)

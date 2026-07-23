@@ -80,6 +80,60 @@ def test_arm_dir_layout():
     assert d == Path("/x/kuhn_league/seed_7")
 
 
+def test_arm_dir_keeps_the_historical_name_without_a_theta():
+    """theta=None must resolve to the pre-knob path so old arms stay cached."""
+    assert league_probe.arm_name("kuhn", "mirror") == "kuhn_mirror"
+    assert league_probe.arm_dir(Path("/x"), "kuhn", "mirror", 0, None) == Path(
+        "/x/kuhn_mirror/seed_0"
+    )
+
+
+def test_arm_dir_separates_thetas_so_ppo_and_ach_can_coexist():
+    """Without the suffix a PPO arm would overwrite the ACH arm it is compared to."""
+    ppo = league_probe.arm_dir(Path("/x"), "kuhn", "mirror", 0, 0.0)
+    ach = league_probe.arm_dir(Path("/x"), "kuhn", "mirror", 0, 1.0)
+    mixed = league_probe.arm_dir(Path("/x"), "kuhn", "mirror", 0, 0.25)
+    assert ppo == Path("/x/kuhn_mirror_t0/seed_0")
+    assert ach == Path("/x/kuhn_mirror_t1/seed_0")
+    assert mixed == Path("/x/kuhn_mirror_t0p25/seed_0")
+    assert len({ppo, ach, mixed}) == 3
+
+
+@pytest.mark.parametrize(
+    ("game", "mode", "theta"),
+    [
+        ("kuhn", "mirror", None),
+        ("kuhn", "league", 0.0),
+        ("goofspiel5_ii", "mirror", 0.25),  # game names containing "_"
+        ("liars_dice1", "league", 1.0),
+        ("oshi_zumo", "mirror", 0.75),
+    ],
+)
+def test_parse_arm_round_trips_even_for_underscored_game_names(game, mode, theta):
+    assert league_probe.parse_arm(league_probe.arm_name(game, mode, theta)) == (game, mode, theta)
+
+
+def test_parse_arm_rejects_a_foreign_directory_name():
+    assert league_probe.parse_arm("summary") is None
+    assert league_probe.parse_arm("kuhn_solo") is None
+
+
+def test_arm_config_theta_switches_to_the_interpolated_rule():
+    """theta=None keeps the YAML's pinned algo; a value switches to algo='theta'."""
+    kwargs = {"total_env_steps": 100, "eval_every_env_steps": 50}
+    plain = league_probe.arm_config("kuhn", "mirror", 0, **kwargs)
+    assert plain.algo == "ach" and plain.theta is None
+    ppo = league_probe.arm_config("kuhn", "mirror", 0, theta=0.0, **kwargs)
+    assert ppo.algo == "theta" and ppo.theta == 0.0
+    # ...but the scaffolding still comes from the ACH config (D11 one-factor).
+    assert (ppo.optimizer, ppo.normalize_advantages, ppo.n_epochs) == (
+        plain.optimizer,
+        plain.normalize_advantages,
+        plain.n_epochs,
+    )
+    assert "kuhn_mirror_t0" in ppo.out_dir
+
+
 def test_interp_forward_fill():
     curve = [(10, 1.0), (20, 0.5), (30, 0.25)]
     assert league_probe.interp_forward(curve, [0, 10, 15, 25, 30, 99]) == [
@@ -214,6 +268,29 @@ def test_render_figure_grid_covers_seven_games(tmp_path: Path):
     assert any("brps: nash_conv" in t for t in titles)
     # Games without data still get panels (grid slot), just no curves.
     assert any(t.startswith("ttt: ") for t in titles)
+
+
+def test_figure_draws_one_line_per_mode_x_theta_arm(tmp_path: Path):
+    """A mode x theta sweep must land in ONE panel, distinguishable."""
+    summary = {
+        "kuhn_mirror_t0": _synthetic_arm("eval/exploitability", 0.20),
+        "kuhn_mirror_t1": _synthetic_arm("eval/exploitability", 0.05),
+        "kuhn_league_t1": _synthetic_arm("eval/exploitability", 0.04),
+    }
+    fig, drew = league_probe.build_figure(summary, games=["kuhn"])
+    assert drew
+    ax = next(a for a in fig.axes if a.get_visible())
+    labels = [t.get_text() for t in ax.get_legend().get_texts()]
+    assert [lab.split(" (")[0] for lab in labels] == [
+        "mirror theta=0",
+        "mirror theta=1",
+        "league theta=1",
+    ]
+    # style encodes the mode, colour encodes theta
+    lines = ax.get_lines()
+    assert [ln.get_linestyle() for ln in lines] == ["-", "-", "--"]
+    assert lines[0].get_color() != lines[1].get_color()  # theta 0 vs 1
+    assert lines[1].get_color() == lines[2].get_color()  # same theta, both modes
 
 
 def test_render_figure_games_filter_gives_one_panel_per_game(tmp_path: Path):

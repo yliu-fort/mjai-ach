@@ -46,7 +46,13 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import arm_cache
-from league_probe import EVAL_TAG_CHAIN, band, mark_best_checkpoint, read_curves_fallback
+from league_probe import (
+    EVAL_TAG_CHAIN,
+    band,
+    mark_best_checkpoint,
+    read_curves_fallback,
+    theta_tag,
+)
 
 from mjai.scripts.experiment import ExperimentConfig, run_experiment
 
@@ -72,11 +78,6 @@ TELEMETRY_TAGS = (
 # Tags spanning orders of magnitude and guaranteed non-negative -> log axis.
 # The cosine is signed and the fracs live in [0, 1], so both stay linear.
 _LOG_TAGS = tuple(t for t in TELEMETRY_TAGS if "grad_norm" in t)
-
-
-def theta_tag(theta: float) -> str:
-    """Filesystem-safe arm tag: 0.25 -> ``0p25``."""
-    return f"{theta:g}".replace(".", "p").replace("-", "m")
 
 
 def parse_thetas(spec: str) -> list[float]:

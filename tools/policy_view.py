@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -38,6 +39,12 @@ from mjai.eval.policy_table import (
 # 400 keeps the notebook cell at well under a second per arm on these games
 # while still separating the opening states from the deep tail.
 DEFAULT_VISIT_EPISODES = 400
+
+
+def slug(label: str) -> str:
+    """Arm label -> filename fragment: "mirror theta=0.5  seed=0" -> "mirror_theta0p5_seed0"."""
+    text = label.replace(".", "p").replace("=", "")
+    return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_")
 
 
 def sample_visits(run_dir: str | Path, *, checkpoint: str, episodes: int, seed: int = 0):
@@ -66,9 +73,11 @@ def view_for_arm(
     seed: int = 0,
 ) -> PolicyView:
     """The finished arm's policy, ranked by how often each info state is reached."""
-    counts = sample_visits(run_dir, checkpoint=checkpoint, episodes=episodes, seed=seed) if (
-        episodes > 0
-    ) else None
+    counts = (
+        sample_visits(run_dir, checkpoint=checkpoint, episodes=episodes, seed=seed)
+        if (episodes > 0)
+        else None
+    )
     return policy_view(run_dir, checkpoint=checkpoint, visit_counts=counts, episodes=episodes)
 
 
@@ -93,9 +102,7 @@ def render_arms(
     skipped: dict[str, str] = {}
     for label, run in arms:
         try:
-            views[label] = view_for_arm(
-                run, checkpoint=checkpoint, episodes=episodes, seed=seed
-            )
+            views[label] = view_for_arm(run, checkpoint=checkpoint, episodes=episodes, seed=seed)
         except (PolicyViewError, FileNotFoundError) as e:
             skipped[label] = str(e)
     if not views:

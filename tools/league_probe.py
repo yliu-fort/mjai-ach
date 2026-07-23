@@ -74,8 +74,43 @@ def load_arm_config(game: str, mode: str) -> ExperimentConfig:
     return ExperimentConfig(**yaml.safe_load(path.read_text(encoding="utf-8")))
 
 
-def arm_dir(root: Path, game: str, mode: str, seed: int) -> Path:
-    return root / f"{game}_{mode}" / f"seed_{seed}"
+def theta_tag(theta: float) -> str:
+    """Filesystem-safe arm tag: 0.25 -> ``0p25``. (Shared with theta_probe.)"""
+    return f"{theta:g}".replace(".", "p").replace("-", "m")
+
+
+def arm_name(game: str, mode: str, theta: float | None = None) -> str:
+    """Arm directory name; the theta suffix appears only when theta is set.
+
+    ``theta=None`` means "whatever the YAML says" (``algo: ach``) and keeps the
+    historical ``<game>_<mode>`` name, so arms trained before the knob existed
+    still resolve. An explicit theta MUST be in the path — otherwise a PPO arm
+    and an ACH arm of the same mode/seed would overwrite each other, which is
+    exactly the comparison the knob exists to make.
+    """
+    return f"{game}_{mode}" if theta is None else f"{game}_{mode}_t{theta_tag(theta)}"
+
+
+def parse_arm(name: str) -> tuple[str, str, float | None] | None:
+    """Split an arm directory name back into ``(game, mode, theta)``.
+
+    Matched against the known games rather than split on "_": three of the
+    seven game names contain underscores (``goofspiel5_ii``, ``liars_dice1``,
+    ``oshi_zumo``), so splitting is ambiguous.
+    """
+    for game in GAMES:
+        for mode in MODES:
+            prefix = f"{game}_{mode}"
+            if name == prefix:
+                return game, mode, None
+            if name.startswith(f"{prefix}_t"):
+                tag = name[len(prefix) + 2 :]
+                return game, mode, float(tag.replace("p", ".").replace("m", "-"))
+    return None
+
+
+def arm_dir(root: Path, game: str, mode: str, seed: int, theta: float | None = None) -> Path:
+    return root / arm_name(game, mode, theta) / f"seed_{seed}"
 
 
 def arm_config(
@@ -88,17 +123,30 @@ def arm_config(
     root: Path = PROBE_ROOT,
     progress_bar: bool = False,
     device: str | None = None,
+    theta: float | None = None,
+    probe_term_grad_norms: bool = False,
 ) -> ExperimentConfig:
     """The resolved config for one arm, without running it.
 
     Split out of :func:`run_arm` so the cache can fingerprint exactly what
     would be run (tools/arm_cache.py) before deciding to run it.
+
+    ``theta`` overrides the YAML's pinned ``algo: ach`` with the interpolated
+    rule (D11): 0 = PPO clipped surrogate, 1 = paper-faithful ACH, in between
+    the convex blend of the two POLICY terms. Note what this is not — the
+    scaffolding still comes from the ACH config (constant-LR SGD, raw
+    advantages, one epoch, no grad clipping), so ``theta=0`` here is "PPO's
+    policy term on ACH's protocol", NOT ``configs/exp/<game>_ppo_mlp_*.yaml``.
+    That one-factor reading is the whole point of the knob.
     """
     overrides: dict[str, object] = {} if device is None else {"device": device}
+    if theta is not None:
+        overrides.update(algo="theta", theta=theta)
     return dataclasses.replace(
         load_arm_config(game, mode),
         seed=seed,
-        out_dir=str(arm_dir(root, game, mode, seed)),
+        out_dir=str(arm_dir(root, game, mode, seed, theta)),
+        probe_term_grad_norms=probe_term_grad_norms,
         total_env_steps=total_env_steps,
         eval_every_env_steps=eval_every_env_steps,
         # Probe-scale pool cadence: at 6e4 env-steps the default 200 main
@@ -131,6 +179,8 @@ def run_arm(
     root: Path = PROBE_ROOT,
     progress_bar: bool = False,
     device: str | None = None,
+    theta: float | None = None,
+    probe_term_grad_norms: bool = False,
 ) -> Path:
     """Train one arm; ``device`` overrides the config's (None keeps it).
 
@@ -148,6 +198,8 @@ def run_arm(
         root=root,
         progress_bar=progress_bar,
         device=device,
+        theta=theta,
+        probe_term_grad_norms=probe_term_grad_norms,
     )
     out = Path(cfg.out_dir)
     run_experiment(cfg)
@@ -281,6 +333,15 @@ def summarize(root: Path = PROBE_ROOT, tags: tuple[str, ...] = EVAL_TAG_CHAIN) -
     return result
 
 
+def _arm_sort_key(item: tuple[str, object]) -> tuple[int, float, str]:
+    """Order a game's arms mirror-before-league, then by theta."""
+    parsed = parse_arm(item[0])
+    if parsed is None:
+        return (2, 0.0, item[0])
+    _, mode, theta = parsed
+    return (MODES.index(mode) if mode in MODES else 2, -1.0 if theta is None else theta, item[0])
+
+
 def _arm_metric(arm: object) -> str:
     """Short equilibrium-metric name recorded for an arm ("" if unknown)."""
     if not isinstance(arm, dict):
@@ -308,6 +369,7 @@ def build_figure(
     telemetry panel). A bare Figure also never enters pyplot's registry, so
     nothing leaks.
     """
+    from matplotlib import colormaps
     from matplotlib.figure import Figure
 
     panels = list(GAMES if games is None else games)
@@ -315,14 +377,22 @@ def build_figure(
     nrows = math.ceil(len(panels) / ncols)
     fig = Figure(figsize=(ncols * 4.6, nrows * 4.2))
     axes = fig.subplots(nrows, ncols, sharey=False, squeeze=False)
+    cmap = colormaps["viridis"]
+    styles = {"mirror": "-", "league": "--"}
     drew = False
     for idx, game in enumerate(panels):
         ax = axes[idx // ncols][idx % ncols]
         metric = ""
         panel_drew = False
-        for mode, style in (("mirror", "-"), ("league", "--")):
-            arm = summary.get(f"{game}_{mode}")
-            if not arm or not isinstance(arm, dict) or not arm.get("band"):
+        # Line STYLE encodes the self-play mode, COLOR encodes theta (same
+        # viridis ramp the theta-scan notebooks use), so a mode x theta sweep
+        # stays readable in one panel and matches the other notebook family.
+        for name, arm in sorted(summary.items(), key=_arm_sort_key):
+            parsed = parse_arm(name)
+            if parsed is None or parsed[0] != game:
+                continue
+            _, mode, theta = parsed
+            if not isinstance(arm, dict) or not arm.get("band"):
                 continue
             metric = metric or _arm_metric(arm)
             b = arm["band"]
@@ -333,8 +403,12 @@ def build_figure(
             ys = [m for m in mean if m is not None]
             lo = [v for v in b["min"] if v is not None]
             hi = [v for v in b["max"] if v is not None]
-            ax.plot(xs, ys, style, label=f"{mode} (n={max(b['n_seeds'])})")
-            ax.fill_between(xs, lo, hi, alpha=0.2)
+            color = "tab:blue" if theta is None else cmap(theta)
+            label = mode if theta is None else f"{mode} theta={theta:g}"
+            ax.plot(
+                xs, ys, styles.get(mode, "-"), color=color, label=f"{label} (n={max(b['n_seeds'])})"
+            )
+            ax.fill_between(xs, lo, hi, color=color, alpha=0.18)
             drew = panel_drew = True
         ax.set_title(f"{game}: {metric or 'equilibrium metric'} vs env-steps")
         ax.set_xlabel("env steps (league counts collector-seat decisions)")
