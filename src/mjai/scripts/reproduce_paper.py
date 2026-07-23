@@ -82,6 +82,13 @@ def main(argv: list[str] | None = None) -> int:
         help="ACH gate thresholds the RAW logit instead of the mean-centered one "
         "(gate_centered_logits=False); only coherent with --layernorm.",
     )
+    parser.add_argument(
+        "--total-env-steps",
+        type=int,
+        default=None,
+        help="Override the config's env-step budget (paper: 1e7). Use a shorter "
+        "budget for screening probes.",
+    )
     args = parser.parse_args(argv)
 
     if args.cpu:
@@ -102,8 +109,11 @@ def main(argv: list[str] | None = None) -> int:
         if done_marker.exists():
             print(f"  skip {game} seed={seed} (DONE exists at {out_dir})")
             continue
+        base = _load_exp_config(game)
         cfg = dataclasses.replace(
-            _load_exp_config(game),
+            base
+            if args.total_env_steps is None
+            else dataclasses.replace(base, total_env_steps=args.total_env_steps),
             seed=seed,
             out_dir=str(out_dir),
             verbose=True,
