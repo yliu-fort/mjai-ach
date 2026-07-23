@@ -55,7 +55,7 @@
 | 动作 mask | 合法动作集上 softmax | 论文未提（假设 A5） | 假设 |
 
 复现实现是按 `audit_report.md` §4 施工单（W1–W14）改写后的论文忠实
-`NNACHUpdate`（单侧门控、无优势归一化、SGD、l_th=2.0、batch 64、
+`NNActorCriticUpdate`（theta=1；单侧门控、无优势归一化、SGD、l_th=2.0、batch 64、
 env-step 口径），审计发现的 F1–F5、F10–F11、F14、F19 均在复现前修复。
 
 ---

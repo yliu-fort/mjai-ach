@@ -169,7 +169,7 @@ steps）与 probe 尺度的失配**。
 
 ### 4.1 实测：门控在 exploiter 轮次真实咬合，且咬合很深
 
-插桩逐角色统计（每次 NNACHUpdate.step 前向重算 ratio）：
+插桩逐角色统计（每次 NNActorCriticUpdate.step 前向重算 ratio）：
 
 | 臂 | 角色 | ratio 落出 (0.5,1.5) 占比 | gate_off_frac | approx_kl |
 |---|---|---|---|---|
@@ -263,7 +263,7 @@ ratio 门控 = 意外正则化**。若想要这个效果，应以显式机制实
 - `league/win_signal_wired/{role}`（现信号的均值；修复前后对照用）
 - `league/pool_age_oldest_rounds`、`league/pool_age_mean_rounds`（以 main 轮/env-step 计）
 - `league/offpolicy/approx_kl_by_role/{role}`、`league/offpolicy/ratio_culled_frac_by_role/{role}`
-- `train/gate_off_frac`（`NNACHUpdate` 已算在 `stats.extra`，`_log_stats` 目前丢弃）
+- `train/gate_off_frac`（`NNActorCriticUpdate` 已算在 `stats.extra`，`_log_stats` 目前丢弃）
 - `league/opponent_bucket/{main,history,exploiter}` 命中率（验证 mix 是否生效）
 
 ---
