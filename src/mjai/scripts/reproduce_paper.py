@@ -58,6 +58,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seeds", default="0-7", help="e.g. '0-7' or '0,1,3' (paper: 8 runs).")
     parser.add_argument("--out", default="runs/reproduce", help="Output root directory.")
     parser.add_argument("--cpu", action="store_true", help="Force CPU (AGENTS.md §1 D6).")
+    parser.add_argument(
+        "--legal-mean",
+        action="store_true",
+        help="ACH gate/loss centered-mean over legal actions only "
+        "(centered_mean_legal_only=True; A5 probe for the Liar's Dice gap).",
+    )
     args = parser.parse_args(argv)
 
     if args.cpu:
@@ -79,7 +85,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  skip {game} seed={seed} (DONE exists at {out_dir})")
             continue
         cfg = dataclasses.replace(
-            _load_exp_config(game), seed=seed, out_dir=str(out_dir), verbose=True
+            _load_exp_config(game),
+            seed=seed,
+            out_dir=str(out_dir),
+            verbose=True,
+            centered_mean_legal_only=args.legal_mean,
         )
         print(f"  run  {game} seed={seed} -> {out_dir}")
         # On failure no DONE marker is written, so the next invocation resumes
