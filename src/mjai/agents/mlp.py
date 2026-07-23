@@ -45,6 +45,11 @@ class MLPSharedActorCritic(nn.Module, Policy):
         num_actions: size of the (fixed) action space (GameSpec.num_actions).
         hidden_sizes: widths of the shared torso layers.
         activation: module constructor for hidden activations (default Tanh).
+        trunk_layernorm: append a LayerNorm to the end of the torso. This bounds
+            the feature scale feeding both heads, which in turn bounds the logit
+            scale — giving an absolute meaning to a logit threshold like ACH's
+            ``l_th`` without mean-centering. Default False (historical
+            architecture); see docs/reproduce_report.md.
         device: explicit device override; if None, resolved via gpu_assert.
         seed: torch RNG seed for reproducible init.
     """
@@ -56,6 +61,7 @@ class MLPSharedActorCritic(nn.Module, Policy):
         *,
         hidden_sizes: tuple[int, ...] = (128, 128),
         activation: type[nn.Module] = nn.Tanh,
+        trunk_layernorm: bool = False,
         device: str | None = None,
         seed: int | None = None,
     ) -> None:
@@ -78,12 +84,16 @@ class MLPSharedActorCritic(nn.Module, Policy):
             layers.append(nn.Linear(last, h))
             layers.append(activation())
             last = h
+        if trunk_layernorm:
+            layers.append(nn.LayerNorm(last))
         self.torso = nn.Sequential(*layers)
         self.policy_head = nn.Linear(last, num_actions)
         self.value_head = nn.Linear(last, 1)
-        # Kept for save(): the sidecar records the activation name so the
-        # checkpoint factory can rebuild the exact architecture (F1).
+        # Kept for save(): the sidecar records the activation name and whether
+        # the torso ends in a LayerNorm, so the checkpoint factory can rebuild
+        # the exact architecture (F1). A mismatch would fail the weight load.
         self._activation_name = activation.__name__.lower()
+        self.trunk_layernorm = trunk_layernorm
 
         # Device resolution: explicit override wins; else gpu_assert (raises on
         # silent-degradation risk).
@@ -233,6 +243,11 @@ class MLPSharedActorCritic(nn.Module, Policy):
             # sidecars predate this key; the factory then derives it from the
             # run's dumped config.json or fails loudly (no silent default).
             "activation": self._activation_name,
+            # Whether the torso ends in a LayerNorm. Older sidecars predate this
+            # key; the factory then falls back to the run config and finally to
+            # False (the historical architecture), and a wrong guess surfaces as
+            # a loud state_dict mismatch rather than silently wrong weights.
+            "trunk_layernorm": self.trunk_layernorm,
             "device": str(self.device),
             "init_seed": self._init_seed,
         }

@@ -109,6 +109,8 @@ class ExperimentConfig:
     ratio_eps: float = 0.5  # ratio gate; vacuous when synchronous (p28)
     loss_centered_logits: bool = True  # False = raw logit in ACH loss (A3 probe)
     centered_mean_legal_only: bool = False  # ACH y_bar over legal actions only (A5 probe)
+    gate_centered_logits: bool = True  # False = ACH gate on the raw logit (needs layernorm)
+    trunk_layernorm: bool = False  # LayerNorm at the torso end (bounds the logit scale)
     # ---- Sampling / env-step protocol (paper: batch 64, 1e5 eval, 1e7 total) ----
     target_samples: int | None = None  # per-round batch size in samples (p28: 64)
     total_env_steps: int | None = None  # set -> env-step mode (paper: 1e7)
@@ -163,6 +165,7 @@ def build_policy(spec: GameSpec, cfg: ExperimentConfig, *, seed: int) -> Policy:
             num_actions=spec.num_actions,
             hidden_sizes=tuple(cfg.hidden_sizes),
             activation=ACTIVATIONS[cfg.activation],
+            trunk_layernorm=cfg.trunk_layernorm,
             device=cfg.device,
             seed=seed,
         )
@@ -190,6 +193,7 @@ def build_update_rule(policy: Policy, cfg: ExperimentConfig, spec: GameSpec) -> 
         ratio_eps=cfg.ratio_eps,
         loss_centered_logits=cfg.loss_centered_logits,
         centered_mean_legal_only=cfg.centered_mean_legal_only,
+        gate_centered_logits=cfg.gate_centered_logits,
     )
     if cfg.policy_kind == "tabular":
         if cfg.algo == "ppo":

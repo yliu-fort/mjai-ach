@@ -70,6 +70,18 @@ def main(argv: list[str] | None = None) -> int:
         help="ACH loss body uses the raw logit instead of the mean-centered one "
         "(loss_centered_logits=False; the literal Algorithm 2 reading, spec U1).",
     )
+    parser.add_argument(
+        "--layernorm",
+        action="store_true",
+        help="Append a LayerNorm to the shared torso (bounds the feature scale). "
+        "Pair with --raw-gate to threshold l_th on the raw logit.",
+    )
+    parser.add_argument(
+        "--raw-gate",
+        action="store_true",
+        help="ACH gate thresholds the RAW logit instead of the mean-centered one "
+        "(gate_centered_logits=False); only coherent with --layernorm.",
+    )
     args = parser.parse_args(argv)
 
     if args.cpu:
@@ -97,6 +109,8 @@ def main(argv: list[str] | None = None) -> int:
             verbose=True,
             centered_mean_legal_only=args.legal_mean,
             loss_centered_logits=not args.raw_logit,
+            gate_centered_logits=not args.raw_gate,
+            trunk_layernorm=args.layernorm,
         )
         print(f"  run  {game} seed={seed} -> {out_dir}")
         # On failure no DONE marker is written, so the next invocation resumes

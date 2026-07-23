@@ -299,7 +299,11 @@ class NNACHUpdate(_NNUpdateBase):
         else:
             y_mean = logits.mean(dim=-1, keepdim=True)
         centered = logits - y_mean
-        y_gate = centered.gather(1, actions.unsqueeze(1)).squeeze(1)
+        # Gate logit source: centered (paper text) or raw. Raw is only coherent
+        # when the architecture bounds the logit scale (MLP trunk_layernorm),
+        # which gives l_th an absolute meaning without manual centering.
+        y_gate_src = centered if self.config.gate_centered_logits else logits
+        y_gate = y_gate_src.gather(1, actions.unsqueeze(1)).squeeze(1)
         # Loss-body logit: centered (paper text, default) or raw (literal
         # Algorithm 2) per AlgoConfig.loss_centered_logits -- A3/U1 probe toggle.
         y_loss_src = centered if self.config.loss_centered_logits else logits

@@ -382,6 +382,65 @@ def test_iw_max_tracks_the_rarest_sampled_action():
     assert stats.extra["iw_mean"] == pytest.approx((1.0 / 0.01 + 1.0 / 0.5) / 2, rel=1e-3)
 
 
+# ---- LayerNorm trunk: does it actually give l_th an absolute meaning? ----
+
+
+def test_layernorm_normalizes_the_torso_output():
+    """What LayerNorm actually guarantees: normalized FEATURES, not logits.
+
+    Per sample the torso output has ~zero mean and ~unit variance. This is the
+    real, checkable mechanism; it does NOT by itself bound the logit scale,
+    because the policy head that follows is an unconstrained Linear
+    (``logits = W @ LN(h) + b``). See docs/reproduce_report.md.
+    """
+    torch.manual_seed(0)
+    obs = torch.randn(8, 4) * 5.0  # deliberately badly scaled input
+    ln = MLPSharedActorCritic(
+        obs_size=4, num_actions=NUM_ACTIONS, hidden_sizes=(16,), trunk_layernorm=True, seed=0
+    )
+    plain = MLPSharedActorCritic(
+        obs_size=4, num_actions=NUM_ACTIONS, hidden_sizes=(16,), trunk_layernorm=False, seed=0
+    )
+    with torch.no_grad():
+        f_ln = ln.torso(obs)
+        f_plain = plain.torso(obs)
+    assert f_ln.mean(dim=-1).abs().max().item() < 1e-5
+    assert (f_ln.var(dim=-1, unbiased=False) - 1.0).abs().max().item() < 1e-3
+    # The un-normalized torso does not have that property.
+    assert f_plain.mean(dim=-1).abs().max().item() > 1e-3
+
+
+def test_layernorm_is_off_by_default_and_changes_parameters():
+    plain = MLPSharedActorCritic(obs_size=4, num_actions=NUM_ACTIONS, hidden_sizes=(8,), seed=0)
+    assert plain.trunk_layernorm is False
+    ln = MLPSharedActorCritic(
+        obs_size=4, num_actions=NUM_ACTIONS, hidden_sizes=(8,), trunk_layernorm=True, seed=0
+    )
+    assert ln.trunk_layernorm is True
+    assert len(ln.state_dict()) > len(plain.state_dict())
+
+
+def test_gate_centered_logits_toggle_selects_the_gate_source():
+    """gate_centered_logits=False thresholds the RAW logit instead of y - y_bar."""
+    # Shift EVERY logit up by a constant: the raw logit is then far past +l_th
+    # while the centered logit is unchanged (~0). Softmax — and hence the policy
+    # — is identical, so only the gate source can distinguish the two.
+    losses: dict[bool, float] = {}
+    for flag in (True, False):
+        p = _policy(seed=2)
+        for a in range(NUM_ACTIONS):
+            _shift_logit(p, a, +6.0)
+        batch = _onpolicy_single_batch(p, 1, 1.0)  # positive advantage -> +l_th side
+        losses[flag] = _ach(p, gate_centered_logits=flag, l_th=2.0).step(batch).policy_loss
+    # Raw-gated run is blocked (raw logit > +l_th); centered-gated run is not.
+    assert losses[False] == 0.0
+    assert losses[True] != 0.0
+
+
+def test_gate_centered_logits_defaults_true():
+    assert AlgoConfig().gate_centered_logits is True
+
+
 def test_grad_norm_is_pre_clip():
     """grad_norm reports the raw norm even when clipping would shrink it."""
     batch = _batch(8, advantages=MIXED_ADVS)

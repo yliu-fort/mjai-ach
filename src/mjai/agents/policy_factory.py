@@ -51,7 +51,8 @@ class _MlpArch:
     """Reconstruction parameters for an MLP checkpoint."""
 
     hidden_sizes: tuple[int, ...]
-    activation: str  # key into mlp.ACTIVATIONS (lowercase)
+    activation: str  # key into mlp.ACTIVATIONS
+    trunk_layernorm: bool
 
 
 def load_policy_from_checkpoint(
@@ -117,6 +118,7 @@ def _construct_policy(d: Path, manifest: CheckpointManifest, *, device: str | No
             num_actions=manifest.num_actions,
             hidden_sizes=arch.hidden_sizes,
             activation=activation,
+            trunk_layernorm=arch.trunk_layernorm,
             device=device,
             # Weights are overwritten by load() right after; seeding the init
             # would only clobber the process-global torch RNG for nothing.
@@ -136,7 +138,23 @@ def _mlp_architecture(d: Path, manifest: CheckpointManifest) -> _MlpArch:
 
     hidden = _derive_hidden_sizes(d, meta, config)
     activation = _derive_activation(d, meta, config)
-    return _MlpArch(hidden_sizes=hidden, activation=activation)
+    ln = _derive_trunk_layernorm(meta, config)
+    return _MlpArch(hidden_sizes=hidden, activation=activation, trunk_layernorm=ln)
+
+
+def _derive_trunk_layernorm(meta: dict[str, Any] | None, config: dict[str, Any] | None) -> bool:
+    """Sidecar first, run config second, else False (historical architecture).
+
+    Unlike the activation, a wrong guess here cannot load silently: LayerNorm
+    adds parameters, so a mismatch fails the state_dict load with a loud
+    CheckpointLoadError. That makes False a safe last resort for the many
+    pre-LayerNorm checkpoints rather than a silent-default hazard (§11).
+    """
+    if meta is not None and meta.get("trunk_layernorm") is not None:
+        return bool(meta["trunk_layernorm"])
+    if config is not None and config.get("trunk_layernorm") is not None:
+        return bool(config["trunk_layernorm"])
+    return False
 
 
 def _read_sidecar(d: Path, manifest: CheckpointManifest) -> dict[str, Any] | None:

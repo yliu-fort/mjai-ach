@@ -66,6 +66,11 @@ class AlgoConfig:
     # shrinking legal sets (Liar's Dice). Probe toggle for the gap
     # investigation (docs/reproduce_report.md liars +0.15 bias).
     centered_mean_legal_only: bool = False
+    # ACH gate thresholds the mean-centered logit (paper p24 is explicit) when
+    # True. False = threshold the RAW logit, which only makes sense when the
+    # network bounds the logit scale itself (see MLP ``trunk_layernorm``):
+    # architecture-level normalization instead of manual centering.
+    gate_centered_logits: bool = True
 
 
 class UpdateRule(ABC):
