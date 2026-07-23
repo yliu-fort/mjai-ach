@@ -89,9 +89,7 @@ def test_legacy_marker_falls_back_to_the_runs_own_config_json(tmp_path: Path):
     """Old arms keep their cache: run_experiment already dumped config.json."""
     cfg = _cfg()
     (tmp_path / "DONE").write_text("ok\n", encoding="utf-8")
-    (tmp_path / "config.json").write_text(
-        json.dumps(dataclasses.asdict(cfg)), encoding="utf-8"
-    )
+    (tmp_path / "config.json").write_text(json.dumps(dataclasses.asdict(cfg)), encoding="utf-8")
     assert arm_cache.status(tmp_path, cfg).state == "hit"
     # ...and a legacy arm trained at a different budget is still caught.
     stale = arm_cache.status(tmp_path, _cfg(total_env_steps=1))
