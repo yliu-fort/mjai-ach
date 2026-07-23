@@ -119,7 +119,9 @@ def _identity(run_dir: Path) -> dict[str, Any]:
     return {"run": str(run_dir), **{k: cfg.get(k) for k in keys}}
 
 
-def _off_policy_series(series: dict[str, list[tuple[int, float]]]) -> tuple[list[tuple[int, bool]], str]:
+def _off_policy_series(
+    series: dict[str, list[tuple[int, float]]],
+) -> tuple[list[tuple[int, bool]], str]:
     """Per-update (step, is_off_policy) plus which scalar it came from.
 
     Prefers the explicit ``off_policy_frac`` probe; falls back to ``approx_kl``
@@ -225,7 +227,13 @@ def _checks(card: dict[str, Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
 
     def add(name: str, ok: bool | None, detail: str) -> None:
-        out.append({"check": name, "verdict": "SKIP" if ok is None else ("PASS" if ok else "FAIL"), "detail": detail})
+        out.append(
+            {
+                "check": name,
+                "verdict": "SKIP" if ok is None else ("PASS" if ok else "FAIL"),
+                "detail": detail,
+            }
+        )
 
     frac = card["on_policy"]["off_policy_fraction"]
     add(
@@ -332,7 +340,9 @@ def render(card: dict[str, Any]) -> str:
         f"{'n/a' if frac is None else f'{frac:.3f}'}  (source: {op['source']})"
     )
     for role, sub in (op.get("by_role") or {}).items():
-        lines.append(f"      {role:18s} n={sub['n']:6d}  off-policy {sub['off_policy_fraction']:.3f}")
+        lines.append(
+            f"      {role:18s} n={sub['n']:6d}  off-policy {sub['off_policy_fraction']:.3f}"
+        )
     if op.get("abs_kl_when_off_policy"):
         k = op["abs_kl_when_off_policy"]
         lines.append(
@@ -363,8 +373,12 @@ def render(card: dict[str, Any]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("run_dirs", nargs="*", type=Path, help="run directories (each holding tb/ and config.json)")
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument(
+        "run_dirs", nargs="*", type=Path, help="run directories (each holding tb/ and config.json)"
+    )
     ap.add_argument("--glob", help="shell glob for run dirs, relative to cwd")
     ap.add_argument("--json", type=Path, help="write all cards to this JSON file")
     args = ap.parse_args(argv)
