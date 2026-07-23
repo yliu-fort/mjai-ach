@@ -226,6 +226,63 @@ def test_ach_reports_gate_off_fraction():
     assert 0.0 <= stats.extra["gate_off_frac"] <= 1.0
 
 
+# ---- off-policy structural probe (AGENTS.md §11: fail loudly on the class
+#      of defect where one learner's batch updates a different learner) ----
+
+
+def test_off_policy_frac_is_zero_for_an_on_policy_batch():
+    """A batch whose pi_old is the current policy reads off_policy_frac == 0.
+
+    This is the invariant a self-play controller must not violate: the policy
+    being updated must have collected the batch it learns from. On the first
+    (and at the ACH protocol's n_epochs=1, only) inner epoch, new_logp is
+    recomputed from the same weights that recorded old_logp, so a genuine
+    on-policy batch lands at exactly 0.0 — not ~0, exactly 0.0 — because the
+    tolerance is set above the single-row-vs-batched float32 noise ceiling.
+    """
+    p = _policy(seed=3)
+    stats = _ach(p).step(_onpolicy_single_batch(p, action=1, advantage=0.5))
+    assert stats.extra["off_policy_frac"] == 0.0
+
+
+def test_off_policy_frac_detects_a_behavior_target_mismatch():
+    """A batch collected under a DIFFERENT policy reads nonzero off_policy_frac.
+
+    This is what catches the league defect (one learner's samples updating
+    another's) at full update resolution, without a paired run to notice.
+    """
+    collector = _policy(seed=1)  # collected the batch
+    learner = _policy(seed=2)  # but a different policy learns from it
+    batch = _onpolicy_single_batch(collector, action=1, advantage=0.5)
+    stats = _ach(learner).step(batch)
+    assert stats.extra["off_policy_frac"] > 0.0
+
+
+def test_off_policy_tolerance_sits_above_noise_below_real_signal():
+    """OFF_POLICY_TOL is chosen, not arbitrary.
+
+    The float32 noise ceiling from the rollout's single-row forward vs the
+    update's batched forward was measured at max 1.43e-6 on a trained
+    liars_dice1 mirror checkpoint (largest-logit game). The tolerance must sit
+    ABOVE that (so an on-policy batch reads exactly 0.0) but far BELOW a real
+    behavior/target mismatch — the pre-fix league ran median |KL| ~0.08 nats.
+    These bounds are pinned here so the tolerance is not silently re-tightened
+    (which would resurrect the spurious off-policy readings) or loosened (which
+    would mask a real defect).
+    """
+    from mjai.algos.nn_updates import OFF_POLICY_TOL
+
+    MEASURED_NOISE_CEILING = 1.43e-6
+    REAL_SIGNAL_MIN = 1e-2  # conservative floor well under the observed 0.08
+    assert OFF_POLICY_TOL > MEASURED_NOISE_CEILING, (
+        "tolerance below the measured float-noise ceiling: on-policy batches "
+        "will spuriously read as off-policy (see the 0.159 mirror false-positive)"
+    )
+    assert (
+        OFF_POLICY_TOL < REAL_SIGNAL_MIN
+    ), "tolerance above real off-policy signal: genuine defects would be masked"
+
+
 # ---- ACH gate: advantage-sign-dependent, one-sided (p24 Algorithm 2) ----
 
 

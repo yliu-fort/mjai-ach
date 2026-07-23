@@ -45,6 +45,19 @@ from mjai.algos.nn_losses import (
 from mjai.algos.transition import Batch, UpdateStats
 from mjai.algos.update_rule import ACHFidelityWarning, AlgoConfig, UpdateRule
 
+# |logp_new - logp_old| above this counts a sample as off-policy. On the first
+# inner epoch the two are produced by the same weights on the same observation,
+# so an on-policy batch lands at 0.0 up to float32 noise: old_logp comes from
+# the rollout's single-row forward, new_logp from the update's batched forward
+# (different GEMM accumulation order). That noise was measured directly on a
+# trained liars_dice1 mirror checkpoint (the worst game: largest logits) at
+# max 1.43e-6 per sample. 2e-6 is the minimum cleanly-passing tolerance — ~1.2x
+# that measured ceiling — so a true on-policy batch reads exactly 0.0 here
+# while any real behavior/target mismatch (the pre-fix league ran median |KL|
+# ~0.08 nats) is still caught with decades of headroom. Keep league_diagnose.py
+# KL_TOL in sync with this value.
+OFF_POLICY_TOL = 2e-6
+
 
 def _warn_if_ach_incompatible(config: AlgoConfig) -> None:
     """Warn when a knob the ACH paper contradicts is on while ACH has weight.
@@ -241,6 +254,7 @@ class NNActorCriticUpdate(UpdateRule):
         old_probs = torch.exp(old_logp)
 
         stats = UpdateStats(policy_loss=0.0, value_loss=0.0, entropy=0.0)
+        first_off_policy: float | None = None
         for _ in range(self.config.n_epochs):
             stats = self._gradient_step(
                 obs=obs,
@@ -252,6 +266,14 @@ class NNActorCriticUpdate(UpdateRule):
                 adv_raw=adv_raw,
                 adv_ppo=adv_ppo,
             )
+            if first_off_policy is None:
+                first_off_policy = stats.extra.get("off_policy_frac", 0.0)
+        # Report the FIRST epoch's reading: later epochs are off-policy by
+        # construction (the batch is stale w.r.t. the weights they update), so
+        # only the first one answers "did the policy being updated collect this
+        # batch?". At the ACH protocol's n_epochs=1 (paper p24) they coincide.
+        if first_off_policy is not None:
+            stats.extra["off_policy_frac"] = first_off_policy
         return stats
 
     def _gradient_step(
@@ -273,7 +295,16 @@ class NNActorCriticUpdate(UpdateRule):
         new_logp = logp_all.gather(1, actions.unsqueeze(1)).squeeze(1)
         ratio = torch.exp(new_logp - old_logp)
 
-        telemetry: dict[str, torch.Tensor] = {}
+        telemetry: dict[str, torch.Tensor] = {
+            # Structural probe, not a hyperparameter: the fraction of the batch
+            # whose behavior log-prob disagrees with this policy's. A self-play
+            # controller that hands one learner's transitions to a DIFFERENT
+            # learner's rule shows up here as a nonzero value, at full update
+            # resolution, without needing a paired run to notice.
+            "off_policy_frac": ((new_logp - old_logp).detach().abs() > OFF_POLICY_TOL)
+            .float()
+            .mean(),
+        }
         terms: dict[str, torch.Tensor] = {}
         policy_loss: torch.Tensor | None = None
         if theta < 1.0:

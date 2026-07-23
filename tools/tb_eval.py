@@ -11,6 +11,7 @@ Used by tools/summarize_reproduce.py and tools/compare_with_paper.py.
 from __future__ import annotations
 
 import sys
+from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -45,6 +46,41 @@ def read_eval_curve(
                         points.append((int(event.step), float(arr)))
     points.sort(key=lambda p: p[0])
     return points
+
+
+def read_tags(tb_dir: str | Path, tags: Sequence[str]) -> dict[str, list[tuple[int, float]]]:
+    """Read several tags in ONE pass over the event files.
+
+    :func:`read_eval_curve` walks the whole file per tag, which is fine for the
+    two eval tags but not for the ~15 per-update ``train/*`` scalars the league
+    auditor needs. Returns a dict keyed by tag; tags absent from the file are
+    absent from the result (an empty list would read as "logged but empty").
+    """
+    from tensorboard.backend.event_processing.event_file_loader import (
+        EventFileLoader,
+    )
+
+    wanted = set(tags)
+    out: dict[str, list[tuple[int, float]]] = {}
+    for ev_file in sorted(Path(tb_dir).glob("events.out.tfevents*")):
+        for event in EventFileLoader(str(ev_file)).Load():
+            if not event.HasField("summary"):
+                continue
+            for v in event.summary.value:
+                if v.tag not in wanted:
+                    continue
+                if v.HasField("simple_value"):
+                    value = float(v.simple_value)
+                elif v.HasField("tensor"):
+                    from tensorboard.util import tensor_util
+
+                    value = float(tensor_util.make_ndarray(v.tensor))
+                else:
+                    continue
+                out.setdefault(v.tag, []).append((int(event.step), value))
+    for points in out.values():
+        points.sort(key=lambda p: p[0])
+    return out
 
 
 def _read_one(args: tuple[str, str]) -> tuple[str, list[tuple[int, float]]]:
