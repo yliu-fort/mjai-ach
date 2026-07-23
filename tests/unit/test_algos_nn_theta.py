@@ -160,21 +160,21 @@ def test_grad_norm_is_reported_at_every_theta():
 
 def test_term_grad_probe_reports_only_the_terms_that_exist():
     """0.0 for a term that was never built would read as a measured zero."""
-    ppo = NNActorCriticUpdate(
-        _policy(), AlgoConfig(theta=0.0, probe_term_grad_norms=True)
-    ).step(_batch())
+    ppo = NNActorCriticUpdate(_policy(), AlgoConfig(theta=0.0, probe_term_grad_norms=True)).step(
+        _batch()
+    )
     assert ppo.extra["grad_norm_ppo"] > 0.0
     assert "grad_norm_ach" not in ppo.extra and "grad_cos_ppo_ach" not in ppo.extra
 
-    ach = NNActorCriticUpdate(
-        _policy(), AlgoConfig(theta=1.0, probe_term_grad_norms=True)
-    ).step(_batch())
+    ach = NNActorCriticUpdate(_policy(), AlgoConfig(theta=1.0, probe_term_grad_norms=True)).step(
+        _batch()
+    )
     assert ach.extra["grad_norm_ach"] > 0.0
     assert "grad_norm_ppo" not in ach.extra and "grad_cos_ppo_ach" not in ach.extra
 
-    mixed = NNActorCriticUpdate(
-        _policy(), AlgoConfig(theta=0.25, probe_term_grad_norms=True)
-    ).step(_batch())
+    mixed = NNActorCriticUpdate(_policy(), AlgoConfig(theta=0.25, probe_term_grad_norms=True)).step(
+        _batch()
+    )
     assert mixed.extra["grad_norm_ppo"] > 0.0 and mixed.extra["grad_norm_ach"] > 0.0
     assert -1.0 - 1e-6 <= mixed.extra["grad_cos_ppo_ach"] <= 1.0 + 1e-6
 

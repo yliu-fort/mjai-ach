@@ -131,6 +131,25 @@ TOTAL_ENV_STEPS = {total}   # per-arm budget (probe depth, not the paper's 1e7)
 EVAL_EVERY      = {eval_every}
 SHOW_TQDM   = True          # per-arm tqdm bar over env-steps
 
+ON_STALE    = "error"       # "error" | "retrain" | "skip"
+"""What to do with an arm that finished under a DIFFERENT config.
+
+Arms are cached by a fingerprint of their resolved ExperimentConfig, not by
+directory name, so raising TOTAL_ENV_STEPS (or changing the device, the eval
+cadence, any ACH knob) is detected instead of being silently "skipped".
+
+    error    refuse that arm and print which knob changed. Nothing is
+             deleted, and the other arms still run.
+    retrain  DELETE the arm directory and train it again. Required rather
+             than merely nice: a second TensorBoard event file in the same
+             tb/ interleaves two runs into one curve.
+    skip     reuse the mismatched result anyway.
+
+DEVICE is part of the fingerprint, so flipping cpu <-> cuda marks every
+finished arm stale. That is the strict reading (a CPU result is not a CUDA
+result); use ON_STALE="skip" for one run if you just want the old numbers.
+"""
+
 DEVICE      = "cpu"         # "cpu" | "cuda" | None (= whatever the YAML says)
 """CPU is the default on purpose, and it is the FAST option here.
 
@@ -156,32 +175,48 @@ if not (REPO / "tools" / "league_probe.py").is_file():
     REPO = REPO.parent  # tolerate running from notebooks/
 sys.path.insert(0, str(REPO / "tools"))
 
-import league_probe  # run_arm / summarize / render_figure / EVAL_TAG_CHAIN
+import arm_cache      # config-fingerprint cache (hit / stale / missing)
+import league_probe   # run_arm / arm_status / summarize / render_figure
 from IPython.display import Image, display
 
+def arm_kwargs():
+    return dict(
+        total_env_steps=TOTAL_ENV_STEPS,
+        eval_every_env_steps=EVAL_EVERY,
+        root=OUT_ROOT,
+        device=DEVICE,
+    )
+
 def train_all():
-    statuses = []
+    statuses, refused = [], []
     for mode in MODES:
         for seed in SEEDS:
+            label = f"{mode:6s} seed={seed}"
             out = league_probe.arm_dir(OUT_ROOT, GAME, mode, seed)
-            if (out / "DONE").exists():
-                print(f"skip  {mode:6s} seed={seed} (already DONE)", flush=True)
-                statuses.append((mode, seed, "cached"))
+            st = league_probe.arm_status(GAME, mode, seed, **arm_kwargs())
+            action, why = arm_cache.resolve(st, ON_STALE, out)
+            if action != "train":
+                print(f"skip  {label}: {why}", flush=True)
+                statuses.append((mode, seed, "cached" if action == "skip" else "REFUSED"))
+                if action == "refuse":
+                    refused.append(label)
                 continue
-            print(f"train {mode:6s} seed={seed} ...", flush=True)
+            print(f"train {label}: {why}", flush=True)
             try:
                 league_probe.run_arm(
-                    GAME, mode, seed,
-                    total_env_steps=TOTAL_ENV_STEPS,
-                    eval_every_env_steps=EVAL_EVERY,
-                    root=OUT_ROOT,
-                    progress_bar=SHOW_TQDM,
-                    device=DEVICE,
+                    GAME, mode, seed, progress_bar=SHOW_TQDM, **arm_kwargs()
                 )
                 statuses.append((mode, seed, "done"))
             except Exception as e:  # keep going; report at the end
                 statuses.append((mode, seed, f"FAILED: {type(e).__name__}: {e}"))
             print(f"      -> {statuses[-1][2]}", flush=True)
+    if refused:
+        print()
+        print("=" * 72)
+        print(f"{len(refused)} arm(s) REFUSED: finished under a different config.")
+        print("Nothing was deleted. See the per-arm lines above for the changed knob,")
+        print('then set ON_STALE="retrain" (rebuilds them) or "skip" (reuses them).')
+        print("=" * 72)
     return statuses"""
 
 TRAIN_CODE = """# === Train (long cell: arms run sequentially; safe to re-run) ===

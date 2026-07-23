@@ -33,6 +33,7 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import arm_cache
 from tb_eval import read_many
 
 from mjai.scripts.experiment import ExperimentConfig, run_experiment
@@ -77,6 +78,49 @@ def arm_dir(root: Path, game: str, mode: str, seed: int) -> Path:
     return root / f"{game}_{mode}" / f"seed_{seed}"
 
 
+def arm_config(
+    game: str,
+    mode: str,
+    seed: int,
+    *,
+    total_env_steps: int,
+    eval_every_env_steps: int,
+    root: Path = PROBE_ROOT,
+    progress_bar: bool = False,
+    device: str | None = None,
+) -> ExperimentConfig:
+    """The resolved config for one arm, without running it.
+
+    Split out of :func:`run_arm` so the cache can fingerprint exactly what
+    would be run (tools/arm_cache.py) before deciding to run it.
+    """
+    overrides: dict[str, object] = {} if device is None else {"device": device}
+    return dataclasses.replace(
+        load_arm_config(game, mode),
+        seed=seed,
+        out_dir=str(arm_dir(root, game, mode, seed)),
+        total_env_steps=total_env_steps,
+        eval_every_env_steps=eval_every_env_steps,
+        # Probe-scale pool cadence: at 6e4 env-steps the default 200 main
+        # rounds would yield ~1 snapshot; 25 fills the 16-member pool with
+        # real main history inside the probe budget (B3).
+        league_main_save_every_rounds=25,
+        verbose=False,
+        progress_bar=progress_bar,
+        **overrides,  # type: ignore[arg-type]
+    )
+
+
+def arm_status(game: str, mode: str, seed: int, **kwargs: object) -> arm_cache.ArmStatus:
+    """Cache verdict for one arm: hit / stale / missing / legacy.
+
+    Takes the same keyword arguments as :func:`run_arm`, so a caller asks
+    "would this exact run be a cache hit?" without duplicating config logic.
+    """
+    cfg = arm_config(game, mode, seed, **kwargs)  # type: ignore[arg-type]
+    return arm_cache.status(Path(cfg.out_dir), cfg)
+
+
 def run_arm(
     game: str,
     mode: str,
@@ -95,24 +139,19 @@ def run_arm(
     overhead on a GPU (measured 2809 env-steps/s on CPU vs 441 on CUDA for
     Liar's Dice).
     """
-    out = arm_dir(root, game, mode, seed)
-    overrides: dict[str, object] = {} if device is None else {"device": device}
-    cfg = dataclasses.replace(
-        load_arm_config(game, mode),
-        seed=seed,
-        out_dir=str(out),
+    cfg = arm_config(
+        game,
+        mode,
+        seed,
         total_env_steps=total_env_steps,
         eval_every_env_steps=eval_every_env_steps,
-        # Probe-scale pool cadence: at 6e4 env-steps the default 200 main
-        # rounds would yield ~1 snapshot; 25 fills the 16-member pool with
-        # real main history inside the probe budget (B3).
-        league_main_save_every_rounds=25,
-        verbose=False,
+        root=root,
         progress_bar=progress_bar,
-        **overrides,  # type: ignore[arg-type]
+        device=device,
     )
+    out = Path(cfg.out_dir)
     run_experiment(cfg)
-    (out / "DONE").write_text("ok\n", encoding="utf-8")
+    arm_cache.write_done(out, cfg)
     mark_best_checkpoint(out)
     return out
 
