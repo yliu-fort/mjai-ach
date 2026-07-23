@@ -108,8 +108,12 @@ def _state_obs(state: pyspiel.State, player: int) -> list[float]:
         return list(state.observation_tensor(player))
 
 
-def _row_players(tabular: ospolicy.TabularPolicy) -> list[int]:
-    """Owning player per TabularPolicy row, recovered from its per-player index."""
+def row_players(tabular: ospolicy.TabularPolicy) -> list[int]:
+    """Owning player per TabularPolicy row, recovered from its per-player index.
+
+    Public because the final-policy view (:mod:`mjai.eval.policy_table`) needs
+    the same row->player mapping to label its table.
+    """
     players = [0] * len(tabular.states)
     for player, info_states in enumerate(tabular.states_per_player):
         for info_state in info_states:
@@ -125,13 +129,22 @@ def _skeleton(spec: GameSpec) -> tuple[ospolicy.TabularPolicy, np.ndarray]:
         obs = np.asarray(
             [
                 _state_obs(state, player)
-                for state, player in zip(tabular.states, _row_players(tabular), strict=True)
+                for state, player in zip(tabular.states, row_players(tabular), strict=True)
             ],
             dtype=np.float32,
         )
         hit = (tabular, obs)
         _SKELETON_CACHE[spec.game_string] = hit
     return hit
+
+
+def state_observations(spec: GameSpec) -> np.ndarray:
+    """Per-info-state observation matrix for ``spec`` (cached, see :func:`_skeleton`).
+
+    Public so the final-policy view can join sampled visit counts onto the same
+    rows this materialization enumerates, without re-walking the tree.
+    """
+    return _skeleton(spec)[1]
 
 
 def clear_skeleton_cache() -> None:

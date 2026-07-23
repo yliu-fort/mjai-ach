@@ -122,6 +122,47 @@ def test_render_curves_and_final_write_pngs(tmp_path: Path):
     assert finals.name == "theta_final_kuhn.png"
 
 
+def test_renderers_never_touch_the_global_matplotlib_backend(tmp_path: Path):
+    """See the twin test in test_tools_league_probe: matplotlib.use() from a
+    helper the notebook imports switches the kernel off the inline backend and
+    every later plt.show() renders nothing."""
+    before = matplotlib.get_backend()
+    summary = _summary({0.0: [0.4], 1.0: [0.2]})
+    theta_probe.render_curves(summary, "kuhn", tmp_path)
+    theta_probe.render_theta_final(summary, "kuhn", tmp_path)
+    assert matplotlib.get_backend() == before
+    assert not plt.get_fignums()
+
+
+def test_telemetry_grid_has_a_panel_per_tag_incl_the_per_term_split(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The per-term panels are the debug read the total grad_norm cannot give."""
+    import tb_eval
+
+    for theta in ("0", "0p5", "1"):
+        (tmp_path / "kuhn" / f"theta_{theta}" / "seed_0" / "tb").mkdir(parents=True)
+
+    def fake_read_many(tb_dirs, tag="eval/exploitability", workers=6):
+        # cos is the only signed tag; the norms must stay positive for log axes.
+        value = -0.4 if tag == "train/grad_cos_ppo_ach" else 0.5
+        return {str(d): [(1, value), (2, value * 2)] for d in tb_dirs}
+
+    monkeypatch.setattr(tb_eval, "read_many", fake_read_many)
+    out = theta_probe.render_telemetry("kuhn", tmp_path)
+    assert out is not None and out.is_file()
+
+    fig, _ = theta_probe.build_telemetry_figure("kuhn", tmp_path)
+    visible = [ax for ax in fig.axes if ax.get_visible()]
+    assert [ax.get_title() for ax in visible] == list(theta_probe.TELEMETRY_TAGS)
+    assert len(visible) == 6
+    scales = {ax.get_title(): ax.get_yscale() for ax in visible}
+    assert scales["train/grad_norm_ppo_scaled"] == "log"
+    assert scales["train/grad_norm_ach_scaled"] == "log"
+    assert scales["train/grad_cos_ppo_ach"] == "linear"  # signed: log would drop it
+    assert scales["train/clip_frac"] == "linear"
+
+
 def test_renderers_return_none_without_data(tmp_path: Path):
     """An empty probe root must not raise or emit an empty figure."""
     assert theta_probe.render_curves({}, "kuhn", tmp_path) is None

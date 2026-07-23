@@ -155,6 +155,65 @@ def test_grad_norm_is_reported_at_every_theta():
         assert stats.extra["grad_norm"] > 0.0
 
 
+# ---- per-term gradient probe (debug telemetry for mixed-theta runs) ----
+
+
+def test_term_grad_probe_reports_only_the_terms_that_exist():
+    """0.0 for a term that was never built would read as a measured zero."""
+    ppo = NNActorCriticUpdate(_policy(), AlgoConfig(theta=0.0, probe_term_grad_norms=True)).step(
+        _batch()
+    )
+    assert ppo.extra["grad_norm_ppo"] > 0.0
+    assert "grad_norm_ach" not in ppo.extra and "grad_cos_ppo_ach" not in ppo.extra
+
+    ach = NNActorCriticUpdate(_policy(), AlgoConfig(theta=1.0, probe_term_grad_norms=True)).step(
+        _batch()
+    )
+    assert ach.extra["grad_norm_ach"] > 0.0
+    assert "grad_norm_ppo" not in ach.extra and "grad_cos_ppo_ach" not in ach.extra
+
+    mixed = NNActorCriticUpdate(_policy(), AlgoConfig(theta=0.25, probe_term_grad_norms=True)).step(
+        _batch()
+    )
+    assert mixed.extra["grad_norm_ppo"] > 0.0 and mixed.extra["grad_norm_ach"] > 0.0
+    assert -1.0 - 1e-6 <= mixed.extra["grad_cos_ppo_ach"] <= 1.0 + 1e-6
+
+
+def test_term_grad_probe_scales_by_the_theta_weight():
+    """``_scaled`` is what enters the update: (1-theta)*|g_ppo| and theta*|g_ach|."""
+    theta = 0.25
+    stats = NNActorCriticUpdate(
+        _policy(), AlgoConfig(theta=theta, probe_term_grad_norms=True)
+    ).step(_batch())
+    assert stats.extra["grad_norm_ppo_scaled"] == pytest.approx(
+        (1.0 - theta) * stats.extra["grad_norm_ppo"], rel=1e-6
+    )
+    assert stats.extra["grad_norm_ach_scaled"] == pytest.approx(
+        theta * stats.extra["grad_norm_ach"], rel=1e-6
+    )
+
+
+@pytest.mark.parametrize("theta", [0.0, 0.5, 1.0])
+def test_term_grad_probe_does_not_perturb_the_update(theta: float):
+    """The probe must be readable during a reproduction run without changing it.
+
+    It reads the graph via torch.autograd.grad and never writes .grad, so the
+    optimizer trajectory has to stay bit-identical with the probe on.
+    """
+    batch = _batch()
+    off = _policy(seed=5)
+    on = _policy(seed=5)
+    _clone_weights(off, on)
+    for policy, probe in ((off, False), (on, True)):
+        rule = NNActorCriticUpdate(
+            policy, AlgoConfig(theta=theta, learning_rate=1e-3, probe_term_grad_norms=probe)
+        )
+        for _ in range(3):
+            rule.step(batch)
+    for (_, a), (_, b) in zip(off.named_parameters(), on.named_parameters(), strict=True):
+        assert torch.equal(a, b)
+
+
 def test_theta_outside_unit_interval_is_rejected():
     for bad in (-0.1, 1.5):
         with pytest.raises(ValueError, match="theta must lie in"):

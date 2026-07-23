@@ -145,6 +145,51 @@ class NNActorCriticUpdate(UpdateRule):
         if self.config.max_grad_norm > 0:
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
 
+    def _term_grad_probe(
+        self, terms: dict[str, torch.Tensor], theta: float
+    ) -> dict[str, torch.Tensor]:
+        """Per-policy-term gradient norms + their cosine, for mixed-theta debugging.
+
+        The total ``grad_norm`` cannot say whether an update was driven by the
+        PPO term or the ACH one, and at intermediate theta that is exactly the
+        question: the two terms differ in gradient magnitude by orders of
+        magnitude (ACH carries an unbounded ``1/pi_old``), so the blend weight
+        theta is not the blend of *influence*. Reported per term:
+
+          - ``grad_norm_<t>``        — the term's own norm, unweighted.
+          - ``grad_norm_<t>_scaled`` — times its theta weight: what actually
+            enters the update.
+          - ``grad_cos_ppo_ach``     — cosine between the two term gradients
+            (negative = the terms are pulling against each other).
+
+        Only terms that were built are reported: at theta=0 there is no ACH
+        gradient and at theta=1 no PPO one, and emitting 0.0 for a term that
+        does not exist would read as a measured zero. The cosine needs both, so
+        it appears only for 0 < theta < 1.
+
+        Uses ``torch.autograd.grad``, which reads the graph without touching
+        ``.grad``; the subsequent ``loss.backward()`` and optimizer step are
+        unaffected.
+        """
+        params = [p for p in self.policy.parameters() if p.requires_grad]
+        weights = {"ppo": 1.0 - theta, "ach": theta}
+        out: dict[str, torch.Tensor] = {}
+        flat: dict[str, torch.Tensor] = {}
+        for name, loss in terms.items():
+            grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+            present = [g.reshape(-1) for g in grads if g is not None]
+            if not present:  # a term touching no parameter has no direction
+                continue
+            vec = torch.cat(present)
+            flat[name] = vec
+            norm = vec.norm()
+            out[f"grad_norm_{name}"] = norm
+            out[f"grad_norm_{name}_scaled"] = norm * weights[name]
+        if len(flat) == 2:
+            a, b = flat["ppo"], flat["ach"]
+            out["grad_cos_ppo_ach"] = torch.dot(a, b) / (a.norm() * b.norm() + 1e-12)
+        return out
+
     def _grad_norm(self) -> torch.Tensor:
         """Raw (pre-clip) global grad norm.
 
@@ -229,12 +274,14 @@ class NNActorCriticUpdate(UpdateRule):
         ratio = torch.exp(new_logp - old_logp)
 
         telemetry: dict[str, torch.Tensor] = {}
+        terms: dict[str, torch.Tensor] = {}
         policy_loss: torch.Tensor | None = None
         if theta < 1.0:
             ppo_loss, ppo_stats = ppo_policy_loss(
                 ratio=ratio, advantages=adv_ppo, clip_eps=self.config.clip_eps
             )
             telemetry.update(ppo_stats)
+            terms["ppo"] = ppo_loss
             policy_loss = ppo_loss if theta == 0.0 else (1.0 - theta) * ppo_loss
         if theta > 0.0:
             ach_loss, ach_stats = ach_policy_loss(
@@ -247,9 +294,12 @@ class NNActorCriticUpdate(UpdateRule):
                 config=self.config,
             )
             telemetry.update(ach_stats)
+            terms["ach"] = ach_loss
             scaled = ach_loss if theta == 1.0 else theta * ach_loss
             policy_loss = scaled if policy_loss is None else policy_loss + scaled
         assert policy_loss is not None  # theta in [0, 1] always builds one term
+        if self.config.probe_term_grad_norms:
+            telemetry.update(self._term_grad_probe(terms, theta))
 
         value_loss, entropy = value_loss_and_entropy(logits, values, returns, mask)
         loss = (

@@ -115,6 +115,35 @@ EVAL_EVERY      = {eval_every}
 FINAL_FRAC  = 0.1           # "final" = mean over the last 10% of x (D5 convention)
 SHOW_TQDM   = True          # per-arm tqdm bar over env-steps
 
+PROBE_GRAD_NORMS = True     # log the PPO and ACH terms' grad norms separately
+"""Per-term gradient telemetry: train/grad_norm_{{ppo,ach}}[_scaled] and
+train/grad_cos_ppo_ach. The two policy terms differ in gradient magnitude by
+orders of magnitude, so theta is NOT the blend of influence -- this is what
+tells you how much of a theta ranking is the operator and how much is the
+effective step size. Costs two extra backward passes per update: measured
++8.5% on a full train round (Liar's Dice, CPU, batch 64). The update itself is
+bit-identical either way."""
+
+ON_STALE    = "error"       # "error" | "retrain" | "skip"
+"""What to do with an arm that finished under a DIFFERENT config.
+
+Arms are cached by a fingerprint of their resolved ExperimentConfig, not by
+directory name, so raising TOTAL_ENV_STEPS (or changing the device, the eval
+cadence, PROBE_GRAD_NORMS, any ACH knob) is detected instead of silently
+"skipped".
+
+    error    refuse that arm and print which knob changed. Nothing is
+             deleted, and the other arms still run.
+    retrain  DELETE the arm directory and train it again. Required rather
+             than merely nice: a second TensorBoard event file in the same
+             tb/ interleaves two runs into one curve.
+    skip     reuse the mismatched result anyway.
+
+DEVICE is part of the fingerprint, so flipping cpu <-> cuda marks every
+finished arm stale. Use ON_STALE="skip" for one run if you just want the old
+numbers back.
+"""
+
 DEVICE      = "cpu"         # "cpu" | "cuda" | None (= whatever the YAML says)
 """CPU is the default on purpose, and it is the FAST option here.
 
@@ -140,32 +169,50 @@ if not (REPO / "tools" / "theta_probe.py").is_file():
     REPO = REPO.parent  # tolerate running from notebooks/
 sys.path.insert(0, str(REPO / "tools"))
 
-import theta_probe  # run_arm / summarize / render_* helpers
+import arm_cache     # config-fingerprint cache (hit / stale / missing)
+import policy_view   # final-policy view (rollout + mjai.eval.policy_table)
+import theta_probe   # run_arm / arm_status / summarize / render_* helpers
 from IPython.display import Image, display
 
+def arm_kwargs():
+    return dict(
+        total_env_steps=TOTAL_ENV_STEPS,
+        eval_every_env_steps=EVAL_EVERY,
+        root=OUT_ROOT,
+        device=DEVICE,
+        probe_term_grad_norms=PROBE_GRAD_NORMS,
+    )
+
 def train_all():
-    statuses = []
+    statuses, refused = [], []
     for theta in THETAS:
         for seed in SEEDS:
+            label = f"theta={theta:<5g} seed={seed}"
             out = theta_probe.arm_dir(OUT_ROOT, GAME, theta, seed)
-            if (out / "DONE").exists():
-                print(f"skip  theta={theta:<5g} seed={seed} (already DONE)", flush=True)
-                statuses.append((theta, seed, "cached"))
+            st = theta_probe.arm_status(GAME, theta, seed, **arm_kwargs())
+            action, why = arm_cache.resolve(st, ON_STALE, out)
+            if action != "train":
+                print(f"skip  {label}: {why}", flush=True)
+                statuses.append((theta, seed, "cached" if action == "skip" else "REFUSED"))
+                if action == "refuse":
+                    refused.append(label)
                 continue
-            print(f"train theta={theta:<5g} seed={seed} ...", flush=True)
+            print(f"train {label}: {why}", flush=True)
             try:
                 theta_probe.run_arm(
-                    GAME, theta, seed,
-                    total_env_steps=TOTAL_ENV_STEPS,
-                    eval_every_env_steps=EVAL_EVERY,
-                    root=OUT_ROOT,
-                    progress_bar=SHOW_TQDM,
-                    device=DEVICE,
+                    GAME, theta, seed, progress_bar=SHOW_TQDM, **arm_kwargs()
                 )
                 statuses.append((theta, seed, "done"))
             except Exception as e:  # keep going; report at the end
                 statuses.append((theta, seed, f"FAILED: {type(e).__name__}: {e}"))
             print(f"      -> {statuses[-1][2]}", flush=True)
+    if refused:
+        print()
+        print("=" * 72)
+        print(f"{len(refused)} arm(s) REFUSED: finished under a different config.")
+        print("Nothing was deleted. See the per-arm lines above for the changed knob,")
+        print('then set ON_STALE="retrain" (rebuilds them) or "skip" (reuses them).')
+        print("=" * 72)
     return statuses
 
 print(f"{len(THETAS)} thetas x {len(SEEDS)} seeds = {len(THETAS) * len(SEEDS)} arms on {DEVICE}")"""
@@ -194,14 +241,75 @@ FINAL_FIG_CODE = """# === Figure 2: final metric vs theta (error bar = min-max a
 fig2 = theta_probe.render_theta_final(summary, GAME, OUT_ROOT)
 display(Image(filename=str(fig2))) if fig2 else print("no finals yet")"""
 
-TELEMETRY_CODE = """# === Diagnostic: gradient scale / gate activity / clip rate per theta ===
+TELEMETRY_CODE = """# === Diagnostic: gradient scale / per-term split / gate / clip, per theta ===
 # The two policy terms differ in gradient magnitude by orders of magnitude (the
 # ACH term carries an unbounded 1/pi_old), so the EFFECTIVE learning rate varies
 # with theta. Read Figure 2 together with this panel before concluding that a
 # theta is "better" — a monotone trend here means the ranking is partly a
 # step-size effect, not purely a policy-operator effect.
+#
+# Six panels: total grad_norm; the PPO and ACH terms' own SCALED norms (what
+# each contributes to the update, requires PROBE_GRAD_NORMS=True); the cosine
+# between the two term gradients (< 0 = the terms disagree); ACH gate-off rate;
+# PPO clip rate. The two term panels are the direct read on "who is driving
+# this update" that the total norm cannot give you.
 fig3 = theta_probe.render_telemetry(GAME, OUT_ROOT)
 display(Image(filename=str(fig3))) if fig3 else print("no telemetry yet")"""
+
+POLICY_MD = """## 最终策略（每个 theta 学到了什么）
+
+图 1/2 只说「离 Nash 多远」，不说「到底怎么打」。这一格把每个 theta 训练完的
+**策略本身**物化出来。展示形式由游戏规模决定（实测枚举成本见
+`src/mjai/eval/policy_table.py` 的模块 docstring）：
+
+- **brps**（2 个信息集）：柱状图 + 与解析 NE (1/16, 10/16, 5/16) 的 TV 距离。
+  这是最直观的一格——PPO 端（theta=0）绕圈时这里会明显偏离，ACH 端应该贴上去。
+- **kuhn**（12）：完整表格。
+- **liars_dice1**（24576）：动作边缘分布 + **按自博弈访问频率排序的 Top-K 信息集**，
+  外加完整 CSV 落盘。
+
+访问频率来自用该臂自己的策略自博弈 `POLICY_EPISODES` 局，按 observation 向量
+join 回枚举出来的行。"""
+
+POLICY_CODE = """# === Final policy per theta ===
+POLICY_PICK     = "best"   # "best" (SOTA snapshot) | "last" | "step_N"
+POLICY_SEED     = 0        # which seed's arm to show
+POLICY_EPISODES = 400      # self-play episodes used to rank info states (0 = skip)
+POLICY_TOP_K    = 12       # rows in the printed table
+
+import pandas as pd
+from mjai.eval.policy_table import brps_nash_gap, to_records
+
+policy_arms = [
+    (f"theta={theta:g}", theta_probe.arm_dir(OUT_ROOT, GAME, theta, POLICY_SEED))
+    for theta in THETAS
+]
+policy_arms = [(lab, run) for lab, run in policy_arms if (run / "checkpoints").is_dir()]
+
+if not policy_arms:
+    print("no trained arms yet")
+else:
+    fig_path, views, skipped = policy_view.render_arms(
+        policy_arms, OUT_ROOT / "figs" / f"policy_{GAME}.png",
+        checkpoint=POLICY_PICK, episodes=POLICY_EPISODES, player=0,
+    )
+    for lab, why in skipped.items():
+        print(f"[{lab}] no policy table: {why}")
+    if fig_path:
+        display(Image(filename=str(fig_path)))
+    if GAME == "brps":
+        print("\\nDistance to the analytic BRPS equilibrium (lower = closer):")
+        for lab, view in views.items():
+            probs, tv = brps_nash_gap(view)
+            print(f"  {lab:<12s} P(R,P,S) = {probs.round(4)}   TV = {tv:.4f}")
+    for lab, view in views.items():
+        print(f"\\n--- {lab} --- {view.checkpoint}")
+        rows = view.top_rows(POLICY_TOP_K, player=0)
+        df = pd.DataFrame(to_records(view, rows=rows)).set_index("info_state")
+        display(df.style.format(precision=3, na_rep="-"))
+        csv = OUT_ROOT / "figs" / f"policy_{GAME}_{policy_view.slug(lab)}.csv"
+        print(f"    full table ({len(view.labels)} rows) -> "
+              f"{policy_view.write_csv(view, csv)}")"""
 
 FOOTER_MD = """## 解读指南
 
@@ -210,9 +318,13 @@ FOOTER_MD = """## 解读指南
 - **图 2（theta–final）**：如果曲线单调下降，说明「越像 ACH 越好」；如果在中间出现
   极小值，说明混合策略项优于两个端点——这是本 notebook 唯一能给出的新结论，也是
   值得进一步查证的地方（先看图 3 排除步长效应）。
-- **图 3（遥测）**：`train/grad_norm` 随 theta 的变化幅度决定了图 2 有多少是「策略算子」
-  的功劳、多少是「有效步长」的功劳。`gate_off_frac` 只在 theta>0 有值（ACH 门控关闭
-  比例），`clip_frac` 只在 theta<1 有值（PPO 截断比例）。
+- **图 3（遥测，6 格）**：`train/grad_norm` 随 theta 的变化幅度决定了图 2 有多少是
+  「策略算子」的功劳、多少是「有效步长」的功劳。中间两格
+  `grad_norm_{{ppo,ach}}_scaled` 是**两项各自实际投进这次更新的梯度量**（总范数看不
+  出这个），`grad_cos_ppo_ach` **小于 0 就说明两项在对着拉**——混合 theta 调不动的时候
+  先看这一格。这三格需要 `PROBE_GRAD_NORMS=True`（本 notebook 默认开）。
+  `gate_off_frac` 只在 theta>0 有值（ACH 门控关闭比例），`clip_frac` 只在 theta<1
+  有值（PPO 截断比例）。
 - **口径**：`final` 取 x 轴末 {final_pct} 的均值（docs/reproduce_report.md 的 D5 口径），
   不是最后一个点。要改口径就改参数格的 `FINAL_FRAC`。
 - **与论文对照**：只有 `theta=1` 这一臂是论文忠实 ACH，可以和 docs/figs 里的数字化
@@ -238,6 +350,8 @@ def build(game: str, spec: dict[str, object]) -> Path:
     code(FIGURE_CODE)
     code(FINAL_FIG_CODE)
     code(TELEMETRY_CODE)
+    md(POLICY_MD)
+    code(POLICY_CODE)
     md(FOOTER_MD.format(n_seeds=3, final_pct="10%"))
     nb = {
         "cells": list(CELLS),

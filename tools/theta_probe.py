@@ -38,13 +38,21 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import math
 import sys
 from pathlib import Path
 
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from league_probe import EVAL_TAG_CHAIN, band, mark_best_checkpoint, read_curves_fallback
+import arm_cache
+from league_probe import (
+    EVAL_TAG_CHAIN,
+    band,
+    mark_best_checkpoint,
+    read_curves_fallback,
+    theta_tag,
+)
 
 from mjai.scripts.experiment import ExperimentConfig, run_experiment
 
@@ -54,15 +62,22 @@ PROBE_ROOT = REPO / "runs" / "theta_probe"
 # and two sequential imperfect-information games with exact exploitability.
 GAMES = ("brps", "kuhn", "liars_dice1")
 DEFAULT_THETAS = (0.0, 0.25, 0.5, 0.75, 1.0)
-# Per-update telemetry worth reading per theta: gradient scale (the ACH term's
-# unbounded 1/pi_old vs the PPO term's O(1) surrogate), gate activity, and the
-# PPO clip rate.
-TELEMETRY_TAGS = ("train/grad_norm", "train/gate_off_frac", "train/clip_frac")
-
-
-def theta_tag(theta: float) -> str:
-    """Filesystem-safe arm tag: 0.25 -> ``0p25``."""
-    return f"{theta:g}".replace(".", "p").replace("-", "m")
+# Per-update telemetry worth reading per theta: total gradient scale, then the
+# PPO and ACH terms' own contributions (the ACH term's unbounded 1/pi_old vs
+# the PPO term's O(1) surrogate) and whether they agree, then gate activity and
+# the PPO clip rate. The per-term tags exist only when the run set
+# ``probe_term_grad_norms``; panels without points are simply empty.
+TELEMETRY_TAGS = (
+    "train/grad_norm",
+    "train/grad_norm_ppo_scaled",
+    "train/grad_norm_ach_scaled",
+    "train/grad_cos_ppo_ach",
+    "train/gate_off_frac",
+    "train/clip_frac",
+)
+# Tags spanning orders of magnitude and guaranteed non-negative -> log axis.
+# The cosine is signed and the fracs live in [0, 1], so both stay linear.
+_LOG_TAGS = tuple(t for t in TELEMETRY_TAGS if "grad_norm" in t)
 
 
 def parse_thetas(spec: str) -> list[float]:
@@ -93,6 +108,41 @@ def arm_dir(root: Path, game: str, theta: float, seed: int) -> Path:
     return root / game / f"theta_{theta_tag(theta)}" / f"seed_{seed}"
 
 
+def arm_config(
+    game: str,
+    theta: float,
+    seed: int,
+    *,
+    total_env_steps: int,
+    eval_every_env_steps: int,
+    root: Path = PROBE_ROOT,
+    progress_bar: bool = False,
+    device: str | None = None,
+    probe_term_grad_norms: bool = False,
+) -> ExperimentConfig:
+    """The resolved config for one arm, without running it (see arm_cache)."""
+    overrides: dict[str, object] = {} if device is None else {"device": device}
+    return dataclasses.replace(
+        load_base_config(game),
+        algo="theta",
+        theta=theta,
+        seed=seed,
+        out_dir=str(arm_dir(root, game, theta, seed)),
+        total_env_steps=total_env_steps,
+        eval_every_env_steps=eval_every_env_steps,
+        probe_term_grad_norms=probe_term_grad_norms,
+        verbose=False,
+        progress_bar=progress_bar,
+        **overrides,  # type: ignore[arg-type]
+    )
+
+
+def arm_status(game: str, theta: float, seed: int, **kwargs: object) -> arm_cache.ArmStatus:
+    """Cache verdict for one arm: hit / stale / missing / legacy."""
+    cfg = arm_config(game, theta, seed, **kwargs)  # type: ignore[arg-type]
+    return arm_cache.status(Path(cfg.out_dir), cfg)
+
+
 def run_arm(
     game: str,
     theta: float,
@@ -103,6 +153,7 @@ def run_arm(
     root: Path = PROBE_ROOT,
     progress_bar: bool = False,
     device: str | None = None,
+    probe_term_grad_norms: bool = False,
 ) -> Path:
     """Train one (game, theta, seed) arm to completion and mark it DONE.
 
@@ -111,22 +162,20 @@ def run_arm(
     time, so a 21->128->13 forward is pure launch-and-sync overhead on a GPU —
     measured 2809 env-steps/s on CPU vs 441 on CUDA for Liar's Dice.
     """
-    out = arm_dir(root, game, theta, seed)
-    overrides: dict[str, object] = {} if device is None else {"device": device}
-    cfg = dataclasses.replace(
-        load_base_config(game),
-        algo="theta",
-        theta=theta,
-        seed=seed,
-        out_dir=str(out),
+    cfg = arm_config(
+        game,
+        theta,
+        seed,
         total_env_steps=total_env_steps,
         eval_every_env_steps=eval_every_env_steps,
-        verbose=False,
+        root=root,
         progress_bar=progress_bar,
-        **overrides,  # type: ignore[arg-type]
+        device=device,
+        probe_term_grad_norms=probe_term_grad_norms,
     )
+    out = Path(cfg.out_dir)
     run_experiment(cfg)
-    (out / "DONE").write_text("ok\n", encoding="utf-8")
+    arm_cache.write_done(out, cfg)
     mark_best_checkpoint(out)
     return out
 
@@ -211,17 +260,21 @@ def _all_positive(ordered_arms: list[tuple[str, dict]]) -> bool:
 
 
 def render_curves(summary: dict[str, object], game: str, root: Path = PROBE_ROOT) -> Path | None:
-    """Figure 1: every theta's metric-vs-env-steps curve, overlaid with bands."""
-    import matplotlib
+    """Figure 1: every theta's metric-vs-env-steps curve, overlaid with bands.
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    Pyplot-free (see :func:`league_probe.build_figure`): ``matplotlib.use()``
+    from a notebook-imported helper kills the kernel's inline backend for the
+    rest of the session.
+    """
+    from matplotlib import colormaps
+    from matplotlib.figure import Figure
 
     thetas, metric = _game_entry(summary, game)
     if not thetas:
         return None
-    fig, ax = plt.subplots(figsize=(8, 5))
-    cmap = plt.get_cmap("viridis")
+    fig = Figure(figsize=(8, 5))
+    ax = fig.subplots()
+    cmap = colormaps["viridis"]
     ordered = sorted(thetas.items(), key=lambda kv: kv[1]["theta"])
     drew = False
     for _tag, arm in ordered:
@@ -254,7 +307,6 @@ def render_curves(summary: dict[str, object], game: str, root: Path = PROBE_ROOT
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(out, dpi=150)
-    plt.close(fig)
     return out
 
 
@@ -262,10 +314,7 @@ def render_theta_final(
     summary: dict[str, object], game: str, root: Path = PROBE_ROOT
 ) -> Path | None:
     """Figure 2: final metric vs theta, with a min-max error bar across seeds."""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
 
     thetas, metric = _game_entry(summary, game)
     if not thetas:
@@ -288,7 +337,8 @@ def render_theta_final(
     if not xs:
         return None
     frac = summary.get(game, {}).get("final_frac", 0.1)  # type: ignore[union-attr]
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    fig = Figure(figsize=(7, 4.5))
+    ax = fig.subplots()
     ax.errorbar(xs, means, yerr=[lo_err, hi_err], marker="o", capsize=4, lw=1.6, color="tab:purple")
     for x, m, n in zip(xs, means, n_seeds, strict=True):
         ax.annotate(f"n={n}", (x, m), textcoords="offset points", xytext=(0, 8), fontsize=7)
@@ -304,32 +354,36 @@ def render_theta_final(
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(out, dpi=150)
-    plt.close(fig)
     return out
 
 
-def render_telemetry(game: str, root: Path = PROBE_ROOT) -> Path | None:
-    """Diagnostic panel: per-update telemetry vs training step, one line per theta.
+def build_telemetry_figure(game: str, root: Path = PROBE_ROOT) -> tuple[object, bool]:
+    """Build the telemetry grid; returns ``(figure, drew_anything)``.
 
     The theta blend is a convex combination of two policy losses whose gradient
     magnitudes differ by orders of magnitude (the ACH term carries an unbounded
     ``1/pi_old``), so the effective learning rate varies with theta. This panel
     makes that confounder visible instead of leaving it to be inferred from the
-    curves.
+    curves — and the two per-term panels answer the question the total
+    ``grad_norm`` cannot: which policy term actually drove the update.
     """
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    from matplotlib import colormaps
+    from matplotlib.figure import Figure
     from tb_eval import read_many
 
     arm_dirs = sorted((root / game).glob("theta_*/seed_0/tb"))
     if not arm_dirs:
-        return None
-    fig, axes = plt.subplots(1, len(TELEMETRY_TAGS), figsize=(5 * len(TELEMETRY_TAGS), 3.8))
-    cmap = plt.get_cmap("viridis")
+        return None, False
+    ncols = 3
+    nrows = math.ceil(len(TELEMETRY_TAGS) / ncols)
+    fig = Figure(figsize=(5 * ncols, 3.8 * nrows))
+    grid = fig.subplots(nrows, ncols, squeeze=False)
+    axes = [grid[i // ncols][i % ncols] for i in range(nrows * ncols)]
+    for ax in axes[len(TELEMETRY_TAGS) :]:
+        ax.set_visible(False)
+    cmap = colormaps["viridis"]
     drew = False
-    for ax, tag in zip(axes, TELEMETRY_TAGS, strict=True):
+    for ax, tag in zip(axes, TELEMETRY_TAGS, strict=False):
         for d, curve in sorted(read_many(list(arm_dirs), tag=tag).items()):
             if not curve:
                 continue
@@ -345,16 +399,35 @@ def render_telemetry(game: str, root: Path = PROBE_ROOT) -> Path | None:
         ax.set_title(tag)
         ax.set_xlabel("update")
         ax.grid(alpha=0.3)
+        if tag in _LOG_TAGS and ax.get_lines():
+            ax.set_yscale("log")
+        if not ax.get_lines():
+            ax.text(
+                0.5,
+                0.5,
+                "no points\n(run with PROBE_GRAD_NORMS=True)"
+                if "grad_norm_" in tag or "grad_cos" in tag
+                else "no points",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                fontsize=8,
+                color="0.5",
+            )
+    if drew:
+        axes[0].legend(fontsize=7)
+        fig.tight_layout()
+    return fig, drew
+
+
+def render_telemetry(game: str, root: Path = PROBE_ROOT) -> Path | None:
+    """Save the telemetry grid under ``root/figs``; None when there is nothing."""
+    fig, drew = build_telemetry_figure(game, root)
     if not drew:
-        plt.close(fig)
         return None
-    axes[0].set_yscale("log")
-    axes[0].legend(fontsize=7)
     out = root / "figs" / f"theta_telemetry_{game}.png"
     out.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(out, dpi=150)
-    plt.close(fig)
+    fig.savefig(out, dpi=150)  # type: ignore[attr-defined]
     return out
 
 

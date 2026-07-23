@@ -27,11 +27,13 @@ import json
 import math
 import shutil
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import arm_cache
 from tb_eval import read_many
 
 from mjai.scripts.experiment import ExperimentConfig, run_experiment
@@ -72,8 +74,99 @@ def load_arm_config(game: str, mode: str) -> ExperimentConfig:
     return ExperimentConfig(**yaml.safe_load(path.read_text(encoding="utf-8")))
 
 
-def arm_dir(root: Path, game: str, mode: str, seed: int) -> Path:
-    return root / f"{game}_{mode}" / f"seed_{seed}"
+def theta_tag(theta: float) -> str:
+    """Filesystem-safe arm tag: 0.25 -> ``0p25``. (Shared with theta_probe.)"""
+    return f"{theta:g}".replace(".", "p").replace("-", "m")
+
+
+def arm_name(game: str, mode: str, theta: float | None = None) -> str:
+    """Arm directory name; the theta suffix appears only when theta is set.
+
+    ``theta=None`` means "whatever the YAML says" (``algo: ach``) and keeps the
+    historical ``<game>_<mode>`` name, so arms trained before the knob existed
+    still resolve. An explicit theta MUST be in the path — otherwise a PPO arm
+    and an ACH arm of the same mode/seed would overwrite each other, which is
+    exactly the comparison the knob exists to make.
+    """
+    return f"{game}_{mode}" if theta is None else f"{game}_{mode}_t{theta_tag(theta)}"
+
+
+def parse_arm(name: str) -> tuple[str, str, float | None] | None:
+    """Split an arm directory name back into ``(game, mode, theta)``.
+
+    Matched against the known games rather than split on "_": three of the
+    seven game names contain underscores (``goofspiel5_ii``, ``liars_dice1``,
+    ``oshi_zumo``), so splitting is ambiguous.
+    """
+    for game in GAMES:
+        for mode in MODES:
+            prefix = f"{game}_{mode}"
+            if name == prefix:
+                return game, mode, None
+            if name.startswith(f"{prefix}_t"):
+                tag = name[len(prefix) + 2 :]
+                return game, mode, float(tag.replace("p", ".").replace("m", "-"))
+    return None
+
+
+def arm_dir(root: Path, game: str, mode: str, seed: int, theta: float | None = None) -> Path:
+    return root / arm_name(game, mode, theta) / f"seed_{seed}"
+
+
+def arm_config(
+    game: str,
+    mode: str,
+    seed: int,
+    *,
+    total_env_steps: int,
+    eval_every_env_steps: int,
+    root: Path = PROBE_ROOT,
+    progress_bar: bool = False,
+    device: str | None = None,
+    theta: float | None = None,
+    probe_term_grad_norms: bool = False,
+) -> ExperimentConfig:
+    """The resolved config for one arm, without running it.
+
+    Split out of :func:`run_arm` so the cache can fingerprint exactly what
+    would be run (tools/arm_cache.py) before deciding to run it.
+
+    ``theta`` overrides the YAML's pinned ``algo: ach`` with the interpolated
+    rule (D11): 0 = PPO clipped surrogate, 1 = paper-faithful ACH, in between
+    the convex blend of the two POLICY terms. Note what this is not — the
+    scaffolding still comes from the ACH config (constant-LR SGD, raw
+    advantages, one epoch, no grad clipping), so ``theta=0`` here is "PPO's
+    policy term on ACH's protocol", NOT ``configs/exp/<game>_ppo_mlp_*.yaml``.
+    That one-factor reading is the whole point of the knob.
+    """
+    overrides: dict[str, object] = {} if device is None else {"device": device}
+    if theta is not None:
+        overrides.update(algo="theta", theta=theta)
+    return dataclasses.replace(
+        load_arm_config(game, mode),
+        seed=seed,
+        out_dir=str(arm_dir(root, game, mode, seed, theta)),
+        probe_term_grad_norms=probe_term_grad_norms,
+        total_env_steps=total_env_steps,
+        eval_every_env_steps=eval_every_env_steps,
+        # Probe-scale pool cadence: at 6e4 env-steps the default 200 main
+        # rounds would yield ~1 snapshot; 25 fills the 16-member pool with
+        # real main history inside the probe budget (B3).
+        league_main_save_every_rounds=25,
+        verbose=False,
+        progress_bar=progress_bar,
+        **overrides,  # type: ignore[arg-type]
+    )
+
+
+def arm_status(game: str, mode: str, seed: int, **kwargs: object) -> arm_cache.ArmStatus:
+    """Cache verdict for one arm: hit / stale / missing / legacy.
+
+    Takes the same keyword arguments as :func:`run_arm`, so a caller asks
+    "would this exact run be a cache hit?" without duplicating config logic.
+    """
+    cfg = arm_config(game, mode, seed, **kwargs)  # type: ignore[arg-type]
+    return arm_cache.status(Path(cfg.out_dir), cfg)
 
 
 def run_arm(
@@ -86,6 +179,8 @@ def run_arm(
     root: Path = PROBE_ROOT,
     progress_bar: bool = False,
     device: str | None = None,
+    theta: float | None = None,
+    probe_term_grad_norms: bool = False,
 ) -> Path:
     """Train one arm; ``device`` overrides the config's (None keeps it).
 
@@ -94,24 +189,21 @@ def run_arm(
     overhead on a GPU (measured 2809 env-steps/s on CPU vs 441 on CUDA for
     Liar's Dice).
     """
-    out = arm_dir(root, game, mode, seed)
-    overrides: dict[str, object] = {} if device is None else {"device": device}
-    cfg = dataclasses.replace(
-        load_arm_config(game, mode),
-        seed=seed,
-        out_dir=str(out),
+    cfg = arm_config(
+        game,
+        mode,
+        seed,
         total_env_steps=total_env_steps,
         eval_every_env_steps=eval_every_env_steps,
-        # Probe-scale pool cadence: at 6e4 env-steps the default 200 main
-        # rounds would yield ~1 snapshot; 25 fills the 16-member pool with
-        # real main history inside the probe budget (B3).
-        league_main_save_every_rounds=25,
-        verbose=False,
+        root=root,
         progress_bar=progress_bar,
-        **overrides,  # type: ignore[arg-type]
+        device=device,
+        theta=theta,
+        probe_term_grad_norms=probe_term_grad_norms,
     )
+    out = Path(cfg.out_dir)
     run_experiment(cfg)
-    (out / "DONE").write_text("ok\n", encoding="utf-8")
+    arm_cache.write_done(out, cfg)
     mark_best_checkpoint(out)
     return out
 
@@ -241,6 +333,15 @@ def summarize(root: Path = PROBE_ROOT, tags: tuple[str, ...] = EVAL_TAG_CHAIN) -
     return result
 
 
+def _arm_sort_key(item: tuple[str, object]) -> tuple[int, float, str]:
+    """Order a game's arms mirror-before-league, then by theta."""
+    parsed = parse_arm(item[0])
+    if parsed is None:
+        return (2, 0.0, item[0])
+    _, mode, theta = parsed
+    return (MODES.index(mode) if mode in MODES else 2, -1.0 if theta is None else theta, item[0])
+
+
 def _arm_metric(arm: object) -> str:
     """Short equilibrium-metric name recorded for an arm ("" if unknown)."""
     if not isinstance(arm, dict):
@@ -251,31 +352,47 @@ def _arm_metric(arm: object) -> str:
     return tag.removeprefix("eval/") if isinstance(tag, str) else ""
 
 
-def render_figure(summary: dict[str, object], root: Path = PROBE_ROOT) -> Path | None:
-    """Per-game panel grid of mean+min/max bands; empty panels hidden.
+def build_figure(
+    summary: dict[str, object], games: Sequence[str] | None = None
+) -> tuple[object, bool]:
+    """Build the per-game panel grid; returns ``(figure, drew_anything)``.
 
-    One panel per game in ``GAMES`` (2 rows x 4 cols for 7 games); each
-    panel's title names the equilibrium metric its curves came from.
-    Returns None if no arm has data.
+    ``games`` selects the panel set: None keeps all of :data:`GAMES` (the
+    whole-probe view, where an empty panel means "that arm has not run yet"),
+    while a single-game list is what a per-game ``ab_<game>.ipynb`` wants —
+    otherwise its figure is 7 panels of which 6 are permanently blank.
+
+    Built through the pyplot-free Figure API on purpose. ``matplotlib.use()``
+    mutates GLOBAL state: calling it from a helper a notebook imports switches
+    the kernel off the inline backend for good, and every later plt.show() in
+    that notebook silently renders nothing (verified: the A/B notebook's league
+    telemetry panel). A bare Figure also never enters pyplot's registry, so
+    nothing leaks.
     """
-    import matplotlib
+    from matplotlib import colormaps
+    from matplotlib.figure import Figure
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    ncols = 4
-    nrows = math.ceil(len(GAMES) / ncols)
-    fig, axes = plt.subplots(
-        nrows, ncols, figsize=(ncols * 4.6, nrows * 4.2), sharey=False, squeeze=False
-    )
+    panels = list(GAMES if games is None else games)
+    ncols = min(4, len(panels))
+    nrows = math.ceil(len(panels) / ncols)
+    fig = Figure(figsize=(ncols * 4.6, nrows * 4.2))
+    axes = fig.subplots(nrows, ncols, sharey=False, squeeze=False)
+    cmap = colormaps["viridis"]
+    styles = {"mirror": "-", "league": "--"}
     drew = False
-    for idx, game in enumerate(GAMES):
+    for idx, game in enumerate(panels):
         ax = axes[idx // ncols][idx % ncols]
         metric = ""
         panel_drew = False
-        for mode, style in (("mirror", "-"), ("league", "--")):
-            arm = summary.get(f"{game}_{mode}")
-            if not arm or not isinstance(arm, dict) or not arm.get("band"):
+        # Line STYLE encodes the self-play mode, COLOR encodes theta (same
+        # viridis ramp the theta-scan notebooks use), so a mode x theta sweep
+        # stays readable in one panel and matches the other notebook family.
+        for name, arm in sorted(summary.items(), key=_arm_sort_key):
+            parsed = parse_arm(name)
+            if parsed is None or parsed[0] != game:
+                continue
+            _, mode, theta = parsed
+            if not isinstance(arm, dict) or not arm.get("band"):
                 continue
             metric = metric or _arm_metric(arm)
             b = arm["band"]
@@ -286,8 +403,12 @@ def render_figure(summary: dict[str, object], root: Path = PROBE_ROOT) -> Path |
             ys = [m for m in mean if m is not None]
             lo = [v for v in b["min"] if v is not None]
             hi = [v for v in b["max"] if v is not None]
-            ax.plot(xs, ys, style, label=f"{mode} (n={max(b['n_seeds'])})")
-            ax.fill_between(xs, lo, hi, alpha=0.2)
+            color = "tab:blue" if theta is None else cmap(theta)
+            label = mode if theta is None else f"{mode} theta={theta:g}"
+            ax.plot(
+                xs, ys, styles.get(mode, "-"), color=color, label=f"{label} (n={max(b['n_seeds'])})"
+            )
+            ax.fill_between(xs, lo, hi, color=color, alpha=0.18)
             drew = panel_drew = True
         ax.set_title(f"{game}: {metric or 'equilibrium metric'} vs env-steps")
         ax.set_xlabel("env steps (league counts collector-seat decisions)")
@@ -296,14 +417,23 @@ def render_figure(summary: dict[str, object], root: Path = PROBE_ROOT) -> Path |
         ax.grid(alpha=0.3)
         if idx % ncols == 0:
             ax.set_ylabel(metric or "equilibrium metric")
-    for idx in range(len(GAMES), nrows * ncols):
+    for idx in range(len(panels), nrows * ncols):
         axes[idx // ncols][idx % ncols].set_visible(False)
+    fig.tight_layout()
+    return fig, drew
+
+
+def render_figure(
+    summary: dict[str, object], root: Path = PROBE_ROOT, games: Sequence[str] | None = None
+) -> Path | None:
+    """Save the panel grid under ``root/figs``; None when no arm has data."""
+    fig, drew = build_figure(summary, games)
     if not drew:
         return None
-    out = root / "figs" / "ab_exploitability.png"
+    stem = "ab_exploitability" if games is None else f"ab_{'_'.join(games)}"
+    out = root / "figs" / f"{stem}.png"
     out.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=150)  # type: ignore[attr-defined]
     return out
 
 
