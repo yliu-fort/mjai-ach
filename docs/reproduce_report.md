@@ -382,7 +382,32 @@ LayerNorm 臂全程无冲高，波动比基线小 3 倍、比 legalmean 小 9 �
 **⚠️ 口径提醒**：D5 判的是 **8 seeds 的 final mean**，此处只有 1 个 seed，
 因此上表的 “未通过” 是**单 seed 代理判定，不是正式 D5 判定**。单 seed
 0.1986 与带上沿 0.1881 仅差 0.0105，8-seed 均值有落入带内的可能。
-**补齐 seeds 1–7 列为后续工作**（约 21 h 串行）。
+
+**后续工作：补齐 seeds 1–7 后重判 D5。** 成本已因合并 theta 分支而大幅下降
+（见 §6.6）：实测训练 3634 env-steps/s、精确评估 warm 1.7 s/次，
+单个 1e7 run ≈ **1 h**（此前 ≈ 3 h），7 个 seed ≈ **7 h 串行**。
+
+### 6.6 合并 `claude/mlp-ppo-theta-scan-d38372`（2026-07-23）
+
+该分支基于本报告 §6.5 的默认配置提交（`32a25e3`）生长，已合并入 `dev`
+（merge `df5817c`），带来三项与本复现直接相关的变化：
+
+1. **PPO 与 ACH 统一为单一 theta 参数化更新规则**
+   （`NNActorCriticUpdate`，损失数学移入 `algos/nn_losses.py`）。论文忠实
+   ACH 即 `theta=1`；`algo: ppo`/`ach` 是 theta 0/1 的固定别名。本报告
+   §1.2 的实现描述已相应更新。**本复现的默认三键
+   （`trunk_layernorm` / `gate_centered_logits` / `loss_centered_logits`）
+   与 §6.2 的遥测（`iw_max`/`iw_mean`/`pterm_max`/`grad_norm`）
+   在新结构中均已保留**，合并后全套门控通过（492 单测、mypy、import-linter）。
+2. **`tests/unit/data/nn_updates_golden.json` 数值冻结证据**：由合并前的
+   双端点代码生成，`uv run python tools/gen_nn_golden.py --check` 必须
+   保持通过。合并后实测 **6 scenarios 全部复现**，即统一重构**没有移动
+   本复现的数值**。任何后续改动若使该检查失败，即意味着复现结果被改变。
+3. **评估与训练大幅提速**：精确评估改为一次性物化策略为 OpenSpiel
+   TabularPolicy（缓存每局状态枚举 + 批量前向）并走 C++ best-response；
+   训练侧动作 mask 改为单次 scatter。实测（liars_dice1 / CPU）：
+   评估 warm **1.7 s/次**、训练 **3634 env-steps/s** → 1e7 run 从 ≈3 h
+   降到 ≈**1 h**。这直接决定了上面 “补齐 seeds 1–7 ≈ 7 h” 的可行性。
 
 **已设为默认配置（2026-07-23）**：`trunk_layernorm: true` +
 `gate_centered_logits: false` + `loss_centered_logits: false` 已写入全部
@@ -400,7 +425,7 @@ LayerNorm 臂全程无冲高，波动比基线小 3 倍、比 legalmean 小 9 �
 ⚠️ 该默认变更**先于全长 1e7 验证完成**（当时验证仅跑到 ~2e6）。若全长结果
 证伪，需回滚这三个键。
 
-### 6.6 剩余候选（未验证）
+### 6.7 剩余候选（未验证）
 
 - **重要性权重 1/π_old 无界**：ACH 损失含 `y(a)/π_old(a)`，而 ratio 门控在
   单线程下恒真（p28）＝不设限。策略锐化后稀有动作的 π_old 很小 → 梯度爆炸，
