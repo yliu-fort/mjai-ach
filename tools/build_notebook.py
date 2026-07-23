@@ -50,6 +50,11 @@ code(
     "N_STEPS       = 1000\n",
     "RUN_ALL_MATRIX = False      # True => sweep all 7 games x 2 algos x 2 modes\n",
     "QUICK          = False      # True => 3 games x 200 steps, fast demo\n",
+    "DEVICE        = 'cpu'       # 'cpu' | 'cuda' | None (= gpu_assert default)\n",
+    "# CPU is the default and is the FAST option: the rollout asks the policy for\n",
+    "# one decision at a time, so a small MLP forward is launch-and-sync overhead\n",
+    "# on a GPU (measured 2809 vs 441 env-steps/s on Liar's Dice). This cell's\n",
+    "# runs are tabular, where DEVICE is inert -- it matters once policy_kind='mlp'.\n",
     "\n",
     "import sys, pathlib\n",
     "sys.path.insert(0, str(pathlib.Path.cwd().parent / 'src'))\n",
@@ -104,6 +109,7 @@ code(
     "for game, algo, mode in cells:\n",
     "    cfg = ExperimentConfig(\n",
     "        game=game, algo=algo, self_play_mode=mode, policy_kind='tabular',\n",
+    "        device=DEVICE,\n",
     "        n_steps=N_STEPS_LOCAL, save_every_steps=SAVE_EVERY, eval_every_steps=EVAL_EVERY,\n",
     "        eval_during_training=True, verbose=True,\n",
     "        out_dir=f'runs/{game}_{algo}_{mode}', seed=0,\n",
@@ -276,5 +282,7 @@ nb = {
 
 out = Path("notebooks/phase1_one_click.ipynb")
 out.parent.mkdir(parents=True, exist_ok=True)
-out.write_text(json.dumps(nb, indent=1), encoding="utf-8")
+# Trailing newline so the end-of-file pre-commit hook does not rewrite the
+# generated notebook after every regeneration (the other two builders match).
+out.write_text(json.dumps(nb, indent=1) + "\n", encoding="utf-8")
 print(f"wrote {out} ({len(CELLS)} cells)")

@@ -1,6 +1,7 @@
 """Reproduce the ACH paper's Appendix G OpenSpiel experiments (p25-26).
 
-Runs the paper-faithful :class:`NNACHUpdate` (mirror self-play) on Kuhn poker,
+Runs the paper-faithful ACH endpoint (``theta=1`` of
+:class:`~mjai.algos.nn_updates.NNActorCriticUpdate`, mirror self-play) on Kuhn poker,
 Leduc poker, and Liar's Dice with N independent seeds (paper: 8 runs, p26),
 training to 1e7 env-steps with exact-exploitability evaluation every 1e5
 env-steps. Serial and resumable: a run directory containing a ``DONE`` marker

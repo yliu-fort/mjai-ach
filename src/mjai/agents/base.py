@@ -78,6 +78,35 @@ class Policy(ABC):
         """
         ...
 
+    # ---- batched read API (eval hot path, AGENTS.md §8) ----
+    #
+    # Exact equilibrium eval materializes the whole policy over every info state
+    # in the game. Asking one state at a time costs ~200 us per call for an NN
+    # (a one-row forward plus one device sync per legal action), which dwarfs
+    # the arithmetic: the same MLP answers 24k states in ~15 ms as one batch.
+    # Subclasses with a vectorizable backbone override this; the default below
+    # loops over ``action_logits`` so a new subclass is correct by construction.
+    def action_logits_batch(self, obs_batch: Any, legal_mask: Any) -> Any:
+        """Full-action-space logits for many observations at once.
+
+        Args:
+            obs_batch: ``(B, obs_size)`` float array of observations.
+            legal_mask: ``(B, num_actions)`` bool array, True where legal. Every
+                row must have at least one legal action.
+
+        Returns:
+            ``(B, num_actions)`` float32 array of logits, with illegal entries
+            set to ``-inf`` so the caller can softmax over the row directly.
+        """
+        import numpy as np
+
+        mask = np.asarray(legal_mask, dtype=bool)
+        out = np.full(mask.shape, -np.inf, dtype=np.float32)
+        for i, row in enumerate(mask):
+            legal = np.flatnonzero(row).tolist()
+            out[i, legal] = self.action_logits(list(obs_batch[i]), legal)
+        return out
+
     @abstractmethod
     def save(self, path: str) -> None:
         """Persist to ``path`` using the canonical ckpt manifest (AGENTS.md §10)."""

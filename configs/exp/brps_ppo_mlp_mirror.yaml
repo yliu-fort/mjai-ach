@@ -1,0 +1,56 @@
+# Reference PPO on the MLP path: the clipped-surrogate endpoint (theta=0) of the
+# unified actor-critic rule (src/mjai/algos/nn_updates.py).
+#
+# Every knob below is COPIED FROM brps_ach_mlp_mirror.yaml on purpose. The
+# scaffolding (SGD constant LR, raw advantages, one epoch per batch, no grad
+# clipping, LayerNorm torso, batch 64, eval cadence) is shared, so an arm run
+# from this file differs from the ACH arm in the policy term ALONE -- which is
+# what makes it a valid control for the theta scan (notebooks/theta_*.ipynb).
+#
+# To evaluate PPO under its own best practices instead, set the knobs the
+# 37-details paper recommends (they are all separately configurable):
+#   optimizer: adam / normalize_advantages: true / max_grad_norm: 0.5 /
+#   n_epochs: 4 / learning_rate: 0.0003
+# That is a different experiment -- an A/B on the scaffolding, not on theta.
+game: brps
+algo: ppo
+self_play_mode: mirror
+policy_kind: mlp
+# Network (p25): 1 hidden FC layer of 128 units + ReLU, then two linear heads.
+hidden_sizes: [128]
+activation: relu
+# Optimization (H.3, p27): SGD with constant learning rate, best lr=1e-3.
+optimizer: sgd
+learning_rate: 0.001
+value_coef: 1.0
+entropy_coef: 0.01     # β = 1e-2 (p28 Table 8)
+gae_lambda: 0.95
+max_grad_norm: 0.0     # disabled — the paper mentions no grad clipping
+eta: 1.0   # ACH-only; inert at theta=0 (the two arms diff by `algo` alone)
+l_th: 2.0   # ACH-only; inert at theta=0 (the two arms diff by `algo` alone)
+ratio_eps: 0.5   # ACH-only; inert at theta=0 (the two arms diff by `algo` alone)
+# Batch = 64 samples (p28 Table 8): whole episodes until ≥64 transitions.
+target_samples: 64
+episodes_per_round: 200  # safety cap only (target_samples stops first)
+# Env-step protocol (p25-26): evaluate every 1e5 steps, train to 1e7 steps.
+total_env_steps: 10000000
+eval_every_env_steps: 100000
+# Legacy round-mode fields (unused while total_env_steps is set).
+n_steps: 1000000
+save_every_steps: 1000
+eval_every_steps: 1000
+eval_during_training: true
+verbose: false
+seed: 0
+out_dir: runs/brps_ppo_mlp_mirror
+hedge_eta: null
+clip_eps: 0.2
+device: null
+# Logit-scale handling (docs/reproduce_report.md §6.5). A LayerNorm at the
+# torso end normalizes the features feeding both heads, so the gate and the
+# loss body threshold the RAW logit rather than a mean-centered one. This
+# combination reproduces the paper's Liar's Dice curve; manual mean-centering
+# did not. Deviation from the paper's stated architecture (p25) — see §6.5.
+trunk_layernorm: true
+gate_centered_logits: false   # ACH-only; inert at theta=0 (the two arms diff by `algo` alone)
+loss_centered_logits: false   # ACH-only; inert at theta=0 (the two arms diff by `algo` alone)

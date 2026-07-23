@@ -1,71 +1,113 @@
-"""Neural UpdateRules: paper-faithful ACH and a reference PPO on torch policies.
+"""The NN UpdateRule: one theta-parameterized PPO/ACH actor-critic update.
 
-These drive the NN half of the 2x2 matrix (AGENTS.md §1 D1) on
-:class:`mjai.agents.mlp.MLPSharedActorCritic`. The two endpoints share only
-semantics-free scaffolding (tensor conversion, masked log-probs, value/entropy
-loss pieces, grad clipping, optimizer state I/O) via :class:`_NNUpdateBase`;
-each owns its optimizer and its ``step()``.
+``theta`` selects the policy-improvement operator on a continuum, on
+:class:`mjai.agents.mlp.MLPSharedActorCritic`:
 
-  - :class:`NNACHUpdate` — the single ACH implementation (AGENTS.md §1 D4):
-    paper-faithful per Fu et al., ICLR 2022 (OpenReview ``DTXZqTNV5nW``),
-    Algorithm 2 + Eq. 29 (p24) with Appendix H.3 hyperparameters (p27-28).
-    Ground truth for every fidelity decision: ``docs/paper_spec_ach.md``.
-  - :class:`NNPPOUpdate` — reference PPO (clipped surrogate + value MSE +
-    entropy bonus) for the PPO-vs-ACH comparison.
+  - ``theta = 0`` — reference PPO: clipped surrogate (Schulman et al. 2017).
+  - ``theta = 1`` — paper-faithful ACH (AGENTS.md §1 D4): Fu et al., ICLR 2022
+    (OpenReview ``DTXZqTNV5nW``), Algorithm 2 + Eq. 29 (p24) with Appendix H.3
+    hyperparameters (p27-28). Ground truth: ``docs/paper_spec_ach.md``.
+  - in between — the convex combination of the two policy losses, which is
+    what the theta-scan notebooks sweep.
+
+Everything OUTSIDE the policy term is one shared, knob-driven scaffold
+(optimizer, advantage treatment, epochs per batch, grad clipping), with
+ACH-protocol defaults at every theta. That is deliberate: it makes theta the
+only difference between a PPO arm and an ACH arm, and it makes each PPO best
+practice an explicit, separately-testable knob rather than a package deal.
+Turning on a knob the paper contradicts while ``theta > 0`` emits an
+:class:`~mjai.algos.update_rule.ACHFidelityWarning`.
+
+The loss math itself lives in :mod:`mjai.algos.nn_losses`, so there is exactly
+one implementation of the ACH operator in the repo. ``theta=1`` with the
+shipped ACH config is pinned bit-exactly by
+``tests/unit/data/nn_updates_golden.json`` (see ``tools/gen_nn_golden.py``).
 """
 
 from __future__ import annotations
 
 import math
-from abc import abstractmethod
+import warnings
 from typing import Any
 
 import torch
 from torch import nn
 
-from mjai.agents.mlp import MASK_VALUE, MLPSharedActorCritic
+from mjai.agents.mlp import MLPSharedActorCritic
+from mjai.algos.nn_losses import (
+    ach_policy_loss,
+    explained_variance,
+    masked_log_probs,
+    normalize_advantages,
+    ppo_policy_loss,
+    value_loss_and_entropy,
+)
 from mjai.algos.transition import Batch, UpdateStats
-from mjai.algos.update_rule import AlgoConfig, UpdateRule
+from mjai.algos.update_rule import ACHFidelityWarning, AlgoConfig, UpdateRule
 
 
-def _explained_variance_torch(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
-    """Explained variance: 1 - Var(y_true - y_pred) / Var(y_true); 1.0 = perfect.
+def _warn_if_ach_incompatible(config: AlgoConfig) -> None:
+    """Warn when a knob the ACH paper contradicts is on while ACH has weight.
 
-    Computed entirely on-device to avoid the two full-array D2H transfers a
-    numpy variant would pay for (AGENTS.md §8). The trailing ``.item()`` is a
-    single-scalar sync. Degenerate (single-sample or constant) batches
-    report 0.0 — variance is undefined there.
+    Silent at ``theta=0`` (no ACH term to be unfaithful to) and silent on the
+    shipped ACH defaults — so a reproduction run never warns, and an A/B arm
+    always says so out loud.
     """
-    if y_true.numel() <= 1:
-        return 0.0
-    yt_var = y_true.var()
-    if yt_var.item() < 1e-12:
-        return 0.0
-    return float(1.0 - (y_true - y_pred).var() / yt_var)
+    if config.theta <= 0.0:
+        return
+    issues: list[str] = []
+    if (config.optimizer or "sgd") == "adam":
+        issues.append(
+            "optimizer='adam' (H.3 p27: 'stochastic gradient descent with a "
+            "constant learning rate')"
+        )
+    if config.normalize_advantages:
+        issues.append(
+            "normalize_advantages=True (Eq. 29 p24 consumes raw GAE advantages; "
+            "normalizing turns the hedge coefficient eta into a batch-adaptive "
+            "learning rate)"
+        )
+    if config.n_epochs > 1:
+        issues.append(
+            f"n_epochs={config.n_epochs} (p24: 'we update theta and omega once "
+            "using a single mini-batch at each iteration')"
+        )
+    if issues:
+        warnings.warn(
+            f"ACH policy term is active (theta={config.theta}) alongside "
+            f"PPO-best-practice knobs the ACH paper does not use: "
+            f"{'; '.join(issues)}. This is a valid A/B arm but NOT a faithful "
+            f"reproduction — do not compare it against the paper's curves.",
+            ACHFidelityWarning,
+            stacklevel=3,
+        )
 
 
-def _normalize_advantages(adv: torch.Tensor) -> torch.Tensor:
-    """Per-batch zero-mean/unit-std normalization (PPO only — ACH has none).
+class NNActorCriticUpdate(UpdateRule):
+    """One gradient step of the theta-interpolated PPO/ACH actor-critic loss.
 
-    The ACH paper's loss consumes raw GAE advantages (p24); normalizing them
-    would turn the hedge coefficient eta into a batch-adaptive learning rate.
-    """
-    if adv.numel() <= 1:
-        return adv
-    std = adv.std()
-    if std.item() < 1e-8:
-        return adv - adv.mean()
-    return (adv - adv.mean()) / (std + 1e-8)
+    Per sample ``[a, s, A(s,a), G, pi_old(a|s)]`` the total loss is::
 
+        L = (1-theta) * L_ppo + theta * L_ach
+            + value_coef * (V - G)^2 - entropy_coef * H(pi)
 
-class _NNUpdateBase(UpdateRule):
-    """Semantics-free scaffolding shared by the PPO and ACH endpoints.
+    with ``L_ppo`` the clipped surrogate and ``L_ach`` the gated logit-space
+    term of Eq. 29 (see :mod:`mjai.algos.nn_losses` for both, including the
+    fidelity notes). The endpoints short-circuit: at ``theta=0`` the ACH term
+    is never built, at ``theta=1`` the PPO term is never built, so each
+    endpoint is bit-identical to a dedicated implementation and pays nothing
+    for the other's presence.
 
-    Owns: optimizer construction (delegated to the endpoint), batch-to-tensor
-    conversion, masked log-probs, the shared value-MSE + entropy-bonus loss
-    pieces, grad-norm clipping, and optimizer state I/O. Owns NO algorithm
-    semantics — the policy-improvement operator lives in each endpoint's
-    ``step()``.
+    Intentional deviations on the PPO side, kept because the scaffolding is
+    shared and its defaults follow ACH (each is a knob, listed with the field
+    that restores the 37-details behavior):
+
+      - one full-batch gradient step per batch, no minibatch shuffling and
+        hence no KL early-stop (``n_epochs``);
+      - raw rather than normalized advantages (``normalize_advantages``);
+      - constant-LR SGD rather than Adam (``optimizer``, ``adam_eps``);
+      - PyTorch default weight init (no orthogonal init — an architecture
+        concern, so it is not a knob here).
     """
 
     def __init__(self, policy: MLPSharedActorCritic, config: AlgoConfig | None = None) -> None:
@@ -75,53 +117,49 @@ class _NNUpdateBase(UpdateRule):
             )
         super().__init__(policy)
         self.config = config or AlgoConfig()
+        _warn_if_ach_incompatible(self.config)
         self.policy: MLPSharedActorCritic = policy
         self.optimizer = self._make_optimizer()
 
-    @abstractmethod
+    # ---- scaffolding ----
+
     def _make_optimizer(self) -> torch.optim.Optimizer:
-        """Build the endpoint's optimizer (PPO: Adam; ACH: SGD, paper p27)."""
-        ...
-
-    # ---- batch-to-tensor helpers ----
-
-    def _obs_tensor(self, batch: Batch) -> torch.Tensor:
-        return torch.as_tensor(batch.obs, dtype=torch.float32, device=self.policy.device)
-
-    def _legal_mask_tensor(self, batch: Batch) -> torch.Tensor:
-        return torch.as_tensor(batch.legal_mask, dtype=torch.float32, device=self.policy.device)
-
-    def _masked_logp(self, logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        masked = logits + (1.0 - mask) * MASK_VALUE
-        return torch.log_softmax(masked, dim=-1)
-
-    # ---- shared loss pieces (identical in the paper's Eq. 29 and in PPO) ----
-
-    def _value_and_entropy(
-        self, logits: torch.Tensor, values: torch.Tensor, returns: torch.Tensor, mask: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (value_mse, mean_entropy) for the combined loss.
-
-        Paper Eq. 29 (p24): ``alpha/2 * [V(s;omega) - G]^2 + beta * sum_a pi(a|s)
-        log pi(a|s)``. Our ``value_coef`` multiplies the plain MSE, so the
-        paper's alpha=2.0 (p27 Table 7) corresponds to ``value_coef=1.0``. The
-        entropy term enters the total loss as ``-entropy_coef * entropy``
-        (= ``+beta * sum_a pi log pi``), with beta=1e-2 (p28 Table 8).
-        """
-        value_loss = ((values - returns) ** 2).mean()
-        logp_all = self._masked_logp(logits, mask)
-        legal_probs = torch.exp(logp_all)
-        entropy = -(legal_probs * logp_all).sum(dim=-1).mean()
-        return value_loss, entropy
+        """Build the configured optimizer; SGD (paper H.3 p27) is the default."""
+        opt = self.config.optimizer or "sgd"
+        if opt == "sgd":
+            return torch.optim.SGD(self.policy.parameters(), lr=self.config.learning_rate)
+        if opt == "adam":
+            return torch.optim.Adam(
+                self.policy.parameters(),
+                lr=self.config.learning_rate,
+                eps=self.config.adam_eps,
+            )
+        raise ValueError(f"Unknown optimizer {opt!r}; expected 'sgd' or 'adam'")
 
     def _clip_grads(self) -> None:
         """Grad-norm clipping; disabled when ``max_grad_norm <= 0``.
 
         The ACH paper mentions no grad clipping, so the reproduction configs
-        set ``max_grad_norm: 0.0``; PPO keeps the 37-details default 0.5.
+        set ``max_grad_norm: 0.0``; the 37-details PPO value is 0.5.
         """
         if self.config.max_grad_norm > 0:
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
+
+    def _grad_norm(self) -> torch.Tensor:
+        """Raw (pre-clip) global grad norm.
+
+        Read before :meth:`_clip_grads` so it reflects the gradient the paper's
+        unclipped setting actually applies. Central telemetry for the theta
+        scan: the ACH term carries an unbounded ``1/pi_old`` factor while the
+        PPO term is O(1), so gradient scale varies strongly with theta.
+        """
+        with torch.no_grad():
+            grad_sqs = [
+                (p.grad.detach() ** 2).sum() for p in self.policy.parameters() if p.grad is not None
+            ]
+            if not grad_sqs:
+                return torch.zeros((), device=self.policy.device)
+            return torch.sqrt(torch.stack(grad_sqs).sum())
 
     # ---- optimizer state I/O ----
 
@@ -135,252 +173,139 @@ class _NNUpdateBase(UpdateRule):
             opt_state: dict[str, Any] = state["optimizer"]  # type: ignore[assignment]
             self.optimizer.load_state_dict(opt_state)
 
-
-class NNPPOUpdate(_NNUpdateBase):
-    """Reference PPO endpoint: clipped surrogate + value MSE + entropy bonus.
-
-    Intentional deviations from Huang et al. 2022 ("The 37 Implementation
-    Details"), kept so PPO shares the ACH paper's single-update-per-batch
-    regime and the comparison isolates the policy-improvement operator:
-
-      - exactly ONE full-batch gradient step per batch (no minibatch shuffling,
-        no multi-epoch sample reuse, hence no KL early-stop);
-      - constant learning rate (no annealing);
-      - PyTorch default weight init (no orthogonal init).
-
-    Adam follows the 37-details eps recommendation (1e-5). Advantage
-    normalization, clip_eps=0.2, action masking, and grad clipping (default
-    0.5) are standard.
-    """
-
-    def __init__(
-        self,
-        policy: MLPSharedActorCritic,
-        config: AlgoConfig | None = None,
-        *,
-        clip_eps: float = 0.2,
-    ) -> None:
-        self.clip_eps = float(clip_eps)
-        super().__init__(policy, config)
-
-    def _make_optimizer(self) -> torch.optim.Optimizer:
-        opt = self.config.optimizer or "adam"
-        if opt == "adam":
-            return torch.optim.Adam(
-                self.policy.parameters(), lr=self.config.learning_rate, eps=1e-5
-            )
-        if opt == "sgd":
-            return torch.optim.SGD(self.policy.parameters(), lr=self.config.learning_rate)
-        raise ValueError(f"Unknown optimizer {opt!r}; expected 'adam' or 'sgd'")
+    # ---- the update ----
 
     def step(self, batch: Batch) -> UpdateStats:
         if batch.size == 0:
             return UpdateStats(policy_loss=0.0, value_loss=0.0, entropy=0.0)
-        obs = self._obs_tensor(batch)
-        mask = self._legal_mask_tensor(batch)
-        actions = torch.as_tensor(batch.actions, dtype=torch.long, device=self.policy.device)
-        old_logp = torch.as_tensor(batch.logprobs, dtype=torch.float32, device=self.policy.device)
-        returns = torch.as_tensor(batch.returns, dtype=torch.float32, device=self.policy.device)
-        adv = _normalize_advantages(
-            torch.as_tensor(batch.advantages, dtype=torch.float32, device=self.policy.device)
-        )
-
-        # One full-batch gradient step (intentional; see class docstring).
-        logits, values = self.policy(obs)
-        logp_all = self._masked_logp(logits, mask)
-        new_logp = logp_all.gather(1, actions.unsqueeze(1)).squeeze(1)
-        ratio = torch.exp(new_logp - old_logp)
-        surr1 = ratio * adv
-        surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
-        ppo_loss = -torch.min(surr1, surr2).mean()
-        value_loss, entropy = self._value_and_entropy(logits, values, returns, mask)
-        loss = ppo_loss + self.config.value_coef * value_loss - self.config.entropy_coef * entropy
-        self.optimizer.zero_grad()
-        loss.backward()  # type: ignore[no-untyped-call]  # torch's Tensor.backward is untyped
-        self._clip_grads()
-        self.optimizer.step()
-
-        with torch.no_grad():
-            clip_frac = ((ratio - 1.0).abs() > self.clip_eps).float().mean()
-            stats_t = torch.stack(
-                [ppo_loss.detach(), value_loss.detach(), entropy.detach(), clip_frac]
-            )
-        total_pol, total_val, total_ent, total_clip = stats_t.cpu().tolist()
-        approx_kl = float((old_logp - new_logp.detach()).mean().item())
-        ev = _explained_variance_torch(returns, values.detach())
-        return UpdateStats(
-            policy_loss=total_pol,
-            value_loss=total_val,
-            entropy=total_ent,
-            approx_kl=approx_kl,
-            clip_frac=total_clip,
-            explained_variance=ev,
-        )
-
-
-class NNACHUpdate(_NNUpdateBase):
-    """Paper-faithful ACH (Fu et al., ICLR 2022, OpenReview ``DTXZqTNV5nW``).
-
-    Implements Algorithm 2 / Eq. 29 (p24) exactly -- per sample
-    ``[a, s, A(s,a), G, pi_old(a|s)]``::
-
-        c = 1{pi(a|s;theta)/pi_old < 1+eps} * 1{y(a)-y_mean <  l_th}   if A >= 0
-        c = 1{pi(a|s;theta)/pi_old > 1-eps} * 1{y(a)-y_mean > -l_th}   if A < 0
-        L = -c * eta * y(a|s;theta) / pi_old(a|s) * A
-            + alpha/2 * (V-G)^2 + beta * sum_a pi log pi
-
-    Fidelity notes (ground truth: docs/paper_spec_ach.md):
-
-      - **Advantage-sign-dependent one-sided gate**: the gate only blocks
-        *further* movement past the threshold in the direction the advantage
-        pushes; the corrective direction is always allowed. A symmetric
-        |y|<=l_th gate would also zero the gradient that pulls an overshot
-        logit back -- a different algorithm (see docs/audit_report.md F1).
-      - **Ambiguity A3 (gate centered; loss body toggleable)**: the gate always
-        thresholds the mean-centered logit ``y - y_mean`` (paper is explicit:
-        "the mean is subtracted from the policy output", p24). The loss body
-        uses the centered logit by default (paper text); set
-        ``AlgoConfig.loss_centered_logits=False`` for the literal Algorithm 2
-        raw-logit reading. Mean-subtraction leaves softmax unchanged but
-        spreads the gradient across actions (``g_a - mean_b g_b``).
-      - **No advantage normalization** (the paper has none; eta=1.0 is the
-        hedge learning rate, p27 Table 7).
-      - **SGD with constant LR** (H.3, p27: "stochastic gradient descent with
-        a constant learning rate", best lr=1e-3, no momentum mentioned).
-      - **Ratio gate kept but vacuous** under synchronous single-threaded
-        self-play, where pi == pi_old (p28 note); it only bites under async
-        IMPALA-style sampling.
-      - **Centered-mean action set toggleable** (A5-adjacent ambiguity): by
-        default ``y_mean`` averages ALL logits; with
-        ``AlgoConfig.centered_mean_legal_only=True`` it averages legal-action
-        logits only, shielding the gate and the centered loss body from
-        illegal-logit drift (matters when legal sets shrink, e.g. Liar's Dice).
-      - **One gradient step per mini-batch** (p24: "we update theta and omega
-        once using a single mini-batch at each iteration").
-    """
-
-    def _make_optimizer(self) -> torch.optim.Optimizer:
-        opt = self.config.optimizer or "sgd"
-        if opt != "sgd":
-            raise ValueError(
-                f"Paper-faithful ACH uses SGD with a constant LR (p27 H.3); got {opt!r}. "
-                "Set optimizer='sgd' in AlgoConfig/YAML."
-            )
-        return torch.optim.SGD(self.policy.parameters(), lr=self.config.learning_rate)
-
-    def step(self, batch: Batch) -> UpdateStats:
-        if batch.size == 0:
-            return UpdateStats(policy_loss=0.0, value_loss=0.0, entropy=0.0)
-        obs = self._obs_tensor(batch)
-        mask = self._legal_mask_tensor(batch)
-        actions = torch.as_tensor(batch.actions, dtype=torch.long, device=self.policy.device)
-        old_logp = torch.as_tensor(batch.logprobs, dtype=torch.float32, device=self.policy.device)
-        # pi_old(a|s): the behavior-policy prob recorded by the rollout under the
-        # exact policy that sampled the action (paper: samples arrive as
+        device = self.policy.device
+        obs = torch.as_tensor(batch.obs, dtype=torch.float32, device=device)
+        mask = torch.as_tensor(batch.legal_mask, dtype=torch.float32, device=device)
+        actions = torch.as_tensor(batch.actions, dtype=torch.long, device=device)
+        old_logp = torch.as_tensor(batch.logprobs, dtype=torch.float32, device=device)
+        returns = torch.as_tensor(batch.returns, dtype=torch.float32, device=device)
+        # Raw GAE advantages feed the ACH term unconditionally (paper p24); the
+        # PPO term optionally sees the normalized copy.
+        adv_raw = torch.as_tensor(batch.advantages, dtype=torch.float32, device=device)
+        adv_ppo = adv_raw
+        if self.config.theta < 1.0 and self.config.normalize_advantages:
+            adv_ppo = normalize_advantages(adv_raw)
+        # pi_old(a|s): the behavior-policy prob recorded by the rollout under
+        # the exact policy that sampled the action (paper: samples arrive as
         # [a, s, A, G, pi_old(a|s)], p24 Algorithm 2).
         old_probs = torch.exp(old_logp)
-        returns = torch.as_tensor(batch.returns, dtype=torch.float32, device=self.policy.device)
-        # Raw GAE advantages — NO normalization (paper p24; see class docstring).
-        adv = torch.as_tensor(batch.advantages, dtype=torch.float32, device=self.policy.device)
 
+        stats = UpdateStats(policy_loss=0.0, value_loss=0.0, entropy=0.0)
+        for _ in range(self.config.n_epochs):
+            stats = self._gradient_step(
+                obs=obs,
+                mask=mask,
+                actions=actions,
+                old_logp=old_logp,
+                old_probs=old_probs,
+                returns=returns,
+                adv_raw=adv_raw,
+                adv_ppo=adv_ppo,
+            )
+        return stats
+
+    def _gradient_step(
+        self,
+        *,
+        obs: torch.Tensor,
+        mask: torch.Tensor,
+        actions: torch.Tensor,
+        old_logp: torch.Tensor,
+        old_probs: torch.Tensor,
+        returns: torch.Tensor,
+        adv_raw: torch.Tensor,
+        adv_ppo: torch.Tensor,
+    ) -> UpdateStats:
+        """One forward/backward/optimizer step over the whole batch."""
+        theta = self.config.theta
         logits, values = self.policy(obs)
-        logp_all = self._masked_logp(logits, mask)
+        logp_all = masked_log_probs(logits, mask)
         new_logp = logp_all.gather(1, actions.unsqueeze(1)).squeeze(1)
         ratio = torch.exp(new_logp - old_logp)
 
-        # Gate logit: always mean-centered (paper is explicit: the gate
-        # thresholds on y(a) - y_mean, p24 Algorithm 2). Which actions enter
-        # y_mean is ambiguous (masking is never discussed, A5): all actions
-        # (historical default) or legal-only (centered_mean_legal_only probe —
-        # illegal logits are untrained and their drift distorts the gate).
-        if self.config.centered_mean_legal_only:
-            n_legal = mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
-            y_mean = (logits * mask).sum(dim=-1, keepdim=True) / n_legal
-        else:
-            y_mean = logits.mean(dim=-1, keepdim=True)
-        centered = logits - y_mean
-        # Gate logit source: centered (paper text) or raw. Raw is only coherent
-        # when the architecture bounds the logit scale (MLP trunk_layernorm),
-        # which gives l_th an absolute meaning without manual centering.
-        y_gate_src = centered if self.config.gate_centered_logits else logits
-        y_gate = y_gate_src.gather(1, actions.unsqueeze(1)).squeeze(1)
-        # Loss-body logit: centered (paper text, default) or raw (literal
-        # Algorithm 2) per AlgoConfig.loss_centered_logits -- A3/U1 probe toggle.
-        y_loss_src = centered if self.config.loss_centered_logits else logits
-        y_loss = y_loss_src.gather(1, actions.unsqueeze(1)).squeeze(1)
-        # Advantage-sign-dependent one-sided gates (p24 Algorithm 2).
-        gate_pos = (y_gate < self.config.l_th) & (ratio < 1.0 + self.config.ratio_eps)
-        gate_neg = (y_gate > -self.config.l_th) & (ratio > 1.0 - self.config.ratio_eps)
-        c = torch.where(adv >= 0, gate_pos, gate_neg).float()
-        policy_loss = -(self.config.eta * y_loss * c * adv / (old_probs + 1e-8)).mean()
+        telemetry: dict[str, torch.Tensor] = {}
+        policy_loss: torch.Tensor | None = None
+        if theta < 1.0:
+            ppo_loss, ppo_stats = ppo_policy_loss(
+                ratio=ratio, advantages=adv_ppo, clip_eps=self.config.clip_eps
+            )
+            telemetry.update(ppo_stats)
+            policy_loss = ppo_loss if theta == 0.0 else (1.0 - theta) * ppo_loss
+        if theta > 0.0:
+            ach_loss, ach_stats = ach_policy_loss(
+                logits=logits,
+                mask=mask,
+                actions=actions,
+                ratio=ratio,
+                advantages=adv_raw,
+                old_probs=old_probs,
+                config=self.config,
+            )
+            telemetry.update(ach_stats)
+            scaled = ach_loss if theta == 1.0 else theta * ach_loss
+            policy_loss = scaled if policy_loss is None else policy_loss + scaled
+        assert policy_loss is not None  # theta in [0, 1] always builds one term
 
-        value_loss, entropy = self._value_and_entropy(logits, values, returns, mask)
+        value_loss, entropy = value_loss_and_entropy(logits, values, returns, mask)
         loss = (
             policy_loss + self.config.value_coef * value_loss - self.config.entropy_coef * entropy
         )
         self.optimizer.zero_grad()
-        loss.backward()
-        # Raw (pre-clip) grad norm — telemetry for the unbounded-1/pi_old probe.
-        # Read before _clip_grads so it reflects the gradient the paper's
-        # unclipped setting actually applies (reproduction sets max_grad_norm=0).
-        with torch.no_grad():
-            grad_sqs = [
-                (p.grad.detach() ** 2).sum() for p in self.policy.parameters() if p.grad is not None
-            ]
-            grad_norm = (
-                torch.sqrt(torch.stack(grad_sqs).sum())
-                if grad_sqs
-                else torch.zeros((), device=self.policy.device)
-            )
+        loss.backward()  # type: ignore[no-untyped-call]  # torch's Tensor.backward is untyped
+        telemetry["grad_norm"] = self._grad_norm()
         self._clip_grads()
         self.optimizer.step()
 
+        return self._make_stats(
+            policy_loss=policy_loss,
+            value_loss=value_loss,
+            entropy=entropy,
+            old_logp=old_logp,
+            new_logp=new_logp,
+            returns=returns,
+            values=values,
+            telemetry=telemetry,
+        )
+
+    def _make_stats(
+        self,
+        *,
+        policy_loss: torch.Tensor,
+        value_loss: torch.Tensor,
+        entropy: torch.Tensor,
+        old_logp: torch.Tensor,
+        new_logp: torch.Tensor,
+        returns: torch.Tensor,
+        values: torch.Tensor,
+        telemetry: dict[str, torch.Tensor],
+    ) -> UpdateStats:
+        """Collect the step's scalars with a single device sync (AGENTS.md §8).
+
+        ``clip_frac`` is promoted to a first-class field (PPO's own metric);
+        the remaining telemetry — the ACH gate/importance-weight probes and the
+        always-on ``grad_norm`` — rides in ``extra``.
+        """
+        names = sorted(telemetry)
         with torch.no_grad():
-            gate_off_frac = 1.0 - c.mean()
-            # Importance weight 1/pi_old(a|s) from Eq. 29. The ratio gate is
-            # vacuous under synchronous self-play (p28), so nothing bounds this;
-            # these scalars let a run be checked for gradient blow-up driven by
-            # rare sampled actions.
-            iw = 1.0 / (old_probs + 1e-8)
-            # Magnitude of the per-sample policy term actually applied.
-            pterm = (self.config.eta * y_loss * c * adv / (old_probs + 1e-8)).abs()
-            stats_t = torch.stack(
-                [
-                    policy_loss.detach(),
-                    value_loss.detach(),
-                    entropy.detach(),
-                    gate_off_frac,
-                    iw.max(),
-                    iw.mean(),
-                    pterm.max(),
-                    grad_norm,
-                ]
+            stacked = torch.stack(
+                [policy_loss.detach(), value_loss.detach(), entropy.detach()]
+                + [telemetry[n] for n in names]
             )
-        (
-            total_pol,
-            total_val,
-            total_ent,
-            gate_off,
-            iw_max,
-            iw_mean,
-            pterm_max,
-            gnorm,
-        ) = stats_t.cpu().tolist()
-        approx_kl = float((old_logp - new_logp.detach()).mean().item())
-        ev = _explained_variance_torch(returns, values.detach())
+        flat = stacked.cpu().tolist()
+        extra = dict(zip(names, flat[3:], strict=True))
         return UpdateStats(
-            policy_loss=total_pol,
-            value_loss=total_val,
-            entropy=total_ent,
-            approx_kl=approx_kl,
-            explained_variance=ev,
-            extra={
-                "gate_off_frac": gate_off,
-                "iw_max": iw_max,
-                "iw_mean": iw_mean,
-                "pterm_max": pterm_max,
-                "grad_norm": gnorm,
-            },
+            policy_loss=flat[0],
+            value_loss=flat[1],
+            entropy=flat[2],
+            approx_kl=float((old_logp - new_logp.detach()).mean().item()),
+            clip_frac=extra.pop("clip_frac", 0.0),
+            explained_variance=explained_variance(returns, values.detach()),
+            extra=extra,
         )
 
 
@@ -390,7 +315,6 @@ def safe_log(x: float) -> float:
 
 
 __all__ = [
-    "NNACHUpdate",
-    "NNPPOUpdate",
+    "NNActorCriticUpdate",
     "safe_log",
 ]

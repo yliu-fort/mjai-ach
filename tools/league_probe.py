@@ -85,8 +85,17 @@ def run_arm(
     eval_every_env_steps: int,
     root: Path = PROBE_ROOT,
     progress_bar: bool = False,
+    device: str | None = None,
 ) -> Path:
+    """Train one arm; ``device`` overrides the config's (None keeps it).
+
+    "cpu" is the right answer for these games: the rollout asks the policy for
+    ONE decision at a time, so a small MLP forward is pure launch-and-sync
+    overhead on a GPU (measured 2809 env-steps/s on CPU vs 441 on CUDA for
+    Liar's Dice).
+    """
     out = arm_dir(root, game, mode, seed)
+    overrides: dict[str, object] = {} if device is None else {"device": device}
     cfg = dataclasses.replace(
         load_arm_config(game, mode),
         seed=seed,
@@ -99,6 +108,7 @@ def run_arm(
         league_main_save_every_rounds=25,
         verbose=False,
         progress_bar=progress_bar,
+        **overrides,  # type: ignore[arg-type]
     )
     run_experiment(cfg)
     (out / "DONE").write_text("ok\n", encoding="utf-8")

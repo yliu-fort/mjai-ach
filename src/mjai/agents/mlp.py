@@ -132,11 +132,37 @@ class MLPSharedActorCritic(nn.Module, Policy):
             logits, _ = self.forward(obs_t)
             return [logits[0, a].item() for a in legal_actions]
 
+    def action_logits_batch(self, obs_batch: Any, legal_mask: Any) -> Any:
+        """One forward over the whole batch (see :meth:`Policy.action_logits_batch`).
+
+        The default implementation would issue one forward plus one device sync
+        per legal action per row; exact eval calls this with every info state in
+        the game, so that path is ~4 orders of magnitude of Python and CUDA-sync
+        overhead around a single small matmul.
+        """
+        import numpy as np
+
+        mask = np.asarray(legal_mask, dtype=bool)
+        with torch.no_grad():
+            obs_t = torch.as_tensor(np.asarray(obs_batch, dtype=np.float32), device=self.device)
+            logits, _ = self.forward(obs_t)
+            out: Any = logits.float().cpu().numpy()
+        out[~mask] = -np.inf
+        return out
+
     def _masked_log_probs(self, logits: torch.Tensor, legal_actions: list[int]) -> torch.Tensor:
-        """Full-space log-probs with illegal actions masked to -inf-probability."""
+        """Full-space log-probs with illegal actions masked to -inf-probability.
+
+        The legal set is unmasked with ONE ``index_fill_`` rather than a Python
+        loop of ``mask[..., a] = 0.0``. Each of those assignments was a separate
+        host->device scalar copy plus kernel launch, so the loop cost one
+        transfer per legal action at every decision point in the rollout — the
+        single largest source of host<->device traffic in the pipeline (mean
+        7.4 legal actions on Liar's Dice). Same mask, same numbers.
+        """
         mask = torch.full_like(logits, MASK_VALUE)
-        for a in legal_actions:
-            mask[..., a] = 0.0
+        idx = torch.as_tensor(legal_actions, dtype=torch.long, device=logits.device)
+        mask.index_fill_(-1, idx, 0.0)
         masked = logits + mask
         return torch.log_softmax(masked, dim=-1)
 

@@ -7,13 +7,17 @@ Reads an :class:`ExperimentConfig` (loaded from YAML), builds the appropriate
 Trainer (mirror or league), runs the train loop for N steps, snapshots the main
 policy periodically to disk via the canonical ckpt manifest, and logs scalars
 to a TensorBoard SummaryWriter (AGENTS.md §1 D9: TensorBoard only).
+
+The config schema and the policy/rule/controller builders live in
+:mod:`mjai.scripts.experiment_build` (§3 line cap) and are re-exported here,
+so ``from mjai.scripts.experiment import ExperimentConfig, run_experiment``
+remains the entry point.
 """
 
 from __future__ import annotations
 
 import json
 import random
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -21,226 +25,34 @@ from torch.utils.tensorboard import SummaryWriter
 
 from mjai.agents.base import Policy
 from mjai.agents.ckpt_io import CheckpointManifest, write_checkpoint
-from mjai.algos.controller import MirrorSelfPlay, SelfPlayController, Trainer
-from mjai.algos.tabular_updates import TabularACHUpdate, TabularPPOUpdate
+from mjai.algos.controller import Trainer
 from mjai.algos.transition import UpdateStats
-from mjai.algos.update_rule import AlgoConfig, UpdateRule
 from mjai.games.loader import GameSpec, load_game
-from mjai.league.league_controller import LeagueSelfPlay
-from mjai.pipeline.rollout import RolloutConfig, RolloutWorkerCore
+from mjai.scripts.experiment_build import (
+    ALGO_THETA,
+    ExperimentConfig,
+    build_controller,
+    build_policy,
+    build_update_rule,
+    resolve_theta,
+)
 from mjai.scripts.experiment_eval import (
     build_eval_row,
     log_eval_scalars,
     print_eval_row,
     write_curve,
 )
-from mjai.scripts.experiment_league import build_league_manager, log_league_health
+from mjai.scripts.experiment_league import log_league_health
 
-
-@dataclass(frozen=True)
-class ExperimentConfig:
-    """All knobs for one experiment (one cell of the 2x2 matrix).
-
-    Env-step mode (paper Appendix G protocol, p25-26): when ``total_env_steps`` is
-    set, the train loop runs until that many decision-point samples have been
-    collected (paper: 1e7) and evaluates every ``eval_every_env_steps``
-    env-steps (paper: 1e5). When ``total_env_steps`` is None, the legacy
-    round-based fields (``n_steps`` / ``eval_every_steps`` /
-    ``save_every_steps``) drive the loop instead. One env-step = one sampled
-    decision point = one batch transition (spec assumption A2).
-    """
-
-    game: str  # short name, e.g. "kuhn"
-    algo: str  # "ppo" | "ach"
-    self_play_mode: str  # "mirror" | "league"
-    policy_kind: str = "tabular"  # "tabular" | "mlp"
-    n_steps: int = 500
-    episodes_per_round: int = 50
-    save_every_steps: int = 100
-    eval_every_steps: int = 100
-    # When True, run_experiment prints per-step training stats and per-eval
-    # equilibrium metrics so the notebook / CLI shows live progress.
-    verbose: bool = False
-    # tqdm bar over env-steps in the train loop (notebooks); off by default so
-    # batch/CI runs and unit tests stay quiet.
-    progress_bar: bool = False
-    seed: int = 0
-    out_dir: str = "runs/default"
-    # When True, evaluate the current policy every ``eval_every_steps`` and
-    # append to train_curve.json. Required for the notebook's training-curve
-    # plots (AGENTS.md Fig 2 reproduction). Off by default to keep fast smoke
-    # runs cheap. In env-step mode evaluation always runs (paper protocol).
-    eval_during_training: bool = False
-    # Algo + rollout + league sub-configs are built in code from these scalars
-    # (kept flat here for YAML simplicity; richer configs can extend later).
-    learning_rate: float = 0.0001  # NN-tuned; tabular overrides at call site
-    entropy_coef: float = 0.05  # NN-tuned; paper ACH uses beta=1e-2 (p28 Table 8)
-    hedge_eta: float | None = None  # tabular ACH (CFR+ wrapper) only
-    clip_eps: float = 0.2  # PPO only
-    league_capacity: int = 16
-    # ---- League strategy knobs (defaults mirror LeagueConfig/LeagueMix; F2) ----
-    league_mix_current_main: float = 0.5  # P(opponent = live main), main + league-exploiter
-    league_mix_history: float = 0.3  # P(opponent = past main snapshot from pool)
-    league_mix_exploiter: float = 0.2  # P(opponent = promoted exploiter from pool)
-    league_main_exploiter_promo: float = 0.55  # promote main-exploiter at this WR vs main
-    league_league_exploiter_promo: float = 0.55  # promote league-exploiter at this WR
-    league_exploiter_share: float = 0.70  # pool fraction league-exploiter must beat
-    league_promo_window: int = 20  # rolling win-rate window size (episodes)
-    league_reset_mode: str = "to_main"  # exploiter reset after promotion: to_main|random
-    # Main-snapshot cadence for the league pool, counted in MAIN COLLECT ROUNDS
-    # (B3; under the default 1:2 role schedule, every third collect is a main
-    # round). Independent of ``save_every_steps`` (legacy round-mode disk
-    # checkpoint cadence) — reusing that knob coupled pool history to an
-    # unrelated unit and starved the pool at probe scale.
-    league_main_save_every_rounds: int = 200
-    # ---- MLP architecture (paper p25: 1x128 FC + ReLU, two linear heads) ----
-    hidden_sizes: list[int] = field(default_factory=lambda: [128])
-    activation: str = "relu"  # "relu" | "tanh"
-    # Explicit torch device override (e.g. "cpu", "cuda:0"); None = gpu_assert
-    # resolution (GPU default, fail loudly unless --cpu / MJAI_CPU=1; D6).
-    device: str | None = None
-    # ---- AlgoConfig wiring (AGENTS.md §9; ACH defaults from p27-28) ----
-    value_coef: float = 0.5  # paper ACH alpha=2.0 <=> value_coef=1.0 (alpha/2 * MSE form)
-    gae_lambda: float = 0.95
-    max_grad_norm: float = 0.5  # <=0 disables; paper mentions no clipping
-    optimizer: str | None = None  # None = per-algo default (ach->sgd, ppo->adam)
-    eta: float = 1.0  # hedge coefficient eta(s) (p27 Table 7)
-    l_th: float = 2.0  # one-sided logit gate threshold (p28 Table 8)
-    ratio_eps: float = 0.5  # ratio gate; vacuous when synchronous (p28)
-    # Default ACH shape since docs/reproduce_report.md §6.5: trunk LayerNorm
-    # supplies logit-scale stability, so gate and loss body both use the raw
-    # logit. Set all three to the old values for the pre-LayerNorm behavior.
-    loss_centered_logits: bool = False  # True = mean-centered logit in the ACH loss
-    gate_centered_logits: bool = False  # True = ACH gate on the mean-centered logit
-    trunk_layernorm: bool = True  # LayerNorm at the torso end (normalizes features)
-    centered_mean_legal_only: bool = False  # ACH y_bar over legal actions only (A5 probe)
-    # ---- Sampling / env-step protocol (paper: batch 64, 1e5 eval, 1e7 total) ----
-    target_samples: int | None = None  # per-round batch size in samples (p28: 64)
-    total_env_steps: int | None = None  # set -> env-step mode (paper: 1e7)
-    eval_every_env_steps: int = 100000  # paper p25: evaluate every 1e5 steps
-    # ---- Equilibrium eval estimator (AGENTS.md §9; mjai.eval.sampled_nash) ----
-    # "exact" walks the full game tree (open_spiel nash_conv) — infeasible for
-    # oshi_zumo-scale games; "sampled" uses a Monte-Carlo approximate best
-    # response with a per-player budget of eval_mc_samples episodes per eval.
-    # The eval seed is cfg.seed itself (common random numbers across the curve
-    # => reproducible, lower-variance eval-to-eval comparisons).
-    eval_estimator: str = "exact"
-    eval_mc_samples: int = 400
-
-    def __post_init__(self) -> None:
-        # League knob validation (AGENTS.md §9: invalid config fails loudly).
-        total = self.league_mix_current_main + self.league_mix_history + self.league_mix_exploiter
-        if abs(total - 1.0) > 1e-6:
-            raise ValueError(f"league mix weights must sum to 1.0 (tolerance 1e-6), got {total}")
-        if self.league_reset_mode not in ("to_main", "random"):
-            raise ValueError(
-                f"bad league_reset_mode {self.league_reset_mode!r}; want to_main|random"
-            )
-        if self.eval_estimator not in ("exact", "sampled"):
-            raise ValueError(f"bad eval_estimator {self.eval_estimator!r}; want exact|sampled")
-        if self.eval_mc_samples < 16:
-            raise ValueError(
-                f"eval_mc_samples must be >= 16 for the derived probe/match budgets, "
-                f"got {self.eval_mc_samples}"
-            )
-
-
-def build_policy(spec: GameSpec, cfg: ExperimentConfig, *, seed: int) -> Policy:
-    """Construct the policy of the configured kind for ``spec``.
-
-    MLP runs resolve the device via gpu_assert (D6: GPU by default, loud error
-    unless CPU was explicitly requested via ``--cpu`` / ``MJAI_CPU=1`` or an
-    explicit ``cfg.device``). No silent CPU fallback.
-    """
-    if cfg.policy_kind == "tabular":
-        from mjai.agents.tabular import TabularPolicy
-
-        return TabularPolicy(num_actions=spec.num_actions, seed=seed, temperature=1.0)
-    if cfg.policy_kind == "mlp":
-        from mjai.agents.mlp import ACTIVATIONS, MLPSharedActorCritic
-
-        if cfg.activation not in ACTIVATIONS:
-            raise ValueError(
-                f"Unknown activation {cfg.activation!r}; expected one of {sorted(ACTIVATIONS)}"
-            )
-        return MLPSharedActorCritic(
-            obs_size=spec.obs_size,
-            num_actions=spec.num_actions,
-            hidden_sizes=tuple(cfg.hidden_sizes),
-            activation=ACTIVATIONS[cfg.activation],
-            trunk_layernorm=cfg.trunk_layernorm,
-            device=cfg.device,
-            seed=seed,
-        )
-    raise ValueError(f"Unknown policy_kind: {cfg.policy_kind}")
-
-
-def build_update_rule(policy: Policy, cfg: ExperimentConfig, spec: GameSpec) -> UpdateRule:
-    """Construct the configured UpdateRule on ``policy`` for ``spec``.
-
-    Every AlgoConfig field is wired from the experiment YAML (AGENTS.md §9).
-    The optimizer defaults per endpoint: ACH → SGD (paper H.3, p27), PPO →
-    Adam; an explicit ``cfg.optimizer`` overrides either (NNACHUpdate rejects
-    anything but SGD — paper-faithful, single ACH implementation).
-    """
-    optimizer = cfg.optimizer or ("sgd" if cfg.algo == "ach" else "adam")
-    algo_cfg = AlgoConfig(
-        learning_rate=cfg.learning_rate,
-        value_coef=cfg.value_coef,
-        entropy_coef=cfg.entropy_coef,
-        max_grad_norm=cfg.max_grad_norm,
-        gae_lambda=cfg.gae_lambda,
-        optimizer=optimizer,
-        eta=cfg.eta,
-        l_th=cfg.l_th,
-        ratio_eps=cfg.ratio_eps,
-        loss_centered_logits=cfg.loss_centered_logits,
-        centered_mean_legal_only=cfg.centered_mean_legal_only,
-        gate_centered_logits=cfg.gate_centered_logits,
-    )
-    if cfg.policy_kind == "tabular":
-        if cfg.algo == "ppo":
-            return TabularPPOUpdate(policy, algo_cfg, clip_eps=cfg.clip_eps)  # type: ignore[arg-type]
-        if cfg.algo == "ach":
-            # TabularACHUpdate wraps CFR+ (AGENTS.md §1 D4) and needs the game
-            # spec to build the solver.
-            return TabularACHUpdate(policy, spec, algo_cfg, hedge_eta=cfg.hedge_eta)  # type: ignore[arg-type]
-    elif cfg.policy_kind == "mlp":
-        from mjai.algos.nn_updates import NNACHUpdate, NNPPOUpdate
-
-        if cfg.algo == "ppo":
-            return NNPPOUpdate(policy, algo_cfg, clip_eps=cfg.clip_eps)  # type: ignore[arg-type]
-        if cfg.algo == "ach":
-            return NNACHUpdate(policy, algo_cfg)  # type: ignore[arg-type]
-    raise ValueError(f"Unknown algo/policy combo: {cfg.algo}/{cfg.policy_kind}")
-
-
-def build_controller(
-    spec: GameSpec, policy: Policy, cfg: ExperimentConfig, *, rng: random.Random
-) -> SelfPlayController:
-    """Build the mirror or league controller + return it."""
-    runner = RolloutWorkerCore(
-        spec,
-        learner_player=0,
-        config=RolloutConfig(
-            n_episodes=cfg.episodes_per_round,
-            gae_lambda=cfg.gae_lambda,
-            seed=cfg.seed,
-            target_samples=cfg.target_samples,
-        ),
-    )
-    if cfg.self_play_mode == "mirror":
-        return MirrorSelfPlay(runner)
-    if cfg.self_play_mode == "league":
-
-        def make_policy() -> Policy:
-            return build_policy(spec, cfg, seed=rng.randint(0, 10**9))
-
-        # League wiring (incl. the B1-generic weight copy) lives in
-        # experiment_league (§3.1: keeps this module under the line cap).
-        mgr = build_league_manager(policy, make_policy, cfg, rng=rng)
-        return LeagueSelfPlay(mgr, runner, episodes_per_round=cfg.episodes_per_round, rng=rng)
-    raise ValueError(f"Unknown self_play_mode: {cfg.self_play_mode}")
+__all__ = [
+    "ALGO_THETA",
+    "ExperimentConfig",
+    "build_controller",
+    "build_policy",
+    "build_update_rule",
+    "resolve_theta",
+    "run_experiment",
+]
 
 
 def run_experiment(cfg: ExperimentConfig) -> Path:
@@ -410,6 +222,7 @@ def _eval_and_record(
         eval_estimator=cfg.eval_estimator,
         eval_mc_samples=cfg.eval_mc_samples,
         seed=cfg.seed,
+        eval_exact_backend=cfg.eval_exact_backend,
     )
     curve_rows.append(row)
     write_curve(curve_path, curve_rows)

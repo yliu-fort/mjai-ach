@@ -334,3 +334,60 @@ p24/p28）——按用户决定，改写时修订 D4。
 - **U6 仓库注释声称的本地 sweep 结论**（nn_updates.py:130–133 "sweep found
   l_th=2.0 allows too much saturation"）：仓库内未找到该 sweep 的产物/配置，
   无法验证；改写后以论文 l_th=2.0 为准重跑。
+
+---
+
+## 6. 附录（2026-07-23）：B10 的修订 —— theta 统一接口回归
+
+> 本节**修订 B10 的结论**。原判定为「删除 theta 插值」，理由是 PPO 与 ACH 在
+> **脚手架层**不可调和（论文 ACH 要 SGD + 不归一化 + 单更新；37-details PPO 要
+> Adam + 归一化 + 多 epoch），继续共享意味着至少一端失真。原文同时留了口子：
+> 「或保留为独立实验类，默认不暴露」。
+
+### 6.1 为什么改判
+
+B10 的分析没错，但它假设了「共享脚手架 ⇒ 有一端被迫失真」。实际上失真只发生在
+**脚手架的取值被写死**的时候。把脚手架旋钮化之后：
+
+- 每个 PPO 最佳实践（Adam、优势归一化、多 epoch、梯度裁剪）成为 `AlgoConfig`
+  上的独立字段，可单独开关、单独 A/B；
+- 默认值一律取 **ACH 协议侧**，且**在所有 theta 上生效**——于是 `theta=0` 的臂
+  与 `theta=1` 的臂之间**只差策略项**，PPO-vs-ACH 第一次成为真正的单因子对比；
+- 需要 37-details 版 PPO 时显式打开旋钮，这本身是另一个实验（对脚手架做 A/B，
+  而不是对 theta 做 A/B）；
+- theta>0 时打开论文不用的旋钮会发出 `ACHFidelityWarning`，避免「看起来像复现、
+  其实不是」的静默偏差（§11 不得静默降级）。
+
+### 6.2 论文忠实度如何被保护
+
+D4 的实质约束是「ACH 的策略损失里没有 PPO 截断代理」。统一规则在 `theta=1` 时
+**根本不构造 PPO 项**（短路，不是乘 0），`theta=0` 时同样不构造 ACH 项，因此两个
+端点在数值上与专用实现完全一致。
+
+这一点不是靠论证，而是靠**证据**：`tests/unit/data/nn_updates_golden.json` 由
+**合并前**的双端点代码（commit `32a25e3` 的 `NNACHUpdate` / `NNPPOUpdate`）生成，
+覆盖 6 个场景（shipped ACH、pre-LayerNorm 居中、legal-only 均值、带梯度裁剪、
+legacy PPO+Adam、theta=0 on ACH 脚手架），记录每步 stats 与**更新后的全部参数张量**。
+合并后 `tools/gen_nn_golden.py --check` 必须复现它：
+
+- 6/6 场景的**更新后参数逐比特相同**；
+- 所有既有 stats 逐比特相同；
+- 唯一差异是两个 PPO 场景**新增** `grad_norm` 遥测键（旧 PPO 端点从未计算过），
+  属纯增量可观测性，不改数值。
+
+该 fixture **不再重新生成**（生成器在文件已存在时拒绝覆写）。它一旦需要变更，
+就等于宣告更新规则的数值变了，必须是一次有意的、被审阅的动作。
+
+### 6.3 遗留的真实代价（不掩盖）
+
+- **默认 PPO 变了**：`algo: ppo` 现在默认 SGD + 原始优势 + 单 epoch，而不是
+  Adam + 归一化。这是「PPO 侧默认跟随 ACH」的直接后果，好处是可比性，代价是
+  `algo: ppo` 不再等于文献里的 reference PPO。恢复方式写在
+  `configs/exp/<game>_ppo_mlp_mirror.yaml` 的头部注释里。
+- **梯度尺度随 theta 变化**：ACH 项带无界的 `1/pi_old` 且用未归一化优势，PPO 项是
+  O(1)。凸组合的梯度范数因此随 theta 强烈变化，**有效步长不是常数**。仓库不做任何
+  "配平"（那会改掉两个算法），而是在每次更新记录 `train/grad_norm`，并在
+  `notebooks/theta_*.ipynb` 的诊断面板里画出来——theta–exploitability 曲线的解读
+  必须带上这一条。
+- **tabular 路径不参与**：`policy_kind: tabular` 的 PPO/ACH 仍是两套离散实现
+  （D5，ACH 侧是 CFR+ 包装），`algo: theta` 在 tabular 下直接报错。
