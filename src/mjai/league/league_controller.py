@@ -5,11 +5,21 @@ matchup decisions to a :class:`~mjai.league.manager.LeagueManager`. The Trainer
 treats this exactly like MirrorSelfPlay — it doesn't know or care which is in
 use (AGENTS.md §2, §4).
 
-Each :meth:`collect` round picks a role (rotates through main, main-exploiter,
-league-exploiter), asks the manager for the opponent, plays one batch of
-episodes via the rollout runner, reports results back to the manager (for
-promotion/reset), and returns every kept learner's transitions as
+Each :meth:`collect` round picks a role from a deterministic smooth weighted
+round-robin cycle (default weights main : main-exploiter : league-exploiter =
+1 : 0.5 : 0.5, AlphaStar-style — the main line collects half of all data),
+asks the manager for the opponent, plays one batch of episodes via the rollout
+runner, reports results back to the manager (for promotion/reset), and returns
+every kept learner's transitions as
 :class:`~mjai.algos.controller.LearnerBatch` parts.
+
+Opponent invariants (locked design, asserted every round — no silent
+fallbacks, AGENTS.md §11):
+
+  - the main-exploiter ALWAYS faces the live main;
+  - the league-exploiter ALWAYS faces a pool member, never the live main
+    (the manager's genesis snapshot keeps the pool non-empty from round one);
+  - the main agent mixes live-main, history, and pool exploiters per the mix.
 
 Routing is by PRODUCER IDENTITY, never by physical seat. The rollout runner
 may shuffle which seat the collector occupies each episode (perspective
@@ -30,6 +40,8 @@ correct whichever seat the collector sat in (B2).
 from __future__ import annotations
 
 import random
+from fractions import Fraction
+from math import gcd, lcm
 
 import numpy as np
 
@@ -43,20 +55,81 @@ from mjai.algos.controller import (
 from mjai.league.checkpoint_store import Role
 from mjai.league.manager import LeagueManager
 
+#: Default collection ratio main : main-exploiter : league-exploiter
+#: (AlphaStar-style: the main line collects half of all data).
+DEFAULT_ROLE_WEIGHTS: dict[Role, float] = {
+    Role.MAIN: 1.0,
+    Role.MAIN_EXPLOITER: 0.5,
+    Role.LEAGUE_EXPLOITER: 0.5,
+}
+
+#: Fixed tie-break order for the smooth rotation (determinism, AGENTS.md §5).
+_ROLE_ORDER: tuple[Role, ...] = (Role.MAIN, Role.MAIN_EXPLOITER, Role.LEAGUE_EXPLOITER)
+
+
+def role_cycle(weights: dict[Role, float]) -> list[Role]:
+    """One full smooth weighted round-robin cycle for ``weights``.
+
+    Deterministic and RNG-free (nginx-style smooth WRR): tweaking the
+    collection ratio never perturbs the run's random streams, so ratio sweeps
+    stay comparable across arms (AGENTS.md §5). Weights reduce to exact
+    integer counts and the cycle is the flattest spacing of those counts —
+    e.g. ``{MAIN: 1, MAIN_EXPLOITER: 0.5, LEAGUE_EXPLOITER: 0.5}`` yields
+    ``[MAIN, MAIN_EXPLOITER, LEAGUE_EXPLOITER, MAIN]`` (ratio 2:1:1).
+
+    A zero-weight exploiter simply never appears in the cycle (a legitimate
+    ablation). The main role must carry positive weight: pool snapshots and
+    PFSP bookkeeping are driven by main rounds.
+    """
+    unknown = set(weights) - set(_ROLE_ORDER)
+    if unknown:
+        raise ValueError(f"unknown roles in role weights: {sorted(unknown)!r}")
+    for role, w in weights.items():
+        if w < 0:
+            raise ValueError(f"role weight for {role.value} must be >= 0, got {w}")
+    if weights.get(Role.MAIN, 0.0) <= 0:
+        raise ValueError(
+            "main's role weight must be > 0: pool snapshots and PFSP bookkeeping "
+            "are driven by main collect rounds"
+        )
+    active = {
+        role: frac
+        for role in _ROLE_ORDER
+        if (frac := Fraction(weights.get(role, 0.0)).limit_denominator(1000)) > 0
+    }
+    den = lcm(*(f.denominator for f in active.values()))
+    counts = {role: int(frac * den) for role, frac in active.items()}
+    common = gcd(*counts.values())
+    counts = {role: c // common for role, c in counts.items()}
+    total = sum(counts.values())
+    current = dict.fromkeys(counts, 0)
+    cycle: list[Role] = []
+    for _ in range(total):
+        for role in counts:
+            current[role] += counts[role]
+        # First maximal role in _ROLE_ORDER insertion order wins ties.
+        pick = max(counts, key=lambda role: current[role])
+        current[pick] -= total
+        cycle.append(pick)
+    return cycle
+
 
 class LeagueSelfPlay(SelfPlayController):
-    """Round-robin across main + main-exploiter + league-exploiter.
+    """Weighted rotation across main + main-exploiter + league-exploiter.
 
     Args:
         manager: the :class:`LeagueManager` holding the live policies + pool.
         runner: the rollout back-end (RolloutRunnerProtocol; Step 4's
             RolloutWorkerCore satisfies it).
         episodes_per_round: how many episodes to play per collect() call.
-        role_schedule: optional explicit role order; default rotates
-            [MAIN, MAIN_EXPLOITER, LEAGUE_EXPLOITER] round-robin so each
-            collects every third round.
+        role_schedule: optional explicit role order, cycled through as-is
+            (escape hatch for tests/debugging). When None, the schedule is the
+            smooth-WRR :func:`role_cycle` of ``role_weights``.
+        role_weights: collection ratio per role; default
+            :data:`DEFAULT_ROLE_WEIGHTS` (1 : 0.5 : 0.5). Ignored when
+            ``role_schedule`` is given. Validated by :func:`role_cycle`.
         train_live_opponents: when True, a round whose opponent is itself a
-            live learner (e.g. every main-exploiter round, whose opponent is
+            live learner (every main-exploiter round, whose opponent is
             always the live main) yields a part for that opponent too, so its
             samples update its own weights. When False (default), only the
             collecting role's samples are kept and the live opponent's share
@@ -70,17 +143,16 @@ class LeagueSelfPlay(SelfPlayController):
         *,
         episodes_per_round: int = 50,
         role_schedule: list[Role] | None = None,
+        role_weights: dict[Role, float] | None = None,
         train_live_opponents: bool = False,
         rng: random.Random | None = None,
     ) -> None:
         self.manager = manager
         self.runner = runner
         self.episodes_per_round = episodes_per_round
-        self.role_schedule = role_schedule or [
-            Role.MAIN,
-            Role.MAIN_EXPLOITER,
-            Role.LEAGUE_EXPLOITER,
-        ]
+        self.role_schedule = role_schedule or role_cycle(role_weights or DEFAULT_ROLE_WEIGHTS)
+        if not self.role_schedule:
+            raise ValueError("role_schedule must be non-empty")
         self.train_live_opponents = train_live_opponents
         self.rng = rng or random.Random()
         self._round_idx: int = 0
@@ -120,9 +192,7 @@ class LeagueSelfPlay(SelfPlayController):
                 else self.manager.league_exploiter
             )
         )
-        opponent = self.manager.opponent_for(role)
-        if opponent is None:
-            opponent = self.manager.main  # pool empty at the very start
+        opponent = self._opponent_for_role(role)
 
         # The keep-set, by identity: the collecting role always keeps its own
         # samples; a live-learner opponent's samples are kept only when
@@ -177,6 +247,34 @@ class LeagueSelfPlay(SelfPlayController):
         return stats
 
     # ---- internals ----
+
+    def _opponent_for_role(self, role: Role) -> Policy:
+        """The round's opponent, with the role invariants asserted loudly.
+
+        The main agent may fall back to its own live policy while the pool is
+        young; the exploiters' opponent rules are hard invariants — a violation
+        is a sampler/manager bug, never something to route around (AGENTS.md
+        §11).
+        """
+        opponent = self.manager.opponent_for(role)
+        if role == Role.MAIN:
+            return opponent if opponent is not None else self.manager.main
+        if role == Role.MAIN_EXPLOITER:
+            if opponent is not self.manager.main:
+                raise RuntimeError(
+                    "main-exploiter must face the live main, got "
+                    f"{type(opponent).__name__} — OpponentSampler bug (AGENTS.md §11)."
+                )
+            return opponent
+        # Role.LEAGUE_EXPLOITER: pool members only, never the live main.
+        if opponent is None or opponent is self.manager.main:
+            got = "None (empty pool)" if opponent is None else "the live main"
+            raise RuntimeError(
+                f"league-exploiter must face a pool member, got {got}; the "
+                "LeagueManager's genesis snapshot should keep the pool non-empty "
+                "— sampler/manager bug (AGENTS.md §11)."
+            )
+        return opponent
 
     def _label_for(self, policy: Policy) -> str:
         """The logging label for a kept policy; every kept policy is a live learner."""

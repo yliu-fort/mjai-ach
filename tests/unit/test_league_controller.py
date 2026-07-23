@@ -6,12 +6,13 @@ import random
 
 import pytest
 
-from mjai.agents.base import copy_weights
+from mjai.agents.base import Policy, copy_weights
 from mjai.agents.tabular import TabularPolicy
 from mjai.games.loader import load_game
 from mjai.league.checkpoint_store import Role
-from mjai.league.league_controller import LeagueSelfPlay
+from mjai.league.league_controller import DEFAULT_ROLE_WEIGHTS, LeagueSelfPlay, role_cycle
 from mjai.league.manager import LeagueConfig, LeagueManager
+from mjai.league.opponent_sampler import LeagueMix
 from mjai.pipeline.rollout import RolloutConfig, RolloutWorkerCore
 from mjai.utils import gpu_assert
 
@@ -31,6 +32,7 @@ def _make_league(
     train_live_opponents: bool = False,
     n_episodes: int = 10,
     role_schedule: list[Role] | None = None,
+    role_weights: dict[Role, float] | None = None,
     **cfg_kwargs,
 ):
     spec = load_game(game_name)
@@ -53,6 +55,7 @@ def _make_league(
         runner,
         episodes_per_round=n_episodes,
         role_schedule=role_schedule,
+        role_weights=role_weights,
         train_live_opponents=train_live_opponents,
         rng=random.Random(0),
     )
@@ -66,6 +69,22 @@ def _sole_producer(part_batch):
     idxs = {int(i) for i in part_batch.producer_idx}
     assert len(idxs) == 1, f"part is not producer-homogeneous: {idxs}"
     return part_batch.producers[idxs.pop()]
+
+
+class _SpyRunner:
+    """RolloutRunnerProtocol double: records (learner, opponent) per collect."""
+
+    def __init__(self, inner: RolloutWorkerCore) -> None:
+        self.inner = inner
+        self.calls: list[tuple[Policy, Policy]] = []
+
+    def run_episode(self, learner, opponent, *, keep=None):
+        self.calls.append((learner, opponent))
+        return self.inner.run_episode(learner=learner, opponent=opponent, keep=keep)
+
+    @property
+    def last_episode_count(self) -> int:
+        return self.inner.last_episode_count
 
 
 def test_name_is_league():
@@ -89,23 +108,51 @@ def test_collect_returns_batch_with_learner_transitions():
     assert collected.parts[0].batch.size > 0
 
 
-def test_collect_rotates_through_roles():
-    """The default schedule cycles MAIN -> ME -> LE -> MAIN ..."""
-    ctrl, _mgr, main = _make_league()
+def test_default_weights_cycle_is_smooth_wrr():
+    """1:0.5:0.5 weights -> the deterministic cycle [MAIN, ME, LE, MAIN]."""
+    assert role_cycle(DEFAULT_ROLE_WEIGHTS) == [
+        Role.MAIN,
+        Role.MAIN_EXPLOITER,
+        Role.LEAGUE_EXPLOITER,
+        Role.MAIN,
+    ]
+
+
+def test_collect_rotates_through_the_default_cycle():
+    ctrl, mgr, main = _make_league()
     ctrl.set_learner(main)
-    ctrl.collect()  # round 0 -> MAIN
-    assert ctrl._round_idx == 1
-    ctrl.collect()  # round 1 -> MAIN_EXPLOITER
-    ctrl.collect()  # round 2 -> LEAGUE_EXPLOITER
-    assert ctrl._round_idx == 3
-    ctrl.collect()  # round 3 -> MAIN again
-    assert ctrl._round_idx == 4
+    collectors = [ctrl.collect().parts[0].learner for _ in range(8)]
+    expected = [
+        mgr.main,
+        mgr.main_exploiter,
+        mgr.league_exploiter,
+        mgr.main,
+    ] * 2
+    assert collectors == expected
+
+
+def test_role_weights_zero_exploiter_never_collects():
+    """A zero-weight role is a valid ablation: it simply never gets a round."""
+    ctrl, mgr, main = _make_league(
+        role_weights={Role.MAIN: 1.0, Role.MAIN_EXPLOITER: 0.5, Role.LEAGUE_EXPLOITER: 0.0}
+    )
+    ctrl.set_learner(main)
+    collectors = [ctrl.collect().parts[0].learner for _ in range(6)]
+    assert mgr.league_exploiter not in collectors
+    assert set(map(id, collectors)) == {id(mgr.main), id(mgr.main_exploiter)}
+
+
+def test_role_weights_validation():
+    with pytest.raises(ValueError, match="main's role weight"):
+        role_cycle({Role.MAIN: 0.0, Role.MAIN_EXPLOITER: 0.5, Role.LEAGUE_EXPLOITER: 0.5})
+    with pytest.raises(ValueError, match=">= 0"):
+        role_cycle({Role.MAIN: 1.0, Role.MAIN_EXPLOITER: -0.1})
 
 
 def test_main_rounds_accumulate_snapshots():
     ctrl, mgr, main = _make_league(main_save_every_rounds=2)
     ctrl.set_learner(main)
-    # MAIN is collected every 3rd round; force two MAIN rounds to trigger a snapshot.
+    # 6 rounds of [MAIN, ME, LE, MAIN] => 3 main rounds => >=1 cadence hit.
     for _ in range(6):
         ctrl.collect()
     assert len(mgr.store.by_role(Role.MAIN)) >= 1
@@ -156,6 +203,41 @@ def test_no_shuffle_keeps_collector_in_seat0():
     assert {int(p) for p in part.batch.players} == {0}
 
 
+def test_main_exploiter_round_opponent_is_the_live_main():
+    """The locked role split, asserted at the controller seam."""
+    ctrl, mgr, main = _make_league(role_schedule=[Role.MAIN_EXPLOITER])
+    spy = _SpyRunner(ctrl.runner)
+    ctrl.runner = spy
+    ctrl.set_learner(main)
+    ctrl.collect()
+    assert spy.calls[0][1] is mgr.main
+
+
+def test_league_exploiter_round_opponent_is_a_pool_member_never_live_main():
+    """The locked role split: LE attacks the league's past (its own live main
+    is off-limits); the genesis snapshot keeps the pool non-empty."""
+    ctrl, mgr, main = _make_league(role_schedule=[Role.LEAGUE_EXPLOITER], n_episodes=4)
+    spy = _SpyRunner(ctrl.runner)
+    ctrl.runner = spy
+    ctrl.set_learner(main)
+    for _ in range(5):
+        ctrl.collect()
+    pool_policies = {id(m.policy) for m in mgr.store.members}
+    for _, opponent in spy.calls:
+        assert opponent is not mgr.main
+        assert id(opponent) in pool_policies
+
+
+def test_league_exploiter_facing_live_main_fails_loudly():
+    """No silent fallback: if the manager ever offers the live main to the
+    league-exploiter, the controller raises instead of playing it (§11)."""
+    ctrl, mgr, main = _make_league(role_schedule=[Role.LEAGUE_EXPLOITER])
+    ctrl.set_learner(main)
+    mgr.opponent_for = lambda role: mgr.main  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="pool member"):
+        ctrl.collect()
+
+
 def test_train_live_opponents_routes_the_live_mains_share_too():
     """ME round + live-opponent routing: the main's own transitions form a
     second part bound for the main's rule, instead of being dropped."""
@@ -182,9 +264,13 @@ def test_train_live_opponents_off_drops_the_live_mains_share():
 
 
 def test_self_play_round_keeps_both_seats_as_one_part():
-    """MAIN round with an empty pool: opponent IS the live main, so both
+    """MAIN round vs the live main itself: opponent IS the learner, so both
     seats' transitions belong to it — one part, nothing dropped."""
-    ctrl, mgr, main = _make_league(n_episodes=10, role_schedule=[Role.MAIN])
+    ctrl, mgr, main = _make_league(
+        n_episodes=10,
+        role_schedule=[Role.MAIN],
+        mix=LeagueMix(1.0, 0.0, 0.0),  # always the live-main bucket: deterministic
+    )
     ctrl.set_learner(main)
     collected = ctrl.collect()
     assert len(collected.parts) == 1
@@ -205,13 +291,20 @@ def test_league_runs_full_loop_on_kuhn():
 def test_collect_names_the_role_that_produced_the_batch():
     """Each round reports its own collector, not the main agent.
 
-    This is what lets the Trainer update the right weights: without it, two of
-    every three rounds would apply an exploiter's samples to the main policy.
+    This is what lets the Trainer update the right weights: without it, the
+    exploiter rounds would apply an exploiter's samples to the main policy.
     """
     ctrl, mgr, main = _make_league()
     ctrl.set_learner(main)
     collectors = [ctrl.collect().parts[0].learner for _ in range(6)]
-    expected = [mgr.main, mgr.main_exploiter, mgr.league_exploiter] * 2
+    expected = [
+        mgr.main,
+        mgr.main_exploiter,
+        mgr.league_exploiter,
+        mgr.main,
+        mgr.main,
+        mgr.main_exploiter,
+    ]
     assert collectors == expected
 
 

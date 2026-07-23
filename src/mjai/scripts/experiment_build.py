@@ -20,6 +20,7 @@ from mjai.algos.controller import MirrorSelfPlay, SelfPlayController
 from mjai.algos.tabular_updates import TabularACHUpdate, TabularPPOUpdate
 from mjai.algos.update_rule import AlgoConfig, UpdateRule
 from mjai.games.loader import GameSpec
+from mjai.league.checkpoint_store import Role
 from mjai.league.league_controller import LeagueSelfPlay
 from mjai.pipeline.rollout import RolloutConfig, RolloutWorkerCore
 from mjai.scripts.experiment_league import build_league_manager
@@ -68,31 +69,43 @@ class ExperimentConfig:
     entropy_coef: float = 0.05  # NN-tuned; paper ACH uses beta=1e-2 (p28 Table 8)
     hedge_eta: float | None = None  # tabular ACH (CFR+ wrapper) only
     clip_eps: float = 0.2  # PPO only
-    league_capacity: int = 16
+    league_capacity: int = 16  # pool size; >= 3 (2 slots reserved for exploiters)
     # ---- League strategy knobs (defaults mirror LeagueConfig/LeagueMix; F2) ----
-    league_mix_current_main: float = 0.5  # P(opponent = live main), main + league-exploiter
+    # Opponent mix for the MAIN role. The league-exploiter never faces the live
+    # main: it draws pool members only, history vs pool-exploiters in the same
+    # history:exploiter proportion renormalized (0.3:0.2 -> 60%/40%).
+    league_mix_current_main: float = 0.5  # P(opponent = live main), main role only
     league_mix_history: float = 0.3  # P(opponent = past main snapshot from pool)
     league_mix_exploiter: float = 0.2  # P(opponent = promoted exploiter from pool)
-    league_main_exploiter_promo: float = 0.55  # promote main-exploiter at this WR vs main
-    league_league_exploiter_promo: float = 0.55  # promote league-exploiter at this WR
+    league_main_exploiter_promo: float = 0.70  # promote main-exploiter at this WR vs main
+    league_league_exploiter_promo: float = 0.70  # promote league-exploiter at this WR
     league_exploiter_share: float = 0.70  # pool fraction league-exploiter must beat
     league_promo_window: int = 20  # rolling win-rate window size (episodes)
     league_reset_mode: str = "to_main"  # exploiter reset after promotion: to_main|random
+    # Data-collection ratio main : main-exploiter : league-exploiter
+    # (AlphaStar-style default 1 : 0.5 : 0.5 — the main line collects half of
+    # all samples). Turned into a deterministic smooth-WRR cycle
+    # (mjai.league.league_controller.role_cycle); main must be > 0, an
+    # exploiter may be 0 (ablation: that role never collects).
+    league_role_weight_main: float = 1.0
+    league_role_weight_main_exploiter: float = 0.5
+    league_role_weight_league_exploiter: float = 0.5
     # Per-episode seat shuffle for the collecting role (perspective coverage):
     # without it a learner only ever sees the game from seat 0, so frozen
     # opponents are never faced from seat 1 — the policy is half-blind. Routing
     # is by producer identity, so shuffled episodes still train the right rule.
     league_seat_shuffle: bool = True
     # When True, a round whose opponent is itself a live learner (every
-    # main-exploiter round faces the live main; ~half of league-exploiter
-    # rounds too) also routes that opponent's transitions to ITS OWN update
+    # main-exploiter round faces the live main) also routes that opponent's
+    # transitions to ITS OWN update
     # rule — on-policy anti-exploiter data instead of dropped samples. This
     # changes the league dynamics (the main line patches exploiter-found holes
-    # faster), so it is an explicit knob, off by default.
+    # faster), so it is an explicit knob, off by default. (The league-exploiter
+    # never faces a live learner: its opponents are always frozen pool members.)
     league_train_live_opponents: bool = False
     # Main-snapshot cadence for the league pool, counted in MAIN COLLECT ROUNDS
-    # (B3; under the default 1:2 role schedule, every third collect is a main
-    # round). Independent of ``save_every_steps`` (legacy round-mode disk
+    # (B3; under the default 1:0.5:0.5 role weights, every other collect is a
+    # main round). Independent of ``save_every_steps`` (legacy round-mode disk
     # checkpoint cadence) — reusing that knob coupled pool history to an
     # unrelated unit and starved the pool at probe scale.
     league_main_save_every_rounds: int = 200
@@ -160,6 +173,25 @@ class ExperimentConfig:
         if self.league_reset_mode not in ("to_main", "random"):
             raise ValueError(
                 f"bad league_reset_mode {self.league_reset_mode!r}; want to_main|random"
+            )
+        if self.league_capacity < 3:
+            raise ValueError(
+                f"league_capacity must be >= 3 (2 pool slots are reserved for the "
+                f"exploiters; the main-history quota capacity-2 must be non-empty), "
+                f"got {self.league_capacity}"
+            )
+        role_weights = {
+            "main": self.league_role_weight_main,
+            "main_exploiter": self.league_role_weight_main_exploiter,
+            "league_exploiter": self.league_role_weight_league_exploiter,
+        }
+        for name, w in role_weights.items():
+            if w < 0:
+                raise ValueError(f"league_role_weight_{name} must be >= 0, got {w}")
+        if self.league_role_weight_main <= 0:
+            raise ValueError(
+                "league_role_weight_main must be > 0: pool snapshots and PFSP "
+                "bookkeeping are driven by main collect rounds"
             )
         if self.eval_estimator not in ("exact", "sampled"):
             raise ValueError(f"bad eval_estimator {self.eval_estimator!r}; want exact|sampled")
@@ -312,6 +344,11 @@ def build_controller(
             mgr,
             runner,
             episodes_per_round=cfg.episodes_per_round,
+            role_weights={
+                Role.MAIN: cfg.league_role_weight_main,
+                Role.MAIN_EXPLOITER: cfg.league_role_weight_main_exploiter,
+                Role.LEAGUE_EXPLOITER: cfg.league_role_weight_league_exploiter,
+            },
             train_live_opponents=cfg.league_train_live_opponents,
             rng=rng,
         )

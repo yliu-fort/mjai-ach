@@ -40,22 +40,30 @@ hedge_eta: null
 clip_eps: 0.2
 device: null
 # ---- League knobs (defaults = LeagueConfig/LeagueMix code defaults) ----
-league_capacity: 16            # opponent-pool size bound (FIFO-evict mains first)
-# Opponent mix for the main + league-exploiter roles; the three weights must
-# sum to 1.0 (±1e-6, validated loudly). PFSP picks within the drawn bucket.
+league_capacity: 16            # pool size bound (history quota 14 + 1 slot per exploiter)
+# Opponent mix for the MAIN role; the three weights must sum to 1.0 (±1e-6,
+# validated loudly). PFSP picks within the drawn bucket. The league-exploiter
+# never faces the live main: it draws pool members only, history vs
+# pool-exploiters in the same 0.3:0.2 proportion renormalized (60%/40%).
 league_mix_current_main: 0.5   # P(opponent = live main policy)
 league_mix_history: 0.3        # P(opponent = past main snapshot from the pool)
 league_mix_exploiter: 0.2      # P(opponent = promoted exploiter from the pool)
 # Promotion thresholds (rolling win-rates over league_promo_window episodes).
-league_main_exploiter_promo: 0.55    # promote main-exploiter at this WR vs main
-league_league_exploiter_promo: 0.55  # promote league-exploiter at this WR vs pool
+league_main_exploiter_promo: 0.70    # promote main-exploiter at this WR vs main
+league_league_exploiter_promo: 0.70  # promote league-exploiter at this WR vs pool
 league_exploiter_share: 0.70         # pool fraction league-exploiter must beat
 league_promo_window: 20              # rolling win-rate window size (episodes)
+# Data-collection ratio main : main-exploiter : league-exploiter, turned into a
+# deterministic smooth-WRR cycle (1:0.5:0.5 -> [main, ME, LE, main]). An
+# exploiter weight of 0 is a valid ablation (that role never collects).
+league_role_weight_main: 1.0
+league_role_weight_main_exploiter: 0.5
+league_role_weight_league_exploiter: 0.5
 # Exploiter weight reset after promotion: "to_main" (locked default) | "random".
 league_reset_mode: to_main
 # Main-snapshot cadence for the pool, counted in MAIN COLLECT ROUNDS (B3;
-# independent of save_every_steps). Under the 1:2 role schedule every third
-# collect is a main round, so 200 ≈ 600 total rounds between snapshots.
+# independent of save_every_steps). Under the 1:0.5:0.5 role weights every
+# other collect is a main round, so 200 ≈ 400 total rounds between snapshots.
 league_main_save_every_rounds: 200
 # Logit-scale handling (docs/reproduce_report.md §6.5). A LayerNorm at the
 # torso end normalizes the features feeding both heads, so the gate and the

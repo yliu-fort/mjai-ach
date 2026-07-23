@@ -3,15 +3,25 @@
 Holds the live set of saved policies the league samples opponents from. Three
 roles (AGENTS.md §1 D10 / Step 6 design):
 
-  - ``main``           — past snapshots of the main agent (history), FIFO-evicted.
+  - ``main``           — past snapshots of the main agent (history), FIFO-bounded.
   - ``main_exploiter`` — promoted when it beat the current main at >=threshold.
   - ``league_exploiter`` — promoted when it beats >threshold of the pool.
 
-Eviction policy (AGENTS.md §8): history is FIFO-bounded; exploiters are rare and
-valuable so we keep the top-N by win-rate against the current main rather than
-auto-evicting them. Weak refs are NOT used for live pool members (we need them
-immediately for sampling); the store is size-bounded instead, which is the
-memory discipline.
+Quota policy (locked design): the pool is divided into a main-history quota of
+``capacity - 2`` members plus exactly one reserved slot per exploiter role.
+
+  - Adding a MAIN snapshot evicts the oldest MAIN snapshot once the history
+    quota is exceeded — exploiters are never touched by main eviction.
+  - Adding an exploiter REPLACES the existing member of the same role (at most
+    one snapshot per exploiter role, ever): the old snapshot is dropped, and no
+    main-history member is evicted to make room. Promotion therefore never
+    erases the main line's past.
+
+The bound ``len(pool) <= capacity`` holds by construction: mains are capped on
+every main add, each exploiter role is capped at one on every exploiter add.
+The store is size-bounded instead of weak-ref'd (AGENTS.md §8): live pool
+members are needed immediately for sampling, so bounding is the memory
+discipline.
 """
 
 from __future__ import annotations
@@ -21,6 +31,11 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from mjai.agents.base import Policy
+
+#: Slots reserved for exploiters (one per exploiter role); the rest is history.
+EXPLOITER_SLOTS = 2
+#: Smallest legal capacity: history quota must fit at least one member.
+MIN_CAPACITY = EXPLOITER_SLOTS + 1
 
 
 class Role(StrEnum):
@@ -46,16 +61,21 @@ class PoolMember:
 
 
 class CheckpointStore:
-    """The opponent pool, size-bounded with role-aware eviction.
+    """The opponent pool, size-bounded with role-aware quotas.
 
     Args:
-        capacity: max pool size (AGENTS.md Step 6: default 16).
+        capacity: max pool size (AGENTS.md Step 6: default 16). Must be >=
+            :data:`MIN_CAPACITY` so the main-history quota is non-empty.
     """
 
     def __init__(self, *, capacity: int = 16) -> None:
-        if capacity <= 0:
-            raise ValueError(f"capacity must be positive, got {capacity}")
+        if capacity < MIN_CAPACITY:
+            raise ValueError(
+                f"capacity must be >= {MIN_CAPACITY} (main-history quota of "
+                f"capacity-{EXPLOITER_SLOTS} must fit at least one member), got {capacity}"
+            )
         self.capacity = capacity
+        self.main_quota = capacity - EXPLOITER_SLOTS
         self._members: list[PoolMember] = []
         self._next_id: int = 0
 
@@ -73,8 +93,8 @@ class CheckpointStore:
         return [m for m in self._members if m.role == role]
 
     def main_history(self) -> list[PoolMember]:
-        """Past main checkpoints, oldest-first."""
-        return sorted(self.by_role(Role.MAIN), key=lambda m: m.created_at)
+        """Past main checkpoints, oldest-first (member_id breaks clock ties)."""
+        return sorted(self.by_role(Role.MAIN), key=lambda m: (m.created_at, m.member_id))
 
     def exploiters(self) -> list[PoolMember]:
         return self.by_role(Role.MAIN_EXPLOITER) + self.by_role(Role.LEAGUE_EXPLOITER)
@@ -82,43 +102,39 @@ class CheckpointStore:
     # ---- mutation ----
 
     def add(self, policy: Policy, role: Role, *, train_step: int = 0) -> PoolMember:
-        """Add a policy to the pool, then evict if over capacity.
+        """Add a policy to the pool under its role's quota; returns the member.
 
-        Returns the added member. Caller is responsible for the promotion
-        criterion (this method just stores + bounds).
+        Exploiter adds replace the existing same-role member in place (capped
+        at one per role) and never evict main history. Main adds FIFO-evict
+        the oldest main once the history quota is exceeded and never touch
+        exploiters. The caller is responsible for the promotion criterion
+        (this method just stores + enforces the quotas).
         """
+        if role != Role.MAIN:
+            self._remove_all_of_role(role)
         member = PoolMember(
             policy=policy, role=role, train_step=train_step, member_id=self._next_id
         )
         self._next_id += 1
         self._members.append(member)
-        self._evict_if_needed()
+        if role == Role.MAIN:
+            self._evict_history_over_quota()
         return member
 
-    def _evict_if_needed(self) -> None:
-        """Enforce the capacity, evicting history (FIFO) before exploiters."""
-        while len(self._members) > self.capacity:
-            # Prefer evicting the oldest MAIN checkpoint.
-            mains = self.main_history()
-            if mains:
-                self._members.remove(mains[0])
-                continue
-            # No main left to evict — trim the weakest exploiter.
-            exploiters = self.exploiters()
-            if len(exploiters) <= 1:
-                # Only exploiters remain and we're still over capacity; keep the
-                # newest one (the pool can't go empty).
-                newest = max(exploiters, key=lambda m: m.created_at, default=None)
-                self._members = [newest] if newest is not None else []
-                break
-            weakest = min(exploiters, key=self._exploiter_score)
-            self._members.remove(weakest)
+    def _evict_history_over_quota(self) -> None:
+        """FIFO-evict the oldest MAIN snapshots beyond the history quota."""
+        while len(self.by_role(Role.MAIN)) > self.main_quota:
+            self._remove(self.main_history()[0])
 
-    def _exploiter_score(self, m: PoolMember) -> float:
-        """Higher = more worth keeping. Mean win rate; -inf if unmeasured."""
-        if not m.win_rates:
-            return float("-inf")
-        return sum(m.win_rates.values()) / len(m.win_rates)
+    def _remove_all_of_role(self, role: Role) -> None:
+        for m in self.by_role(role):
+            self._remove(m)
+
+    def _remove(self, member: PoolMember) -> None:
+        """Drop ``member`` and scrub win-rate rows that point at its id."""
+        self._members.remove(member)
+        for m in self._members:
+            m.win_rates.pop(member.member_id, None)
 
     def update_win_rate(self, member_id: int, opponent_id: int, win_rate: float) -> None:
         """Record/refresh the cached win rate of ``member`` vs ``opponent``."""

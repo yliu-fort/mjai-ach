@@ -43,13 +43,18 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tb_eval import read_tags
 
-# Role schedule of LeagueSelfPlay, in collect() order. Update index i (1-based,
-# as logged) ran role_schedule[(i - 1) % 3], so MAIN sits at i % 3 == 1.
+from mjai.league.checkpoint_store import Role
+from mjai.league.league_controller import role_cycle
+
+# Display order for the per-role tables: columns read main -> main-exploiter ->
+# league-exploiter everywhere ("main" and "main_exploiter" share a prefix, so
+# they cannot be abbreviated by splitting).
 ROLE_ORDER = ("main", "main_exploiter", "league_exploiter")
-ROLE_PERIOD = len(ROLE_ORDER)
-# Distinct short labels for the compact per-role table ("main" and
-# "main_exploiter" share a prefix, so they cannot be abbreviated by splitting).
 ROLE_ABBREV = {"main": "MAIN", "main_exploiter": "ME", "league_exploiter": "LE"}
+# League runs written before the role-weight knobs existed used this fixed
+# 1:1:1 collect rotation; newer runs carry league_role_weight_* in config.json
+# and get their smooth-WRR cycle reconstructed from it (see _role_cycle).
+LEGACY_ROLE_CYCLE = ("main", "main_exploiter", "league_exploiter")
 
 # A batch is off-policy if its behavior log-probs disagree with the updating
 # policy's. Same tolerance as mjai.algos.nn_updates.OFF_POLICY_TOL (2e-6: 1.2x
@@ -115,8 +120,31 @@ def _identity(run_dir: Path) -> dict[str, Any]:
         "league_capacity",
         "league_main_save_every_rounds",
         "league_promo_window",
+        "league_role_weight_main",
+        "league_role_weight_main_exploiter",
+        "league_role_weight_league_exploiter",
     )
     return {"run": str(run_dir), **{k: cfg.get(k) for k in keys}}
+
+
+def _role_cycle(ident: dict[str, Any]) -> tuple[str, ...]:
+    """The run's collect-round role cycle, reconstructed from its config.
+
+    Update index i (1-based, as logged) ran ``cycle[(i - 1) % len(cycle)]``.
+    Mirror runs have no league schedule -> empty tuple (the per-role split is
+    skipped); league runs pre-dating the role-weight knobs fall back to the
+    legacy 1:1:1 rotation.
+    """
+    if ident.get("self_play_mode") != "league":
+        return ()
+    weights = {
+        Role.MAIN: ident.get("league_role_weight_main"),
+        Role.MAIN_EXPLOITER: ident.get("league_role_weight_main_exploiter"),
+        Role.LEAGUE_EXPLOITER: ident.get("league_role_weight_league_exploiter"),
+    }
+    if any(w is None for w in weights.values()):
+        return LEGACY_ROLE_CYCLE
+    return tuple(r.value for r in role_cycle({r: float(w) for r, w in weights.items()}))
 
 
 def _off_policy_series(
@@ -133,31 +161,6 @@ def _off_policy_series(
     if "train/approx_kl" in series:
         return [(s, abs(v) > KL_TOL) for s, v in series["train/approx_kl"]], "approx_kl (fallback)"
     return [], "none"
-
-
-def _role_phase(flags: list[tuple[int, bool]]) -> dict[int, str] | None:
-    """Map residue (step % 3) -> role name, or None if the pattern is not clean.
-
-    Self-validating on purpose: rather than trusting that the schedule is the
-    default 3-role rotation, it requires exactly one residue to be essentially
-    all-on-policy and the other two to be predominantly off-policy. Anything
-    else (mirror, a custom schedule, an already-fixed league) returns None and
-    the per-role split is simply skipped instead of being invented.
-    """
-    if not flags:
-        return None
-    rates: dict[int, float] = {}
-    for residue in range(ROLE_PERIOD):
-        vals = [off for step, off in flags if step % ROLE_PERIOD == residue]
-        if not vals:
-            return None
-        rates[residue] = sum(vals) / len(vals)
-    clean = [r for r, rate in rates.items() if rate <= 0.01]
-    dirty = [r for r, rate in rates.items() if rate >= 0.50]
-    if len(clean) != 1 or len(dirty) != ROLE_PERIOD - 1:
-        return None
-    main = clean[0]
-    return {(main + i) % ROLE_PERIOD: name for i, name in enumerate(ROLE_ORDER)}
 
 
 def _budget(series: dict[str, list[tuple[int, float]]], ident: dict[str, Any]) -> dict[str, Any]:
@@ -193,7 +196,9 @@ def _budget(series: dict[str, list[tuple[int, float]]], ident: dict[str, Any]) -
     return out
 
 
-def _league_health(series: dict[str, list[tuple[int, float]]], updates: int) -> dict[str, Any]:
+def _league_health(
+    series: dict[str, list[tuple[int, float]]], updates: int, cycle: tuple[str, ...]
+) -> dict[str, Any]:
     def last(tag: str) -> float | None:
         pts = series.get(tag)
         return pts[-1][1] if pts else None
@@ -203,7 +208,8 @@ def _league_health(series: dict[str, list[tuple[int, float]]], updates: int) -> 
         return statistics.mean(v for _, v in pts) if pts else None
 
     promotions = last("league/promotions_total")
-    exploiter_rounds = updates * (ROLE_PERIOD - 1) / ROLE_PERIOD if updates else 0
+    exploiter_share = sum(1 for r in cycle if r != "main") / len(cycle) if cycle else 0.0
+    exploiter_rounds = updates * exploiter_share if updates else 0
     return {
         "pool_size": last("league/pool_size"),
         "pool_composition": {
@@ -278,8 +284,10 @@ def diagnose(run_dir: Path) -> dict[str, Any]:
     series = read_tags(run_dir / "tb", TAGS)
     ident = _identity(run_dir)
     flags, source = _off_policy_series(series)
-    phase = _role_phase(flags)
     budget = _budget(series, ident)
+    cycle = _role_cycle(ident)
+    # Round index i (1-based, as logged) ran cycle[(i - 1) % len(cycle)].
+    role_at = (lambda s: cycle[(s - 1) % len(cycle)]) if cycle else None
 
     on_policy: dict[str, Any] = {
         "source": source,
@@ -289,30 +297,27 @@ def diagnose(run_dir: Path) -> dict[str, Any]:
     if "train/approx_kl" in series:
         nonzero = [abs(v) for _, v in series["train/approx_kl"] if abs(v) > KL_TOL]
         on_policy["abs_kl_when_off_policy"] = _stats(nonzero) if nonzero else None
-    # Both per-role tables are keyed in ROLE_ORDER, not residue order, so the
-    # columns read main -> main-exploiter -> league-exploiter everywhere.
-    residue_of = {role: r for r, role in phase.items()} if phase else {}
-    if phase:
+    # Both per-role tables are keyed in ROLE_ORDER, so the columns read
+    # main -> main-exploiter -> league-exploiter everywhere.
+    if role_at is not None and flags:
         on_policy["by_role"] = {
             role: {
-                "n": sum(1 for s, _ in flags if s % ROLE_PERIOD == residue_of[role]),
-                "off_policy_fraction": statistics.mean(
-                    [float(off) for s, off in flags if s % ROLE_PERIOD == residue_of[role]]
-                ),
+                "n": len(role_flags),
+                "off_policy_fraction": statistics.mean(float(off) for off in role_flags),
             }
             for role in ROLE_ORDER
+            if (role_flags := [off for s, off in flags if role_at(s) == role])
         }
 
     per_role: dict[str, Any] = {}
-    if phase:
+    if role_at is not None:
         for tag in PER_ROLE_TAGS:
             if tag not in series:
                 continue
             per_role[tag.removeprefix("train/")] = {
-                role: statistics.mean(
-                    [v for s, v in series[tag] if s % ROLE_PERIOD == residue_of[role]]
-                )
+                role: statistics.mean(v for s, v in series[tag] if role_at(s) == role)
                 for role in ROLE_ORDER
+                if any(role_at(s) == role for s, _ in series[tag])
             }
 
     card: dict[str, Any] = {
@@ -320,7 +325,7 @@ def diagnose(run_dir: Path) -> dict[str, Any]:
         "on_policy": on_policy,
         "budget": budget,
         "per_role_mean": per_role or None,
-        "league": _league_health(series, budget["updates"]),
+        "league": _league_health(series, budget["updates"], cycle),
     }
     card["checks"] = _checks(card)
     return card

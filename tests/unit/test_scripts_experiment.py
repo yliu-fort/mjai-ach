@@ -12,6 +12,7 @@ import random
 import pytest
 
 from mjai.games.loader import load_game
+from mjai.league.checkpoint_store import Role
 from mjai.league.league_controller import LeagueSelfPlay
 from mjai.league.manager import LeagueConfig
 from mjai.league.opponent_sampler import LeagueMix
@@ -91,6 +92,38 @@ def test_invalid_reset_mode_raises():
 def test_valid_reset_modes_accepted():
     assert _base_cfg(league_reset_mode="to_main").league_reset_mode == "to_main"
     assert _base_cfg(league_reset_mode="random").league_reset_mode == "random"
+
+
+def test_role_weight_knobs_reach_controller_schedule():
+    """The YAML ratio becomes the controller's deterministic SWRR cycle."""
+    ctrl = _build_league_controller(_base_cfg())
+    assert ctrl.role_schedule == [
+        Role.MAIN,
+        Role.MAIN_EXPLOITER,
+        Role.LEAGUE_EXPLOITER,
+        Role.MAIN,
+    ]
+    ctrl = _build_league_controller(
+        _base_cfg(
+            league_role_weight_main=1.0,
+            league_role_weight_main_exploiter=1.0,
+            league_role_weight_league_exploiter=0.0,
+        )
+    )
+    assert ctrl.role_schedule == [Role.MAIN, Role.MAIN_EXPLOITER]
+
+
+def test_invalid_role_weights_raise():
+    with pytest.raises(ValueError, match="league_role_weight_main must be > 0"):
+        _base_cfg(league_role_weight_main=0.0)
+    with pytest.raises(ValueError, match=">= 0"):
+        _base_cfg(league_role_weight_main_exploiter=-0.1)
+
+
+def test_league_capacity_below_three_raises():
+    """Two pool slots are reserved for exploiters; the history quota needs >= 1."""
+    with pytest.raises(ValueError, match="league_capacity"):
+        _base_cfg(league_capacity=2)
 
 
 def test_unknown_config_key_fails_loudly():

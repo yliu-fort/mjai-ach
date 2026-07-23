@@ -9,9 +9,16 @@ Owns the three live learners (main, main-exploiter, league-exploiter), the
 
 Promotion thresholds (Step 6 design, configurable):
   - main_exploiter promoted when its rolling win-rate vs the current main >=
-    ``main_exploiter_promo`` (default 0.55).
+    ``main_exploiter_promo`` (default 0.70).
   - league_exploiter promoted when its win-rate vs >``league_exploiter_share``
-    of the pool (default 0.70 share) is >= ``league_exploiter_promo``.
+    of the pool (default 0.70 share) is >= ``league_exploiter_promo``
+    (default 0.70).
+
+Pool seeding: construction places a ``train_step=0`` GENESIS snapshot of the
+initial main into the pool. The pool is therefore never empty, which makes
+"the league-exploiter only ever faces pool members" a hard invariant from the
+first round (no fallback to the live main — AGENTS.md §11) and gives PFSP a
+main-line member id to bookkeep against from round one.
 
 Reset policy (configurable knob, default: reset to current main weights per the
 locked Step 6 design).
@@ -38,8 +45,8 @@ class LeagueConfig:
     # ``main_save_every_rounds`` main rounds. Under the default 1:2 role
     # schedule one main round is every third collect().
     main_save_every_rounds: int = 200
-    main_exploiter_promo: float = 0.55  # >= this win-rate vs current main
-    league_exploiter_promo: float = 0.55  # >= this win-rate vs pool members
+    main_exploiter_promo: float = 0.70  # >= this win-rate vs current main
+    league_exploiter_promo: float = 0.70  # >= this win-rate vs pool members
     league_exploiter_share: float = 0.70  # fraction of pool it must beat
     promo_window: int = 20  # rolling win-rate window size, counted in EPISODES
     mix: LeagueMix = field(default_factory=LeagueMix)
@@ -94,6 +101,14 @@ class LeagueManager:
         self._main_snapshots_total: int = 0
         # Roles whose live weights are owed a reset, applied by begin_round.
         self._pending_reset: set[Role] = set()
+        # Genesis snapshot: the initial main enters the pool at train_step=0.
+        # The pool is never empty, so the league-exploiter's "pool members
+        # only" rule is a hard invariant from round one (no live-main
+        # fallback), and the main line has a pool identity for PFSP
+        # bookkeeping immediately rather than after the first cadence hit.
+        genesis = self.store.add(self._clone(self.main), Role.MAIN, train_step=0)
+        self._main_member_id = genesis.member_id
+        self._main_snapshots_total += 1
 
     # ---- per-round matchup decisions ----
 
@@ -247,10 +262,10 @@ class LeagueManager:
         """League health counters for the runner's telemetry (B7, AGENTS.md §6).
 
         The per-role pool composition is reported alongside the total size:
-        eviction prefers the oldest MAIN snapshot (CheckpointStore), so a pool
-        fed more promotions than snapshots silently loses its entire history
-        bucket — which the sampler then falls back out of, into the current
-        main. ``pool_size`` alone cannot show that; the breakdown can.
+        under the store's role quotas a healthy pool holds a growing main
+        history plus at most one snapshot per exploiter role, so any drift
+        from that shape (e.g. history not growing between cadence hits) shows
+        up here before it distorts sampling.
         """
         return {
             "pool_size": len(self.store),

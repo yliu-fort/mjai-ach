@@ -54,6 +54,9 @@ def test_league_yamls_carry_explicit_league_knobs():
             "league_league_exploiter_promo",
             "league_exploiter_share",
             "league_promo_window",
+            "league_role_weight_main",
+            "league_role_weight_main_exploiter",
+            "league_role_weight_league_exploiter",
             "league_reset_mode",
             "league_main_save_every_rounds",
         ):

@@ -68,10 +68,10 @@ def _build_trainer(rule_cls, **rule_kwargs):
 @pytest.mark.slow
 def test_league_loop_runs_and_pool_grows():
     trainer, mgr, _ = _build_trainer(TabularACHUpdate, hedge_eta=0.5)
-    assert len(mgr.store) == 0
-    for _ in range(12):  # 12 rounds => 4 MAIN rounds => >=1 snapshot at save_every=2
-        trainer.step()
-    assert len(mgr.store) >= 1
+    assert len(mgr.store) == 1  # the genesis snapshot of the initial main
+    for _ in range(12):  # 12 rounds of [MAIN, ME, LE, MAIN] => 6 MAIN rounds
+        trainer.step()  # => >=1 snapshot at save_every=2, plus promotions
+    assert len(mgr.store) >= 2
     # last_stats tracks the MAIN line only (None right after an exploiter
     # round); the round's updates are all in last_stats_by_label.
     stats = trainer.last_stats_by_label
@@ -95,7 +95,7 @@ def test_league_three_roles_all_collect():
     """Over enough rounds, all three roles draw their turn and produce batches."""
     trainer, _mgr, _ = _build_trainer(TabularACHUpdate, hedge_eta=0.3)
     batch_sizes = []
-    for _ in range(9):  # 3 full cycles of [MAIN, ME, LE]
+    for _ in range(9):  # >2 full cycles of [MAIN, ME, LE, MAIN]: every role draws
         r = trainer.step()
         batch_sizes.append(r.batch_size)
     assert all(b > 0 for b in batch_sizes)

@@ -8,8 +8,8 @@ Each test names the bug it pins down:
     two-seat advantage mean.
   - B4: the live main's latest pool member id reaches the sampler, and main
     rounds vs pool members write win-rates back to the store (PFSP live).
-  - B6: the live main is not a phantom "-1" pool member — an empty pool means
-    no league-exploiter promotion, however many rounds it wins.
+  - B6: the live main is not a phantom "-1" pool member — beating it opens no
+    league-exploiter promotion window, however many rounds it wins.
   - B7: league/* health scalars are emitted through the runner-passed writer.
   - B8: promotion windows are counted in EPISODES, not collect rounds.
 """
@@ -226,7 +226,8 @@ def test_b2_true_winrate_tracked_per_role():
 
 def test_b4_main_member_id_reaches_sampler():
     mgr, main = _make_manager(main_save_every_rounds=1)
-    mgr.record_main_round()  # live main enters the pool -> member id 0
+    # The genesis snapshot holds member id 0; the first cadence hit gets id 1.
+    mgr.record_main_round()  # live main enters the pool -> member id 1
     captured: dict[str, object] = {}
 
     class _SpySampler:
@@ -238,7 +239,7 @@ def test_b4_main_member_id_reaches_sampler():
 
     mgr.sampler = _SpySampler()  # type: ignore[assignment]
     mgr.opponent_for(Role.MAIN)
-    assert captured["learner_member_id"] == 0
+    assert captured["learner_member_id"] == 1
     mgr.opponent_for(Role.MAIN_EXPLOITER)
     assert captured["learner_member_id"] is None  # exploiters have no pool entry
 
@@ -287,8 +288,10 @@ def test_b4_exploiter_results_do_not_pollute_main_win_rates():
 # ---- B6: no phantom "-1" pool member ----
 
 
-def test_b6_empty_pool_league_exploiter_cannot_promote():
-    """Beating the live main every round never promotes with an empty pool."""
+def test_b6_live_main_wins_never_promote_league_exploiter():
+    """Beating the LIVE main never counts: it opens no pool window, however
+    many rounds the league-exploiter wins (the live main is not a phantom
+    "-1" pool member — and since the role split, not even an opponent)."""
     mgr, main = _make_manager()
     for _ in range(10):
         mgr.record_exploiter_match(Role.LEAGUE_EXPLOITER, opponent=main, won=True, n_episodes=20)
@@ -308,14 +311,15 @@ def test_b6_real_pool_members_still_allow_promotion():
 
 def test_b6_evicted_member_windows_stop_counting():
     """Windows of evicted members are stale and leave the share denominator."""
-    mgr, _ = _make_manager(share=0.75, capacity=2)
+    mgr, _ = _make_manager(share=0.75, capacity=4)  # history quota = 2
     m1 = mgr.store.add(TabularPolicy(num_actions=3, seed=3), Role.MAIN)
     m2 = mgr.store.add(TabularPolicy(num_actions=3, seed=4), Role.MAIN)
+    # (The second add overflowed the quota and evicted the genesis snapshot.)
     # Lose to m1, beat m2: beaten 1 / total 2 = 0.5 < 0.75 — no promotion.
     mgr.record_exploiter_match(Role.LEAGUE_EXPLOITER, opponent=m1.policy, won=False, n_episodes=3)
     mgr.record_exploiter_match(Role.LEAGUE_EXPLOITER, opponent=m2.policy, won=True, n_episodes=3)
     assert mgr.store.by_role(Role.LEAGUE_EXPLOITER) == []
-    # Capacity 2: adding a third main evicts m1 (oldest main, FIFO).
+    # Quota 2: adding a third main evicts m1 (oldest main, FIFO).
     m3 = mgr.store.add(TabularPolicy(num_actions=3, seed=5), Role.MAIN)
     assert m1 not in mgr.store.members
     # A one-episode result vs m3 triggers the promotion check. With m1's stale
