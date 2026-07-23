@@ -106,7 +106,7 @@ league）互补——这里固定 mirror 自博弈，只扫**策略项**的插�
 **直接 Runtime → Run All 即可**；想加深/加宽，改下一格参数后重跑（已完成的臂不会
 被重训；要重训某臂需先删掉它的目录）。"""
 
-PARAMS_CODE = """# === Parameters ===
+PARAMS_CODE = '''# === Parameters ===
 GAME        = "{game}"
 THETAS      = [0.0, 0.25, 0.5, 0.75, 1.0]   # 0 = PPO, 1 = ACH
 SEEDS       = [0, 1, 2]
@@ -114,8 +114,22 @@ TOTAL_ENV_STEPS = {total}   # per-arm budget (probe depth, not the paper's 1e7)
 EVAL_EVERY      = {eval_every}
 FINAL_FRAC  = 0.1           # "final" = mean over the last 10% of x (D5 convention)
 SHOW_TQDM   = True          # per-arm tqdm bar over env-steps
+
+DEVICE      = "cpu"         # "cpu" | "cuda" | None (= whatever the YAML says)
+"""CPU is the default on purpose, and it is the FAST option here.
+
+The rollout asks the policy for ONE decision at a time, so a 21->128->13
+forward never fills a GPU: it is ~10 host<->device syncs of launch overhead
+around a matmul that takes microseconds. Measured on Liar's Dice (RTX 3060 Ti):
+
+    cpu    2809 env-steps/s      one policy call 241 us
+    cuda    441 env-steps/s      one policy call 2110 us   (6.4x slower)
+
+Set "cuda" only if you have raised the network width or batch size far enough
+that the matmul dominates the launch overhead -- measure before assuming.
+"""
 from pathlib import Path
-OUT_ROOT = Path("runs/nb_theta")"""
+OUT_ROOT = Path("runs/nb_theta")'''
 
 SETUP_CODE = """# === Setup: import the probe machinery (no logic reimplemented here) ===
 import sys
@@ -146,6 +160,7 @@ def train_all():
                     eval_every_env_steps=EVAL_EVERY,
                     root=OUT_ROOT,
                     progress_bar=SHOW_TQDM,
+                    device=DEVICE,
                 )
                 statuses.append((theta, seed, "done"))
             except Exception as e:  # keep going; report at the end
@@ -153,7 +168,7 @@ def train_all():
             print(f"      -> {statuses[-1][2]}", flush=True)
     return statuses
 
-print(f"{len(THETAS)} thetas x {len(SEEDS)} seeds = {len(THETAS) * len(SEEDS)} arms")"""
+print(f"{len(THETAS)} thetas x {len(SEEDS)} seeds = {len(THETAS) * len(SEEDS)} arms on {DEVICE}")"""
 
 TRAIN_CODE = """# === Train (long cell: arms run sequentially; safe to re-run) ===
 statuses = train_all()

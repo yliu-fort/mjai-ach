@@ -132,3 +132,29 @@ def test_renderers_return_none_without_data(tmp_path: Path):
 def test_summarize_on_empty_root_writes_empty_summary(tmp_path: Path):
     assert theta_probe.summarize(tmp_path) == {}
     assert (tmp_path / "summary.json").is_file()
+
+
+def test_run_arm_accepts_a_device_override():
+    """The notebooks pin the device explicitly; the probe must honour it."""
+    import inspect
+
+    for probe in (theta_probe.run_arm,):
+        assert "device" in inspect.signature(probe).parameters
+
+
+def test_every_notebook_carries_a_cpu_default_device_knob():
+    """All notebooks expose DEVICE and default to CPU (measured 6.4x faster).
+
+    The rollout is one policy call per decision point, so a small MLP forward
+    on a GPU is launch-and-sync overhead; the knob makes that choice explicit
+    and reversible rather than buried in a YAML.
+    """
+    import json
+
+    notebooks = sorted((TOOLS_DIR.parent / "notebooks").glob("*.ipynb"))
+    assert len(notebooks) >= 11, "notebook set shrank unexpectedly"
+    for path in notebooks:
+        cells = json.loads(path.read_text(encoding="utf-8"))["cells"]
+        source = "".join("".join(c["source"]) for c in cells)
+        assert "DEVICE" in source, f"{path.name}: no DEVICE knob"
+        assert '"cpu"' in source or "'cpu'" in source, f"{path.name}: DEVICE not defaulted to cpu"

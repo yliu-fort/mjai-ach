@@ -123,15 +123,29 @@ HEADER_MD = """# A/B 验证 · {game}（mirror vs league）
 **直接 Runtime → Run All 即可**；想加深/加宽，改下一格的参数后重跑（已完成的
 臂不会被重训）。"""
 
-PARAMS_CODE = """# === Parameters ===
+PARAMS_CODE = '''# === Parameters ===
 GAME        = "{game}"
 MODES       = ["mirror", "league"]
 SEEDS       = [0, 1, 2, 3]
 TOTAL_ENV_STEPS = {total}   # per-arm budget (probe depth, not the paper's 1e7)
 EVAL_EVERY      = {eval_every}
 SHOW_TQDM   = True          # per-arm tqdm bar over env-steps
+
+DEVICE      = "cpu"         # "cpu" | "cuda" | None (= whatever the YAML says)
+"""CPU is the default on purpose, and it is the FAST option here.
+
+The rollout asks the policy for ONE decision at a time, so a 21->128->13
+forward never fills a GPU: it is ~10 host<->device syncs of launch overhead
+around a matmul that takes microseconds. Measured on Liar's Dice (RTX 3060 Ti):
+
+    cpu    2809 env-steps/s      one policy call 241 us
+    cuda    441 env-steps/s      one policy call 2110 us   (6.4x slower)
+
+Set "cuda" only if you have raised the network width or batch size far enough
+that the matmul dominates the launch overhead -- measure before assuming.
+"""
 from pathlib import Path
-OUT_ROOT = Path("runs/nb_ab") / GAME"""
+OUT_ROOT = Path("runs/nb_ab") / GAME'''
 
 SETUP_CODE = """# === Setup: import the probe machinery (no logic reimplemented here) ===
 import sys
@@ -162,6 +176,7 @@ def train_all():
                     eval_every_env_steps=EVAL_EVERY,
                     root=OUT_ROOT,
                     progress_bar=SHOW_TQDM,
+                    device=DEVICE,
                 )
                 statuses.append((mode, seed, "done"))
             except Exception as e:  # keep going; report at the end

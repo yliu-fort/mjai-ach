@@ -102,9 +102,17 @@ def run_arm(
     eval_every_env_steps: int,
     root: Path = PROBE_ROOT,
     progress_bar: bool = False,
+    device: str | None = None,
 ) -> Path:
-    """Train one (game, theta, seed) arm to completion and mark it DONE."""
+    """Train one (game, theta, seed) arm to completion and mark it DONE.
+
+    ``device`` overrides the config's (None keeps it). "cpu" is the right
+    answer for these games: the rollout asks the policy for ONE decision at a
+    time, so a 21->128->13 forward is pure launch-and-sync overhead on a GPU —
+    measured 2809 env-steps/s on CPU vs 441 on CUDA for Liar's Dice.
+    """
     out = arm_dir(root, game, theta, seed)
+    overrides: dict[str, object] = {} if device is None else {"device": device}
     cfg = dataclasses.replace(
         load_base_config(game),
         algo="theta",
@@ -115,6 +123,7 @@ def run_arm(
         eval_every_env_steps=eval_every_env_steps,
         verbose=False,
         progress_bar=progress_bar,
+        **overrides,  # type: ignore[arg-type]
     )
     run_experiment(cfg)
     (out / "DONE").write_text("ok\n", encoding="utf-8")

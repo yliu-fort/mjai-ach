@@ -262,3 +262,10 @@ def test_mark_best_checkpoint_missing_step_dir_returns_none(tmp_path):
     rows = [{"step": 99, "env_steps": 5000, "eval/nash_conv": 1.0}]
     run = _fake_run_dir(tmp_path, rows, [10])  # no step_99 dir
     assert league_probe.mark_best_checkpoint(run) is None
+
+
+def test_run_arm_accepts_a_device_override():
+    """The A/B notebooks pin the device explicitly; the probe must honour it."""
+    import inspect
+
+    assert "device" in inspect.signature(league_probe.run_arm).parameters
