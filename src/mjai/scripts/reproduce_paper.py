@@ -64,6 +64,12 @@ def main(argv: list[str] | None = None) -> int:
         help="ACH gate/loss centered-mean over legal actions only "
         "(centered_mean_legal_only=True; A5 probe for the Liar's Dice gap).",
     )
+    parser.add_argument(
+        "--raw-logit",
+        action="store_true",
+        help="ACH loss body uses the raw logit instead of the mean-centered one "
+        "(loss_centered_logits=False; the literal Algorithm 2 reading, spec U1).",
+    )
     args = parser.parse_args(argv)
 
     if args.cpu:
@@ -90,6 +96,7 @@ def main(argv: list[str] | None = None) -> int:
             out_dir=str(out_dir),
             verbose=True,
             centered_mean_legal_only=args.legal_mean,
+            loss_centered_logits=not args.raw_logit,
         )
         print(f"  run  {game} seed={seed} -> {out_dir}")
         # On failure no DONE marker is written, so the next invocation resumes
