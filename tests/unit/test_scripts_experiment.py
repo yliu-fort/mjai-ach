@@ -15,7 +15,13 @@ from mjai.games.loader import load_game
 from mjai.league.league_controller import LeagueSelfPlay
 from mjai.league.manager import LeagueConfig
 from mjai.league.opponent_sampler import LeagueMix
-from mjai.scripts.experiment import ExperimentConfig, build_controller, build_policy
+from mjai.scripts.experiment import (
+    ExperimentConfig,
+    build_controller,
+    build_policy,
+    build_update_rule,
+    resolve_theta,
+)
 
 
 def _base_cfg(**overrides: object) -> ExperimentConfig:
@@ -96,3 +102,58 @@ def test_unknown_config_key_fails_loudly():
             self_play_mode="league",
             league_mix_current_mainn=0.5,  # typo must not parse
         )  # type: ignore[call-arg]
+
+
+# ---- algo <-> theta resolution (the unified NN update rule) ----
+
+
+def _algo_cfg(algo: str, **overrides: object) -> ExperimentConfig:
+    """Mirror-mode config with an explicit algo (``_base_cfg`` pins algo=ach)."""
+    return ExperimentConfig(game="kuhn", algo=algo, self_play_mode="mirror", **overrides)  # type: ignore[arg-type]
+
+
+def test_algo_aliases_pin_theta():
+    """ppo/ach are pinned aliases for the interpolation endpoints."""
+    assert resolve_theta(_algo_cfg("ppo")) == 0.0
+    assert resolve_theta(_algo_cfg("ach")) == 1.0
+
+
+def test_explicit_theta_requires_the_theta_algo():
+    """A config whose name disagrees with its update rule fails loudly (§9)."""
+    with pytest.raises(ValueError, match="pins theta"):
+        resolve_theta(_algo_cfg("ach", theta=0.5))
+    with pytest.raises(ValueError, match="requires an explicit theta"):
+        resolve_theta(_algo_cfg("theta"))
+    assert resolve_theta(_algo_cfg("theta", theta=0.25)) == 0.25
+
+
+def test_unknown_algo_is_rejected():
+    with pytest.raises(ValueError, match="Unknown algo"):
+        resolve_theta(_algo_cfg("reinforce"))
+
+
+def test_theta_algo_has_no_tabular_implementation():
+    """The interpolation is MLP-only; the tabular pair stays discrete (D5)."""
+    cfg = _algo_cfg("theta", theta=0.5, policy_kind="tabular")
+    spec = load_game("kuhn")
+    policy = build_policy(spec, cfg, seed=0)
+    with pytest.raises(ValueError, match="no tabular implementation"):
+        build_update_rule(policy, cfg, spec)
+
+
+def test_mlp_theta_reaches_the_update_rule():
+    """Every algo name on the MLP path builds the one rule, carrying its theta."""
+    from mjai.algos.nn_updates import NNActorCriticUpdate
+    from mjai.utils import gpu_assert
+
+    gpu_assert.reset_for_tests()
+    gpu_assert.require_cpu()
+    try:
+        spec = load_game("kuhn")
+        for algo, theta, want in (("ppo", None, 0.0), ("ach", None, 1.0), ("theta", 0.4, 0.4)):
+            cfg = _algo_cfg(algo, theta=theta, policy_kind="mlp", optimizer="sgd")
+            rule = build_update_rule(build_policy(spec, cfg, seed=0), cfg, spec)
+            assert isinstance(rule, NNActorCriticUpdate)
+            assert rule.config.theta == want
+    finally:
+        gpu_assert.reset_for_tests()

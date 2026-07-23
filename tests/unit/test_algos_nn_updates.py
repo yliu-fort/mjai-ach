@@ -14,9 +14,9 @@ import torch
 
 from mjai.agents.mlp import MLPSharedActorCritic
 from mjai.agents.tabular import TabularPolicy
-from mjai.algos.nn_updates import NNACHUpdate, NNPPOUpdate, safe_log
+from mjai.algos.nn_updates import NNActorCriticUpdate, safe_log
 from mjai.algos.transition import Batch, Transition, make_batch
-from mjai.algos.update_rule import AlgoConfig
+from mjai.algos.update_rule import ACHFidelityWarning, AlgoConfig
 from mjai.utils import gpu_assert
 
 OBS = [0.5, -0.2, 0.0, 1.0]
@@ -36,10 +36,26 @@ def _policy(seed: int = 0) -> MLPSharedActorCritic:
     return MLPSharedActorCritic(obs_size=4, num_actions=NUM_ACTIONS, seed=seed)
 
 
-def _ach(p: MLPSharedActorCritic, **cfg_kwargs) -> NNACHUpdate:
+def _ach(p: MLPSharedActorCritic, **cfg_kwargs) -> NNActorCriticUpdate:
     """ACH with explicit SGD (paper H.3) and no entropy term unless asked."""
     base = {"optimizer": "sgd", "learning_rate": 1e-2, "entropy_coef": 0.0}
-    return NNACHUpdate(p, AlgoConfig(**{**base, **cfg_kwargs}))
+    return NNActorCriticUpdate(p, AlgoConfig(**{**base, **cfg_kwargs}))
+
+
+def _ppo(p: MLPSharedActorCritic, **cfg_kwargs) -> NNActorCriticUpdate:
+    """Reference PPO: theta=0 with the 37-details knobs explicitly enabled.
+
+    The shared scaffolding defaults follow the ACH protocol at every theta
+    (SGD, raw advantages), so a test that means "reference PPO" says so.
+    """
+    base = {
+        "theta": 0.0,
+        "learning_rate": 1e-3,
+        "optimizer": "adam",
+        "normalize_advantages": True,
+        "max_grad_norm": 0.5,
+    }
+    return NNActorCriticUpdate(p, AlgoConfig(**{**base, **cfg_kwargs}))
 
 
 def _batch(n: int, advantages=None, returns=None) -> Batch:
@@ -107,7 +123,7 @@ def _head_weights(p: MLPSharedActorCritic) -> torch.Tensor:
 def test_rejects_non_mlp_policy():
     p = TabularPolicy(num_actions=4, seed=0)
     with pytest.raises(TypeError, match="MLPSharedActorCritic"):
-        NNACHUpdate(p)  # type: ignore[arg-type]
+        NNActorCriticUpdate(p)  # type: ignore[arg-type]
 
 
 def test_empty_batch_short_circuits():
@@ -129,13 +145,39 @@ def test_ach_optimizer_is_sgd_without_momentum():
 
 def test_ach_bare_construction_defaults_to_sgd():
     """No explicit config -> endpoint default is SGD (single paper-faithful ACH)."""
-    rule = NNACHUpdate(_policy())
+    rule = NNActorCriticUpdate(_policy())
     assert isinstance(rule.optimizer, torch.optim.SGD)
 
 
-def test_ach_rejects_non_sgd_optimizer():
-    with pytest.raises(ValueError, match="SGD"):
-        NNACHUpdate(_policy(), AlgoConfig(optimizer="adam"))
+def test_ach_warns_on_optimizer_the_paper_does_not_use():
+    """Adam under theta=1 is a valid A/B arm but must announce itself (D6-style)."""
+    with pytest.warns(ACHFidelityWarning, match="optimizer='adam'"):
+        NNActorCriticUpdate(_policy(), AlgoConfig(optimizer="adam"))
+
+
+def test_ach_warns_on_advantage_normalization_and_multi_epoch():
+    with pytest.warns(ACHFidelityWarning, match="normalize_advantages"):
+        NNActorCriticUpdate(_policy(), AlgoConfig(normalize_advantages=True))
+    with pytest.warns(ACHFidelityWarning, match="n_epochs"):
+        NNActorCriticUpdate(_policy(), AlgoConfig(n_epochs=3))
+
+
+def test_paper_faithful_ach_construction_is_silent():
+    """The shipped reproduction config must never emit a fidelity warning."""
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ACHFidelityWarning)
+        NNActorCriticUpdate(_policy(), AlgoConfig(optimizer="sgd", learning_rate=1e-3))
+
+
+def test_ppo_endpoint_never_warns_about_ach_fidelity():
+    """theta=0 has no ACH term, so PPO best practices are unremarkable there."""
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ACHFidelityWarning)
+        _ppo(_policy(), n_epochs=4)
 
 
 def test_ach_paper_default_hyperparams():
@@ -147,7 +189,7 @@ def test_ach_paper_default_hyperparams():
 
 
 def test_ppo_optimizer_is_adam_with_37details_eps():
-    rule = NNPPOUpdate(_policy(), AlgoConfig(learning_rate=1e-3))
+    rule = _ppo(_policy())
     assert isinstance(rule.optimizer, torch.optim.Adam)
     assert rule.optimizer.param_groups[0]["eps"] == 1e-5
 
@@ -157,7 +199,7 @@ def test_ppo_optimizer_is_adam_with_37details_eps():
 
 def test_ppo_returns_finite_stats_after_step():
     p = _policy()
-    rule = NNPPOUpdate(p, AlgoConfig(learning_rate=1e-3))
+    rule = _ppo(p)
     stats = rule.step(_batch(8))
     for v in (stats.policy_loss, stats.value_loss, stats.entropy, stats.approx_kl, stats.clip_frac):
         assert math.isfinite(v)
@@ -167,7 +209,7 @@ def test_ppo_returns_finite_stats_after_step():
 def test_ppo_step_changes_weights():
     p = _policy()
     before = _head_weights(p)
-    NNPPOUpdate(p, AlgoConfig(learning_rate=1e-2)).step(_batch(8, advantages=MIXED_ADVS))
+    _ppo(p, learning_rate=1e-2).step(_batch(8, advantages=MIXED_ADVS))
     assert not torch.allclose(before, p.policy_head.weight.detach())
 
 
@@ -255,7 +297,7 @@ def test_ach_constant_advantages_give_nonzero_policy_loss():
 def test_ppo_constant_advantages_give_zero_policy_loss():
     """PPO keeps per-batch advantage normalization (37-details): constant A -> 0."""
     p = _policy()
-    stats = NNPPOUpdate(p, AlgoConfig(learning_rate=1e-2)).step(_batch(8, advantages=[0.5] * 8))
+    stats = _ppo(p, learning_rate=1e-2).step(_batch(8, advantages=[0.5] * 8))
     assert stats.policy_loss == 0.0
 
 
@@ -474,7 +516,7 @@ def test_grad_norm_is_pre_clip():
 def test_value_head_moves_toward_returns():
     """After enough steps with strong value coef, predicted values approach targets."""
     p = MLPSharedActorCritic(obs_size=4, num_actions=NUM_ACTIONS, hidden_sizes=(16,), seed=0)
-    rule = NNPPOUpdate(p, AlgoConfig(learning_rate=5e-3, value_coef=1.0))
+    rule = _ppo(p, learning_rate=5e-3, value_coef=1.0)
     for _ in range(20):
         rule.step(_batch(16, returns=[5.0] * 16))
     with torch.no_grad():

@@ -10,8 +10,9 @@ Adding an algorithm (AGENTS.md §4 "Algo rule") = new ``UpdateRule`` subclass.
 No edits to Trainer or pipeline.
 
 Two implementation families ship in Phase 1:
-  - :mod:`mjai.algos.nn_updates` — :class:`NNPPOUpdate` (reference PPO) and
-    :class:`NNACHUpdate` (paper-faithful ACH, AGENTS.md §1 D4) on torch MLPs.
+  - :mod:`mjai.algos.nn_updates` — :class:`NNActorCriticUpdate`, one
+    theta-parameterized rule spanning reference PPO (``theta=0``) and
+    paper-faithful ACH (``theta=1``, AGENTS.md §1 D4) on torch MLPs.
   - :mod:`mjai.algos.tabular_updates` — tabular PPO / ACH (CFR+ wrapper) on
     dict-backed policies.
 """
@@ -25,23 +26,55 @@ from mjai.agents.base import Policy
 from mjai.algos.transition import Batch, UpdateStats
 
 
+class ACHFidelityWarning(UserWarning):
+    """A scaffolding knob is set to a value the ACH paper does not use.
+
+    Raised (as a warning) when the ACH policy term carries weight
+    (``theta > 0``) while a PPO-best-practice knob is enabled that the paper's
+    Appendix H.3 protocol contradicts — Adam instead of constant-LR SGD,
+    per-batch advantage normalization, or more than one epoch per mini-batch.
+    Such a run is a deliberate A/B arm, not a reproduction; the warning exists
+    so that distinction is never silent (AGENTS.md §11).
+    """
+
+
 @dataclass(frozen=True)
 class AlgoConfig:
     """Shared hyperparameters consumed by every UpdateRule.
 
     All fields are wired from the experiment YAML (AGENTS.md §9 — no magic
     numbers in code). ACH-specific fields (``eta``, ``l_th``, ``ratio_eps``)
-    are ignored by PPO; ``clip_eps`` lives on the PPO endpoint itself.
+    are inert at ``theta=0``; ``clip_eps`` is inert at ``theta=1``.
 
     Defaults follow the ACH paper's Appendix H.3 (p27-28) where applicable:
     eta=1.0, l_th=2.0 (p28 Table 8); ``ratio_eps`` is vacuous under synchronous
     single-threaded self-play (p28) and only matters for async sampling.
 
+    **Scaffolding defaults follow ACH, at every theta.** The optimizer, the
+    advantage treatment, the epoch count and the grad-clip setting are one
+    shared, knob-driven scaffold rather than a per-algorithm one, so a
+    PPO-vs-ACH comparison varies only ``theta`` unless a knob is turned on
+    deliberately. Knobs that contradict the paper's protocol emit an
+    :class:`ACHFidelityWarning` when the ACH term carries weight.
+
     Attributes:
-        optimizer: ``"sgd"`` | ``"adam"`` | None. None = the endpoint's own
-            default (ACH: SGD constant LR, paper p27; PPO: Adam eps=1e-5).
+        theta: PPO/ACH interpolation of the POLICY term, 0 = PPO clipped
+            surrogate, 1 = paper-faithful ACH. Intermediate values take the
+            convex combination ``(1-theta)*L_ppo + theta*L_ach``. The value
+            and entropy terms have the same form in both and are never
+            interpolated.
+        optimizer: ``"sgd"`` | ``"adam"`` | None (None = ``"sgd"``, paper p27).
+        adam_eps: Adam epsilon; 1e-5 per the 37-details recommendation.
+            Ignored when the optimizer is SGD.
         max_grad_norm: grad-norm clip; ``<= 0`` disables (paper mentions no
             clipping, so the ACH reproduction configs disable it).
+        normalize_advantages: per-batch advantage normalization for the PPO
+            term (a 37-details best practice). The ACH term ALWAYS consumes
+            raw GAE advantages regardless, since normalizing them would turn
+            eta into a batch-adaptive learning rate (paper p24).
+        n_epochs: gradient steps taken per collected batch. The paper updates
+            once per mini-batch (p24), so >1 is a PPO-side A/B knob.
+        clip_eps: PPO surrogate clip range (37-details default 0.2).
         gae_lambda: lambda for the rollout's per-player GAE (paper H.3 unspecified;
             0.95 follows the paper's Mahjong/FHP choice — spec assumption A1).
     """
@@ -75,6 +108,24 @@ class AlgoConfig:
     # architecture-level normalization instead of manual centering. Set True
     # together with ``loss_centered_logits`` for the pre-LayerNorm behavior.
     gate_centered_logits: bool = False
+    # ---- PPO/ACH interpolation + shared-scaffolding knobs ----
+    # theta=1 (default) is paper-faithful ACH; theta=0 is the PPO clipped
+    # surrogate. See the class docstring for what is and is not interpolated.
+    theta: float = 1.0
+    clip_eps: float = 0.2
+    # Scaffolding knobs. Defaults are the ACH-protocol values at EVERY theta
+    # (so PPO inherits ACH's scaffolding unless told otherwise); flipping one
+    # while theta>0 warns (ACHFidelityWarning) rather than silently producing a
+    # run that looks like a reproduction but is not.
+    normalize_advantages: bool = False
+    n_epochs: int = 1
+    adam_eps: float = 1e-5
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.theta <= 1.0:
+            raise ValueError(f"theta must lie in [0, 1], got {self.theta}")
+        if self.n_epochs < 1:
+            raise ValueError(f"n_epochs must be >= 1, got {self.n_epochs}")
 
 
 class UpdateRule(ABC):

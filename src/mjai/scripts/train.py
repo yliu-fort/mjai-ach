@@ -45,7 +45,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Train one mjai experiment.")
     parser.add_argument("--config", help="Path to a YAML experiment config.")
     parser.add_argument("--game", help="Override game short name.")
-    parser.add_argument("--algo", choices=["ppo", "ach"], help="Override algo.")
+    parser.add_argument(
+        "--algo",
+        choices=["ppo", "ach", "theta"],
+        help="Override algo: ppo (theta=0) | ach (theta=1) | theta (needs --theta).",
+    )
+    parser.add_argument(
+        "--theta",
+        type=float,
+        help="PPO<->ACH interpolation weight in [0, 1]; requires --algo theta.",
+    )
     parser.add_argument("--mode", choices=["mirror", "league"], help="Override self-play mode.")
     parser.add_argument("--steps", type=int, help="Override n_steps.")
     parser.add_argument("--out", help="Override output directory.")
@@ -66,14 +75,19 @@ def main(argv: list[str] | None = None) -> int:
         cfg = ExperimentConfig(
             game=args.game,
             algo=args.algo,
+            theta=args.theta,
             self_play_mode=args.mode,
             out_dir=args.out or f"runs/{args.game}_{args.algo}_{args.mode}",
         )
 
-    # Apply overrides.
+    # Apply overrides. ``theta`` is meaningful only under --algo theta; the
+    # config layer rejects the contradictory combinations loudly.
+    if args.theta is not None and args.algo != "theta":
+        parser.error("--theta requires --algo theta (ppo/ach pin theta to 0/1).")
     overrides = {
         "game": args.game,
         "algo": args.algo,
+        "theta": args.theta,
         "self_play_mode": args.mode,
         "n_steps": args.steps,
         "out_dir": args.out,
