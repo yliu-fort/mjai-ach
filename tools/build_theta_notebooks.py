@@ -53,9 +53,10 @@ GAMES: dict[str, dict[str, object]] = {
         "metric": "exploitability（exact）",
         "metric_note": "回合制 2p0s，精确 exploitability。这也是论文复现里唯一没过 "
         "D5 判定的游戏（docs/reproduce_report.md §6）。",
-        "note": "**慢**：每次 64 样本更新约 2–4 s，1e4 env-steps ≈ 8–15 min/臂，"
-        "5θ×3seed ≈ 2.5–4 h。想加深预算请先确认能等，或参考 "
-        "memory 里的 Task Scheduler 脱离会话跑法。",
+        "note": "实测（本机 GPU）：训练约 97 ms/更新（672 env-steps/s），1e4 "
+        "env-steps ≈ 15 s；精确 exploitability 每次约 12 s，本预算下 4–5 个评估点 "
+        "≈ 1 min。**单臂约 1–1.5 min，5θ×3seed ≈ 20 min。** 注意 eval 仍是大头，"
+        "加大 EVAL_EVERY 比缩短训练更能省时间。",
     },
 }
 

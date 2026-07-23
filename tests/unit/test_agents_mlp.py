@@ -214,3 +214,54 @@ def test_snapshot_restore_roundtrip_and_independence():
     assert math.isclose(m2.value(probe), m3.value(probe), abs_tol=1e-6)
     # Silence unused-var lint for a_after/a2_after (kept for debug readability).
     _ = a_after, a2_after
+
+
+def test_action_logits_batch_matches_per_state_calls():
+    """The batched read must answer exactly what the one-state API answers.
+
+    Exact eval materializes the policy through this method, so a divergence
+    here would silently change every equilibrium number.
+    """
+    import numpy as np
+
+    gpu_assert.reset_for_tests()
+    gpu_assert.require_cpu()
+    try:
+        policy = MLPSharedActorCritic(obs_size=4, num_actions=5, hidden_sizes=(16,), seed=0)
+        obs_batch = np.array(
+            [[0.1, -0.2, 0.3, 0.4], [1.0, 0.0, -1.0, 0.5], [0.0, 0.0, 0.0, 0.0]],
+            dtype=np.float32,
+        )
+        legal_mask = np.array(
+            [[True] * 5, [True, False, True, False, True], [False, True, True, True, False]]
+        )
+        batched = policy.action_logits_batch(obs_batch, legal_mask)
+        assert batched.shape == (3, 5)
+        for i, row in enumerate(legal_mask):
+            legal = [a for a, ok in enumerate(row) if ok]
+            one_at_a_time = policy.action_logits(list(obs_batch[i]), legal)
+            # Batched and one-row forwards may differ in the last float32 ulp
+            # (different BLAS blocking); rel=1e-5 is far tighter than that gap.
+            assert [batched[i, a] for a in legal] == pytest.approx(one_at_a_time, rel=1e-5)
+            assert all(batched[i, a] == float("-inf") for a in range(5) if a not in legal)
+    finally:
+        gpu_assert.reset_for_tests()
+
+
+def test_action_logits_batch_default_impl_matches_the_mlp_override():
+    """The Policy ABC's loop fallback and the MLP's batched override agree."""
+    import numpy as np
+
+    from mjai.agents.base import Policy
+
+    gpu_assert.reset_for_tests()
+    gpu_assert.require_cpu()
+    try:
+        policy = MLPSharedActorCritic(obs_size=4, num_actions=3, hidden_sizes=(8,), seed=1)
+        obs_batch = np.array([[0.5, 0.5, 0.5, 0.5], [-1.0, 2.0, 0.0, 0.25]], dtype=np.float32)
+        legal_mask = np.array([[True, True, False], [False, True, True]])
+        override = policy.action_logits_batch(obs_batch, legal_mask)
+        fallback = Policy.action_logits_batch(policy, obs_batch, legal_mask)
+        assert override == pytest.approx(fallback, rel=1e-5, nan_ok=False)
+    finally:
+        gpu_assert.reset_for_tests()

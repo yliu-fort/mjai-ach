@@ -132,6 +132,24 @@ class MLPSharedActorCritic(nn.Module, Policy):
             logits, _ = self.forward(obs_t)
             return [logits[0, a].item() for a in legal_actions]
 
+    def action_logits_batch(self, obs_batch: Any, legal_mask: Any) -> Any:
+        """One forward over the whole batch (see :meth:`Policy.action_logits_batch`).
+
+        The default implementation would issue one forward plus one device sync
+        per legal action per row; exact eval calls this with every info state in
+        the game, so that path is ~4 orders of magnitude of Python and CUDA-sync
+        overhead around a single small matmul.
+        """
+        import numpy as np
+
+        mask = np.asarray(legal_mask, dtype=bool)
+        with torch.no_grad():
+            obs_t = torch.as_tensor(np.asarray(obs_batch, dtype=np.float32), device=self.device)
+            logits, _ = self.forward(obs_t)
+            out: Any = logits.float().cpu().numpy()
+        out[~mask] = -np.inf
+        return out
+
     def _masked_log_probs(self, logits: torch.Tensor, legal_actions: list[int]) -> torch.Tensor:
         """Full-space log-probs with illegal actions masked to -inf-probability."""
         mask = torch.full_like(logits, MASK_VALUE)

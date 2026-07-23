@@ -8,7 +8,23 @@ format OpenSpiel expects, then compute:
     Oshi-Zumo, BRPS). Calls open_spiel.exploitability.nash_conv.
   - :func:`distance_to_brps_nash` — TV distance to the analytic BRPS NE.
 
-The mjai Policy → OpenSpiel Policy adapter lives in :class:`_PolicyAdapter`.
+Two routes to the same numbers:
+
+  - **Reference** (:class:`_PolicyAdapter` + the two ``*_of`` functions): asks
+    the policy for one state at a time, exactly as OpenSpiel's traversal
+    demands. Simple, and the definition of correct.
+  - **Fast** (:func:`equilibrium_metrics_exact`, used by the training loop):
+    materializes the policy over every info state ONCE with a single batched
+    query, then hands OpenSpiel a plain TabularPolicy. The reference route
+    re-queries each info state ~18x (once per tree node that reaches it) and
+    pays ~200 us per query for an NN; on Liar's Dice that is 122 s per eval on
+    CPU and 468 s on GPU (one CUDA sync per legal action), versus ~15 s here.
+
+The two agree to ~1e-8 relative, not bit-for-bit: a batched float32 forward
+uses different BLAS blocking than a one-row forward, so the logits differ in
+the last ulp. That is far below the metric's seed-to-seed noise, but it does
+mean eval values are not comparable bit-for-bit with runs from before this
+change. ``tests/unit/test_eval_nash.py`` pins the agreement.
 """
 
 from __future__ import annotations
@@ -52,6 +68,113 @@ class _PolicyAdapter(ospolicy.Policy):  # type: ignore[misc]
         s = sum(exps) or 1.0
         probs = {a: float(e / s) for a, e in zip(legal, exps, strict=True)}
         return probs
+
+
+# ---------------------------------------------------------------------------
+# Fast route: materialize the policy once per eval, then let OpenSpiel walk a
+# plain TabularPolicy.
+# ---------------------------------------------------------------------------
+
+# Per-game state enumeration, keyed by the canonical game string. The game tree
+# is invariant across evals, so the expensive part (walking every state, ~3.5 s
+# on Liar's Dice) is paid once per process rather than once per eval point.
+# Bounded by the number of exactly-evaluable games (D8: 7), and only populated
+# for games that actually use the exact estimator. Measured resident cost:
+# Liar's-Dice-1 ~16 MB, Goofspiel-5 ~2.6 MB, Leduc ~0.7 MB.
+_SKELETON_CACHE: dict[str, tuple[ospolicy.TabularPolicy, np.ndarray]] = {}
+
+
+def _state_obs(state: pyspiel.State, player: int) -> list[float]:
+    """The observation the policy was trained on, for ``player`` at ``state``.
+
+    Mirrors :meth:`_PolicyAdapter.action_probabilities` exactly — information
+    state when the game provides one, observation tensor otherwise. The player
+    is passed in rather than read from ``state.current_player()`` because
+    simultaneous games report ``SIMULTANEOUS_PLAYER_ID`` (-2) there, which no
+    tensor accessor accepts.
+    """
+    try:
+        return list(state.information_state_tensor(player))
+    except Exception:
+        return list(state.observation_tensor(player))
+
+
+def _row_players(tabular: ospolicy.TabularPolicy) -> list[int]:
+    """Owning player per TabularPolicy row, recovered from its per-player index."""
+    players = [0] * len(tabular.states)
+    for player, info_states in enumerate(tabular.states_per_player):
+        for info_state in info_states:
+            players[tabular.state_lookup[info_state]] = player
+    return players
+
+
+def _skeleton(spec: GameSpec) -> tuple[ospolicy.TabularPolicy, np.ndarray]:
+    """Cached (empty TabularPolicy, per-state observation matrix) for ``spec``."""
+    hit = _SKELETON_CACHE.get(spec.game_string)
+    if hit is None:
+        tabular = ospolicy.TabularPolicy(spec.game)
+        obs = np.asarray(
+            [
+                _state_obs(state, player)
+                for state, player in zip(tabular.states, _row_players(tabular), strict=True)
+            ],
+            dtype=np.float32,
+        )
+        hit = (tabular, obs)
+        _SKELETON_CACHE[spec.game_string] = hit
+    return hit
+
+
+def clear_skeleton_cache() -> None:
+    """Drop the cached state enumerations (tests; long-lived multi-game processes)."""
+    _SKELETON_CACHE.clear()
+
+
+def tabular_view_of(spec: GameSpec, policy: Policy) -> ospolicy.TabularPolicy:
+    """``policy`` as an OpenSpiel TabularPolicy, built with ONE batched query.
+
+    .. warning::
+       The returned object is the cached skeleton with its probability array
+       overwritten in place — the next call for the same game invalidates it.
+       Consume it before evaluating another policy; never store it.
+    """
+    tabular, obs = _skeleton(spec)
+    mask = np.asarray(tabular.legal_actions_mask, dtype=bool)
+    if not mask.any(axis=1).all():
+        raise ValueError(
+            f"{spec.name}: a decision state has no legal actions; refusing to "
+            "normalize an empty action distribution (AGENTS.md: fail loudly)"
+        )
+    logits = np.asarray(policy.action_logits_batch(obs, mask), dtype=np.float64)
+    logits = np.where(mask, logits, -np.inf)
+    logits -= logits.max(axis=1, keepdims=True)
+    exps = np.exp(logits)
+    exps[~mask] = 0.0
+    tabular.action_probability_array[:] = exps / exps.sum(axis=1, keepdims=True)
+    return tabular
+
+
+def equilibrium_metrics_exact(spec: GameSpec, policy: Policy) -> dict[str, float]:
+    """Exact ``nash_conv`` (+ ``exploitability`` when defined) in ONE traversal.
+
+    OpenSpiel's own ``exploitability`` docstring states it "is equivalent to
+    NashConv / num_players" for 2-player constant-sum games, so computing both
+    metrics separately walks the same tree twice for no extra information —
+    roughly 44% of the old eval cost. Here exploitability is derived from
+    nash_conv; games outside that identity fall back to the reference call.
+    """
+    tabular = tabular_view_of(spec, policy)
+    from open_spiel.python.algorithms import exploitability
+
+    nash_conv = float(exploitability.nash_conv(spec.game, tabular))
+    out = {"nash_conv": nash_conv}
+    if spec.num_players != 2 or spec.is_simultaneous:
+        return out
+    if spec.is_zero_sum:
+        out["exploitability"] = nash_conv / spec.num_players
+    else:  # constant- but not zero-sum: no identity to lean on, ask OpenSpiel.
+        out["exploitability"] = exploitability_of(spec, policy)
+    return out
 
 
 def exploitability_of(spec: GameSpec, policy: Policy) -> float:
@@ -159,12 +282,7 @@ def evaluate_equilibrium(
             warnings.warn(f"sampled nash_conv not computable for {spec.name}: {e}", stacklevel=2)
         return out
     try:
-        out["nash_conv"] = nash_conv_of(spec, policy)
+        out.update(equilibrium_metrics_exact(spec, policy))
     except Exception as e:
-        warnings.warn(f"nash_conv not computable for {spec.name}: {e}", stacklevel=2)
-    if not spec.is_simultaneous and spec.num_players == 2:
-        try:
-            out["exploitability"] = exploitability_of(spec, policy)
-        except Exception as e:
-            warnings.warn(f"exploitability not computable for {spec.name}: {e}", stacklevel=2)
+        warnings.warn(f"exact equilibrium eval failed for {spec.name}: {e}", stacklevel=2)
     return out

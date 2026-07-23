@@ -48,9 +48,12 @@ GAMES: dict[str, dict[str, object]] = {
         "total": 10_000,
         "eval_every": 2_500,
         "metric": "exploitability (exact)",
-        "note": "SLOW: ~2-4 s per 64-sample update — 1e4 steps ≈ 8-15 min/arm "
-        "(8 arms ≈ 1-2 h). Raise TOTAL_ENV_STEPS only if you can wait; deeper "
-        "runs need resume support or SLURM (Phase 3).",
+        "note": "Re-measured 2026-07-23: training is ~97 ms per 64-sample update "
+        "(672 env-steps/s), so 1e4 steps ≈ 15 s. The old '2-4 s per update' note "
+        "here was wrong — it was charging the exact-exploitability eval to "
+        "training. Eval is ~12 s per point since the batched-materialization fix "
+        "(was 4-8 min), and is still the dominant cost: budget by EVAL_EVERY, "
+        "not by TOTAL_ENV_STEPS.",
     },
     "ttt": {
         "total": 60_000,
