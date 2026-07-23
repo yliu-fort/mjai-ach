@@ -73,12 +73,21 @@ package-dir = { "" = "src" }
 # -----------------------------------------------------------------------------
 
 # CUDA 12.8 wheel index for torch (D6: GPU by default, no silent degradation).
-# uv will resolve torch from this index. Falls back to PyPI for non-torch deps.
+# The cu128 wheels are used for torch only, and only on CUDA-capable platforms;
+# see the marker in [tool.uv.sources]. Everything else comes from PyPI.
 [tool.uv]
 # We do NOT set an index here unconditionally — torch's cu128 wheels live at the
 # pytorch index below; everything else comes from PyPI.
 [tool.uv.sources]
-torch = { index = "pytorch-cu128" }
+# Platform-conditional: cu128 wheels only exist for linux/windows NVIDIA. On
+# those platforms torch resolves to the cu128 build (D6: GPU by default, fail
+# loud). macOS has no CUDA build at all, so when the marker doesn't match uv
+# falls back to the default PyPI index (CPU/MPS build); the CPU path then runs
+# under --cpu / MJAI_CPU=1. (No silent degradation either way: the GPU path
+# still errors via gpu_assert unless CPU is explicitly requested.)
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
