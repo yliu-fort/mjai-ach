@@ -263,16 +263,23 @@ def test_ppo_constant_advantages_give_zero_policy_loss():
 
 
 def test_loss_body_logit_toggle_centered_vs_raw():
-    """A3/U1 probe toggle: the gate stays on the centered logit while the loss
-    body switches between centered (default) and raw logit. For a single
-    on-policy sample, policy_loss == -eta * y_used * c * A / pi_old."""
+    """A3/U1 probe toggle: with the gate pinned to the centered logit, the loss
+    body switches between centered and raw logit. For a single on-policy sample,
+    policy_loss == -eta * y_used * c * A / pi_old.
+
+    The gate is pinned explicitly because the default gate is now the raw logit,
+    which the +2.0 shift would push past l_th — that would zero both arms and
+    stop the test from seeing the loss body at all.
+    """
     adv = 1.5
     losses: dict[bool, float] = {}
     for flag in (True, False):
         p = _policy(seed=3)
         _shift_logit(p, 1, +2.0)  # non-uniform policy -> raw logit != centered logit
         batch = _onpolicy_single_batch(p, 1, adv)
-        losses[flag] = _ach(p, loss_centered_logits=flag).step(batch).policy_loss
+        losses[flag] = (
+            _ach(p, loss_centered_logits=flag, gate_centered_logits=True).step(batch).policy_loss
+        )
 
     p = _policy(seed=3)
     _shift_logit(p, 1, +2.0)
@@ -287,8 +294,11 @@ def test_loss_body_logit_toggle_centered_vs_raw():
     assert losses[False] != losses[True]
 
 
-def test_loss_centered_logits_defaults_true():
-    assert AlgoConfig().loss_centered_logits is True
+def test_logit_scale_defaults_are_the_layernorm_shape():
+    """Default ACH: raw logit in gate and loss, paired with the LayerNorm torso."""
+    cfg = AlgoConfig()
+    assert cfg.loss_centered_logits is False
+    assert cfg.gate_centered_logits is False
 
 
 # ---- ACH: A5 toggle (centered mean over legal actions only) ----
@@ -321,19 +331,21 @@ def test_centered_mean_legal_only_changes_loss_only_with_illegal_actions():
     """A5 probe toggle: y_bar over legal actions only. With a partially-legal
     state the two means differ (so the loss differs); with all actions legal
     the toggle is a no-op."""
+    # Centering must be switched on for y_bar to reach the loss at all.
+    centered = {"gate_centered_logits": True, "loss_centered_logits": True}
     losses: dict[bool, float] = {}
     for flag in (True, False):
         p = _policy(seed=5)
         _shift_logit(p, 3, +2.0)  # make the excluded illegal logit off-mean
         batch = _partial_legal_single_batch(p, 1, legal=[0, 1, 2])
-        losses[flag] = _ach(p, centered_mean_legal_only=flag).step(batch).policy_loss
+        losses[flag] = _ach(p, centered_mean_legal_only=flag, **centered).step(batch).policy_loss
     assert losses[True] != losses[False]
 
     all_legal: dict[bool, float] = {}
     for flag in (True, False):
         p = _policy(seed=5)
         batch = _onpolicy_single_batch(p, 1, 1.5)
-        all_legal[flag] = _ach(p, centered_mean_legal_only=flag).step(batch).policy_loss
+        all_legal[flag] = _ach(p, centered_mean_legal_only=flag, **centered).step(batch).policy_loss
     assert all_legal[True] == pytest.approx(all_legal[False], rel=1e-6)
 
 
@@ -410,14 +422,14 @@ def test_layernorm_normalizes_the_torso_output():
     assert f_plain.mean(dim=-1).abs().max().item() > 1e-3
 
 
-def test_layernorm_is_off_by_default_and_changes_parameters():
-    plain = MLPSharedActorCritic(obs_size=4, num_actions=NUM_ACTIONS, hidden_sizes=(8,), seed=0)
-    assert plain.trunk_layernorm is False
-    ln = MLPSharedActorCritic(
-        obs_size=4, num_actions=NUM_ACTIONS, hidden_sizes=(8,), trunk_layernorm=True, seed=0
+def test_layernorm_is_on_by_default_and_adds_parameters():
+    default = MLPSharedActorCritic(obs_size=4, num_actions=NUM_ACTIONS, hidden_sizes=(8,), seed=0)
+    assert default.trunk_layernorm is True
+    plain = MLPSharedActorCritic(
+        obs_size=4, num_actions=NUM_ACTIONS, hidden_sizes=(8,), trunk_layernorm=False, seed=0
     )
-    assert ln.trunk_layernorm is True
-    assert len(ln.state_dict()) > len(plain.state_dict())
+    assert plain.trunk_layernorm is False
+    assert len(default.state_dict()) > len(plain.state_dict())
 
 
 def test_gate_centered_logits_toggle_selects_the_gate_source():
@@ -437,8 +449,15 @@ def test_gate_centered_logits_toggle_selects_the_gate_source():
     assert losses[True] != 0.0
 
 
-def test_gate_centered_logits_defaults_true():
-    assert AlgoConfig().gate_centered_logits is True
+def test_centered_mean_legal_only_is_inert_under_the_raw_logit_default():
+    """y_bar is unused when neither the gate nor the loss body is centered."""
+    losses: dict[bool, float] = {}
+    for flag in (True, False):
+        p = _policy(seed=5)
+        _shift_logit(p, 3, +2.0)
+        batch = _partial_legal_single_batch(p, 1, legal=[0, 1, 2])
+        losses[flag] = _ach(p, centered_mean_legal_only=flag).step(batch).policy_loss
+    assert losses[True] == pytest.approx(losses[False], rel=1e-6)
 
 
 def test_grad_norm_is_pre_clip():

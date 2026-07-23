@@ -36,3 +36,11 @@ out_dir: runs/reproduce/brps_ach_mlp_mirror/seed_0
 hedge_eta: null
 clip_eps: 0.2
 device: null
+# Logit-scale handling (docs/reproduce_report.md §6.5). A LayerNorm at the
+# torso end normalizes the features feeding both heads, so the gate and the
+# loss body threshold the RAW logit rather than a mean-centered one. This
+# combination reproduces the paper's Liar's Dice curve; manual mean-centering
+# did not. Deviation from the paper's stated architecture (p25) — see §6.5.
+trunk_layernorm: true
+gate_centered_logits: false
+loss_centered_logits: false

@@ -55,6 +55,7 @@ def _write_mlp_ckpt(
     hidden: tuple[int, ...] = (32,),
     activation: type[nn.Module] = nn.ReLU,
     with_sidecar: bool = True,
+    trunk_layernorm: bool = True,
 ) -> MLPSharedActorCritic:
     """Write a manifest + MLP weights; returns the policy that was saved."""
     write_checkpoint(directory, _manifest())
@@ -63,6 +64,7 @@ def _write_mlp_ckpt(
         num_actions=NUM_ACTIONS,
         hidden_sizes=hidden,
         activation=activation,
+        trunk_layernorm=trunk_layernorm,
         seed=0,
     )
     if with_sidecar:
@@ -100,6 +102,19 @@ def test_sidecar_records_activation(tmp_path):
     assert meta["hidden_sizes"] == [32]
 
 
+@pytest.mark.parametrize("layernorm", [True, False])
+def test_trunk_layernorm_round_trips_via_sidecar(tmp_path, layernorm):
+    """Either torso variant reloads exactly — the sidecar records which it was."""
+    ckpt = tmp_path / f"ckpt_{layernorm}"
+    saved = _write_mlp_ckpt(ckpt, trunk_layernorm=layernorm)
+    meta = json.loads((ckpt / "policy.pt.meta.json").read_text(encoding="utf-8"))
+    assert meta["trunk_layernorm"] is layernorm
+    loaded = load_policy_from_checkpoint(ckpt)
+    assert isinstance(loaded, MLPSharedActorCritic)
+    assert loaded.trunk_layernorm is layernorm
+    _assert_same_policy(saved, loaded)
+
+
 def test_tabular_roundtrip(tmp_path):
     write_checkpoint(tmp_path / "ckpt", _manifest(kind="tabular"))
     pol = TabularPolicy(num_actions=NUM_ACTIONS, seed=0)
@@ -112,9 +127,16 @@ def test_tabular_roundtrip(tmp_path):
 
 
 def test_legacy_checkpoint_derives_arch_from_run_config(tmp_path):
-    """Old sidecar-less ckpt: hidden_sizes + activation come from the run's config.json."""
+    """Old sidecar-less ckpt: hidden_sizes + activation come from the run's config.json.
+
+    A genuinely legacy checkpoint also predates the trunk LayerNorm, so it is
+    saved without one; the factory's fallback to ``trunk_layernorm=False`` is
+    what makes such a checkpoint still loadable under the new default.
+    """
     ckpt = tmp_path / "run" / "checkpoints" / "step_1"
-    saved = _write_mlp_ckpt(ckpt, hidden=(32,), activation=nn.ReLU, with_sidecar=False)
+    saved = _write_mlp_ckpt(
+        ckpt, hidden=(32,), activation=nn.ReLU, with_sidecar=False, trunk_layernorm=False
+    )
     (tmp_path / "run" / "config.json").write_text(
         json.dumps(
             {

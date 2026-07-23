@@ -36,7 +36,7 @@
 | 项 | 本次复现 | 论文设定（出处） | 一致性 |
 |---|---|---|---|
 | 游戏 | kuhn_poker / leduc_poker / liars_dice（1 骰，OpenSpiel 默认） | 同左（p25） | ✓ |
-| 网络 | MLP `(128,)` + ReLU，共享躯干 + policy/value 双线性头 | 1 层 128 FC + ReLU 双头（p25） | ✓ |
+| 网络 | MLP `(128,)` + ReLU + **trunk 末尾 LayerNorm**，共享躯干 + policy/value 双线性头 | 1 层 128 FC + ReLU 双头（p25，**未提 LayerNorm**） | **偏离**（见 §6.5） |
 | 优化器 | SGD 恒定 lr=1e-3 | SGD 恒定 lr=1e-3（p27 Table 7） | ✓ |
 | Value loss 系数 | value_coef=1.0（等效 α/2·MSE 中 α=2.0） | α=2.0（p27 Table 7） | ✓ |
 | Hedge 系数 η | 1.0 | 1.0（p27 Table 7） | ✓ |
@@ -47,7 +47,7 @@
 | ratio clip | 单线程串行 → ratio 恒 1，门控 vacuous | p28 注记同样 vacuous | ✓（语义一致） |
 | 每迭代更新 | 单 mini-batch 单次更新，value/policy 合并同时更新 | p24 / p27 末段 | ✓ |
 | 优势估计 | 每玩家 GAE，λ=0.95、γ=1.0 | H.3 未给（假设 A1） | 假设 |
-| 损失中 logit | 减均值（loss_centered_logits=true） | 歧义（假设 A3，p24） | 假设 |
+| 损失/门控中 logit | **原始 logit**（gate/loss_centered_logits=false，配合 LayerNorm） | 歧义（正文写减均值、Algorithm 2 写原始 y；假设 A3） | 假设（§6.5 改判） |
 | 训练总长 | 1e7 环境步 | x 轴 1e7 training steps（p26；口径按假设 A2 = 环境步） | ✓ |
 | 评估 | OpenSpiel 精确 exploitability，每 1e5 环境步一次 | 每 1e5 steps 精确评估（p25） | ✓ |
 | 报告对象 | 当前策略 π=softmax(y)（非平均策略） | 当前策略（p25, p27） | ✓ |
@@ -356,6 +356,22 @@ Liar's Dice 是三游戏中唯一动作空间大（13）且**多数动作非法*
 3. **4e6 是筛选预算，不等于复现**。legalmean 的失稳始于 ~3.6e6 并恶化至
    8e6；本 run 只覆盖到该窗口起点。全长 1e7 验证（seed 0，与基线 0.3066 /
    legalmean 0.3366 配对）**进行中**。
+
+**已设为默认配置（2026-07-23）**：`trunk_layernorm: true` +
+`gate_centered_logits: false` + `loss_centered_logits: false` 已写入全部
+**14 个 `configs/exp/*_ach_mlp_*.yaml`**（7 游戏 × mirror/league），并同步为
+`AlgoConfig` / `ExperimentConfig` / `MLPSharedActorCritic` 的代码默认值。
+`notebooks/ab_*.ipynb` 直接读这些 YAML 且不覆写这些键，因此自动继承。
+`reproduce_paper` 的三个开关改为三态（`--layernorm/--no-layernorm` 等），
+不传时**不覆盖配置**，保持 YAML 为唯一真源（AGENTS.md §9）。
+
+⚠️ **这引入了对论文所述架构的偏离**（p25 只写 128 FC + ReLU + 双线性头，
+未提 LayerNorm）。本复现自此应表述为 **"论文 + trunk LayerNorm"**，
+§1.2 配置表已相应标注。旧 checkpoint 不受影响：侧车记录 `trunk_layernorm`，
+缺失时回退 `False`，架构不符会**响亮报错**而非静默载入错误权重。
+
+⚠️ 该默认变更**先于全长 1e7 验证完成**（当时验证仅跑到 ~2e6）。若全长结果
+证伪，需回滚这三个键。
 
 ### 6.6 剩余候选（未验证）
 

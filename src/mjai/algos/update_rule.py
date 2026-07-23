@@ -56,9 +56,12 @@ class AlgoConfig:
     l_th: float = 2.0
     ratio_eps: float = 0.5
     # ACH loss body uses the mean-centered logit (paper text, p24) when True;
-    # False = raw logit (literal Algorithm 2). Probe toggle for spec ambiguity
-    # A3/U1; the gate always uses the centered logit (paper is explicit there).
-    loss_centered_logits: bool = True
+    # False (default) = raw logit, the literal Algorithm 2 form. Raw logits are
+    # the default because they are paired with the MLP's trunk LayerNorm, which
+    # supplies the logit-scale stability that manual centering was standing in
+    # for -- the combination is what reproduces the paper's Liar's Dice curve
+    # (docs/reproduce_report.md §6.5). Set True for the pre-LayerNorm behavior.
+    loss_centered_logits: bool = False
     # ACH centered-logit mean y_bar over LEGAL actions only when True; False =
     # mean over all actions (historical behavior). The paper never discusses
     # action masking (spec assumption A5), so which actions enter y_bar is
@@ -67,10 +70,11 @@ class AlgoConfig:
     # investigation (docs/reproduce_report.md liars +0.15 bias).
     centered_mean_legal_only: bool = False
     # ACH gate thresholds the mean-centered logit (paper p24 is explicit) when
-    # True. False = threshold the RAW logit, which only makes sense when the
-    # network bounds the logit scale itself (see MLP ``trunk_layernorm``):
-    # architecture-level normalization instead of manual centering.
-    gate_centered_logits: bool = True
+    # True. False (default) = threshold the RAW logit, which is coherent because
+    # the MLP's trunk LayerNorm stabilizes the scale feeding the heads:
+    # architecture-level normalization instead of manual centering. Set True
+    # together with ``loss_centered_logits`` for the pre-LayerNorm behavior.
+    gate_centered_logits: bool = False
 
 
 class UpdateRule(ABC):

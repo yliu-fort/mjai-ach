@@ -45,11 +45,14 @@ class MLPSharedActorCritic(nn.Module, Policy):
         num_actions: size of the (fixed) action space (GameSpec.num_actions).
         hidden_sizes: widths of the shared torso layers.
         activation: module constructor for hidden activations (default Tanh).
-        trunk_layernorm: append a LayerNorm to the end of the torso. This bounds
-            the feature scale feeding both heads, which in turn bounds the logit
-            scale — giving an absolute meaning to a logit threshold like ACH's
-            ``l_th`` without mean-centering. Default False (historical
-            architecture); see docs/reproduce_report.md.
+        trunk_layernorm: append a LayerNorm to the end of the torso, normalizing
+            the features that feed both heads. Default True: paired with ACH's
+            raw-logit gate it reproduces the paper's Liar's Dice curve, which
+            manual mean-centering did not (docs/reproduce_report.md §6.5). Note
+            this normalizes the FEATURES, not the logits — the heads that follow
+            are unconstrained Linears. Pass False for the pre-LayerNorm
+            architecture (needed to reload pre-LayerNorm checkpoints, which the
+            checkpoint factory handles from the sidecar).
         device: explicit device override; if None, resolved via gpu_assert.
         seed: torch RNG seed for reproducible init.
     """
@@ -61,7 +64,7 @@ class MLPSharedActorCritic(nn.Module, Policy):
         *,
         hidden_sizes: tuple[int, ...] = (128, 128),
         activation: type[nn.Module] = nn.Tanh,
-        trunk_layernorm: bool = False,
+        trunk_layernorm: bool = True,
         device: str | None = None,
         seed: int | None = None,
     ) -> None:

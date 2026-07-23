@@ -64,23 +64,28 @@ def main(argv: list[str] | None = None) -> int:
         help="ACH gate/loss centered-mean over legal actions only "
         "(centered_mean_legal_only=True; A5 probe for the Liar's Dice gap).",
     )
+    # Tri-state: absent leaves the value from the YAML config untouched, so the
+    # committed defaults stay the single source of truth (AGENTS.md §9).
     parser.add_argument(
         "--raw-logit",
-        action="store_true",
-        help="ACH loss body uses the raw logit instead of the mean-centered one "
-        "(loss_centered_logits=False; the literal Algorithm 2 reading, spec U1).",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="ACH loss body on the raw logit (--no-raw-logit for mean-centered). "
+        "Default: whatever the game's config says.",
     )
     parser.add_argument(
         "--layernorm",
-        action="store_true",
-        help="Append a LayerNorm to the shared torso (bounds the feature scale). "
-        "Pair with --raw-gate to threshold l_th on the raw logit.",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="LayerNorm at the end of the shared torso (--no-layernorm to drop it). "
+        "Default: whatever the game's config says.",
     )
     parser.add_argument(
         "--raw-gate",
-        action="store_true",
-        help="ACH gate thresholds the RAW logit instead of the mean-centered one "
-        "(gate_centered_logits=False); only coherent with --layernorm.",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="ACH gate thresholds the raw logit (--no-raw-gate for mean-centered); "
+        "only coherent with a LayerNorm torso. Default: from the config.",
     )
     parser.add_argument(
         "--total-env-steps",
@@ -109,18 +114,23 @@ def main(argv: list[str] | None = None) -> int:
         if done_marker.exists():
             print(f"  skip {game} seed={seed} (DONE exists at {out_dir})")
             continue
-        base = _load_exp_config(game)
+        overrides: dict[str, object] = {}
+        if args.total_env_steps is not None:
+            overrides["total_env_steps"] = args.total_env_steps
+        if args.legal_mean:
+            overrides["centered_mean_legal_only"] = True
+        if args.raw_logit is not None:
+            overrides["loss_centered_logits"] = not args.raw_logit
+        if args.raw_gate is not None:
+            overrides["gate_centered_logits"] = not args.raw_gate
+        if args.layernorm is not None:
+            overrides["trunk_layernorm"] = args.layernorm
         cfg = dataclasses.replace(
-            base
-            if args.total_env_steps is None
-            else dataclasses.replace(base, total_env_steps=args.total_env_steps),
+            _load_exp_config(game),
             seed=seed,
             out_dir=str(out_dir),
             verbose=True,
-            centered_mean_legal_only=args.legal_mean,
-            loss_centered_logits=not args.raw_logit,
-            gate_centered_logits=not args.raw_gate,
-            trunk_layernorm=args.layernorm,
+            **overrides,  # type: ignore[arg-type]
         )
         print(f"  run  {game} seed={seed} -> {out_dir}")
         # On failure no DONE marker is written, so the next invocation resumes

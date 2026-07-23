@@ -107,10 +107,13 @@ class ExperimentConfig:
     eta: float = 1.0  # hedge coefficient eta(s) (p27 Table 7)
     l_th: float = 2.0  # one-sided logit gate threshold (p28 Table 8)
     ratio_eps: float = 0.5  # ratio gate; vacuous when synchronous (p28)
-    loss_centered_logits: bool = True  # False = raw logit in ACH loss (A3 probe)
+    # Default ACH shape since docs/reproduce_report.md §6.5: trunk LayerNorm
+    # supplies logit-scale stability, so gate and loss body both use the raw
+    # logit. Set all three to the old values for the pre-LayerNorm behavior.
+    loss_centered_logits: bool = False  # True = mean-centered logit in the ACH loss
+    gate_centered_logits: bool = False  # True = ACH gate on the mean-centered logit
+    trunk_layernorm: bool = True  # LayerNorm at the torso end (normalizes features)
     centered_mean_legal_only: bool = False  # ACH y_bar over legal actions only (A5 probe)
-    gate_centered_logits: bool = True  # False = ACH gate on the raw logit (needs layernorm)
-    trunk_layernorm: bool = False  # LayerNorm at the torso end (bounds the logit scale)
     # ---- Sampling / env-step protocol (paper: batch 64, 1e5 eval, 1e7 total) ----
     target_samples: int | None = None  # per-round batch size in samples (p28: 64)
     total_env_steps: int | None = None  # set -> env-step mode (paper: 1e7)
