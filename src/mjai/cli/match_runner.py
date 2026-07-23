@@ -78,9 +78,17 @@ class MatchRunner:
                 p = state.current_player()
                 a = self._one_step(state, p, mode)
                 state.apply_action(a)
+                # Announce a robot's sequential move so a spectating human sees
+                # what happened (MR2). Skipped for human moves (already shown)
+                # and for auto_fast (no per-step output by design).
+                if mode != "auto_fast" and self.seats[p] != "human":
+                    self._announce(state, p, a)
             n_steps += 1
             if mode == "auto_step" and not state.is_terminal():
-                self.output_fn(self.renderer.render(state, observer_player=None))
+                # auto_step has no human (enforced in main.py); render_public is
+                # the consistent public view (render(None) would fall back to
+                # current_player() and leak on imperfect-info games).
+                self.output_fn(self.renderer.render_public(state))
                 self.output_fn("[press Enter to continue]")
                 self.input_fn()
         self.output_fn(self.renderer.render_terminal(state))
@@ -91,12 +99,16 @@ class MatchRunner:
         legal = list(state.legal_actions(player))
         if mode == "auto_fast":
             return self._policy_action(seat, state, player, legal)
-        # interactive or auto_step with a human seat: render first.
+        # interactive or auto_step.
         if seat == "human":
+            # Human acts from their own view (private info filtered to them).
             self.output_fn(self.renderer.render(state, observer_player=player))
             return self._human_action(legal, player)
-        # policy seat in interactive/auto_step: render the policy's view too.
-        self.output_fn(self.renderer.render(state, observer_player=player))
+        # Robot (policy) seat: render the PUBLIC view only. Rendering the
+        # robot's own view (observer_player=player) would leak the opponent's
+        # private info to any spectating human (MR1, INV-1). The public view
+        # shows pot/board/history but no player's private card/die/hand.
+        self.output_fn(self.renderer.render_public(state))
         return self._policy_action(seat, state, player, legal)
 
     def _simultaneous_step(self, state: pyspiel.State) -> list[int]:
@@ -136,6 +148,19 @@ class MatchRunner:
         obs = self.spec.obs_tensor(state, player)
         action, _ = seat.act(obs, legal, eval=True)
         return int(action)
+
+    def _announce(self, state: pyspiel.State, player: int, action: int) -> None:
+        """Print a one-line description of a robot's move (MR2).
+
+        Lets a spectating human follow the game without seeing the robot's
+        private info. Uses OpenSpiel's own ``action_to_string`` so the label is
+        always correct (no per-game encoding in the runner).
+        """
+        try:
+            desc = state.action_to_string(player, action)
+        except Exception:  # pragma: no cover - defensive; pyspiel rarely fails here
+            desc = f"action {action}"
+        self.output_fn(f"Player {player} (robot): {desc}")
 
     def _sample_chance(self, state: pyspiel.State) -> None:
         outcomes = state.chance_outcomes()

@@ -13,6 +13,10 @@ For simultaneous-move games (BRPS, Goofspiel, Oshi-Zumo) the renderer must
 **not** reveal the opponent's simultaneous choice — the human enters their own
 blind, then the joint outcome is shown on the next render. This preserves the
 game's information structure (AGENTS.md §4, §1 D10).
+
+Every renderer also exposes :meth:`render_public` — a public-information-only
+view used when a human is spectating a robot's turn (the robot's private info
+must never leak to the human, INV-1).
 """
 
 from __future__ import annotations
@@ -30,6 +34,18 @@ class GameRenderer(Protocol):
 
         For perfect-info games observer_player can be None (full board). For
         imperfect-info games it MUST be set so private info is filtered.
+        """
+        ...
+
+    def render_public(self, state: pyspiel.State) -> str:
+        """Public-information-only view of ``state`` (no player's private info).
+
+        Used when a human is spectating a robot's turn: shows only public state
+        (pot, public board, bidding history, action count) and never any
+        player's private card / die / hand. For perfect-info games this equals
+        ``render(state, None)``; for simultaneous-move games it shows the
+        public board but not either player's pending choice. Required to honour
+        INV-1 when a human shares a table with a robot (AGENTS.md §4).
         """
         ...
 

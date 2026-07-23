@@ -61,6 +61,20 @@ class _LiarsDiceRenderer:
         ]
         return "\n".join(lines)
 
+    def render_public(self, state: pyspiel.State) -> str:
+        """Public-only view: bidding history, no player's die.
+
+        Used when a human is spectating a robot's turn (INV-1). The dice are
+        private until a challenge resolves; only the bid/challenge sequence is
+        public.
+        """
+        if state.is_terminal():
+            return self.render_terminal(state)
+        game = state.get_game()
+        challenge_id = game.num_distinct_actions() - 1
+        history = self._history(state, game.num_players(), challenge_id)
+        return f"Liar's Dice — public view.\nBidding history: {history}"
+
     def render_terminal(self, state: pyspiel.State) -> str:
         ret = state.returns()
         winner = 0 if ret[0] > 0 else 1

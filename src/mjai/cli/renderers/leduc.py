@@ -66,6 +66,25 @@ class _LeducRenderer:
         lines.append("Legal: " + ", ".join(f"{a}={_ACTION_NAMES.get(a, str(a))}" for a in legal))
         return "\n".join(lines)
 
+    def render_public(self, state: pyspiel.State) -> str:
+        """Public-only view: board card + betting history, no hole cards.
+
+        Used when a human is spectating a robot's turn (INV-1). The public
+        board card and the betting sequence are public; each player's hole card
+        is private. The board card is read from P0's info-state, but only the
+        *public* region, so no private card leaks.
+        """
+        if state.is_terminal():
+            return self.render_terminal(state)
+        info = state.information_state_tensor(0)
+        public = self._card_rank(info, _PUBLIC_CARD_SLOT_START, _PUBLIC_CARD_SLOT_END)
+        public_str = _RANK.get(public, "-") if public is not None else "-"
+        return (
+            "Leduc Poker — public view.\n"
+            f"Public card: {public_str}\n"
+            f"Action history: {self._history(state)}"
+        )
+
     def render_terminal(self, state: pyspiel.State) -> str:
         ret = state.returns()
         if abs(ret[0]) < 1e-9:

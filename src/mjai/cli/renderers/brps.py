@@ -23,6 +23,17 @@ class _BRPSRenderer:
             f"{_PAYOFF}"
         )
 
+    def render_public(self, state: pyspiel.State) -> str:
+        """Public-only view: just announces a move is pending, reveals nothing.
+
+        BRPS is one-shot simultaneous with no private state, so the public view
+        is simply 'moves pending' — no choice is revealed until the joint
+        outcome resolves.
+        """
+        if state.is_terminal():
+            return self.render_terminal(state)
+        return "Biased RPS — public view.\nMoves pending (choices hidden until resolved)."
+
     def render_terminal(self, state: pyspiel.State) -> str:
         # Joint action was applied; we cannot recover it from the terminal state
         # for a one-shot matrix game, so just report the payoff.

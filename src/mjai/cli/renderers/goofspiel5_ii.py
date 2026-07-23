@@ -46,6 +46,17 @@ class _GoofspielRenderer:
         ]
         return "\n".join(lines)
 
+    def render_public(self, state: pyspiel.State) -> str:
+        """Public-only view: rounds played, no player's hand or pending bid.
+
+        Used when a human is spectating a robot's turn (INV-1). With
+        ``imp_info=True`` the opponent's played card is hidden, and each
+        player's remaining hand is private; only the round count is public.
+        """
+        if state.is_terminal():
+            return self.render_terminal(state)
+        return f"Goofspiel-5 — public view.\nRounds played: {self._history(state)}"
+
     def render_terminal(self, state: pyspiel.State) -> str:
         ret = state.returns()
         if abs(ret[0]) < 1e-9:

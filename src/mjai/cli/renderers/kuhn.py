@@ -68,14 +68,28 @@ class _KuhnRenderer:
         lines.append("Legal: " + ", ".join(f"{a}={names.get(a, str(a))}" for a in legal))
         return "\n".join(lines)
 
+    def render_public(self, state: pyspiel.State) -> str:
+        """Public-only view: pot + betting history, no player's hole card.
+
+        Used when a human is spectating a robot's turn (INV-1). The cards are
+        private; only the pot and the pass/bet sequence are public.
+        """
+        if state.is_terminal():
+            return self.render_terminal(state)
+        history = self._public_history(state)
+        return (
+            "Kuhn Poker — public view.\n"
+            f"Pot: {self._pot(state)}    Actions so far: "
+            f"{' '.join(history) or '(none)'}"
+        )
+
     def render_terminal(self, state: pyspiel.State) -> str:
         ret = state.returns()
         if abs(ret[0]) < 1e-9:
             return "Hand over: tie."
         winner = 0 if ret[0] > 0 else 1
         return (
-            f"Hand over: player {winner} wins {abs(ret[0]):+.0f}. "
-            f"Returns: {[int(r) for r in ret]}"
+            f"Hand over: player {winner} wins {abs(ret[0]):+.0f}. Returns: {[int(r) for r in ret]}"
         )
 
     def _public_history(self, state: pyspiel.State) -> list[str]:

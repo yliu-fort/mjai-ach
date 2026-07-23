@@ -44,6 +44,12 @@ class _TTTRenderer:
         rows.append(f"\nPlayer {player} ({_MARKS[player]}) to move. Action = row*3 + col.")
         return "\n".join(rows)
 
+    def render_public(self, state: pyspiel.State) -> str:
+        """Public-only view. Tic-Tac-Toe is perfect-info, so this is the full
+        board with no private state to filter.
+        """
+        return self.render(state, observer_player=0)
+
     def render_terminal(self, state: pyspiel.State) -> str:
         ret = state.returns()
         if abs(ret[0]) < 1e-9:

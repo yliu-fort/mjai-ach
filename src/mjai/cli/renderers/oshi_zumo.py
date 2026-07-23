@@ -47,12 +47,18 @@ class _OshiZumoRenderer:
         legal = state.legal_actions(p)
         lines = [
             f"Oshi-Zumo — you are player {p}.",
-            f"Your coins: {coins_self}    Opponent coins: {coins_opp}    "
-            f"Wrestler at cell {pos}.",
+            f"Your coins: {coins_self}    Opponent coins: {coins_opp}    Wrestler at cell {pos}.",
             f"Legal bids: {legal}  (0..coins)",
             "  (blind: choose without seeing opponent's bid)",
         ]
         return "\n".join(lines)
+
+    def render_public(self, state: pyspiel.State) -> str:
+        """Public-only view. Oshi-Zumo is perfect-info, so this is the full
+        board (coins + wrestler) with no private state to filter.
+        """
+        # Perfect-information game: the public view is the same as the full view.
+        return self.render(state, observer_player=0)
 
     def render_terminal(self, state: pyspiel.State) -> str:
         ret = state.returns()
