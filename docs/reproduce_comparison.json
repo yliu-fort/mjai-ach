@@ -20,9 +20,9 @@
     "paper_final_mean": 0.1712,
     "paper_final_range": [
       0.1541,
-      0.7833
+      0.1884
     ],
-    "verdict": "pass",
+    "verdict": "fail",
     "figure": "docs\\figs\\compare_liars_dice1.png"
   },
   "leduc": {
