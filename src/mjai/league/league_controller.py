@@ -8,12 +8,17 @@ use (AGENTS.md §2, §4).
 Each :meth:`collect` round picks a role (rotates through main, main-exploiter,
 league-exploiter), asks the manager for the opponent, plays one batch of
 episodes via the rollout runner, reports results back to the manager (for
-promotion/reset), and returns the learner's transitions as a Batch.
+promotion/reset), and returns the learner's transitions as a
+:class:`~mjai.algos.controller.Collected`.
 
 The ``learner`` set via :meth:`set_learner` is taken to be the *main* agent;
 the manager owns the two exploiters directly. Whose transitions are returned
 depends on the role drawn this round (exploiters learn too — against their
-narrower opponent sets).
+narrower opponent sets). Because that rotation hands out batches belonging to
+three different policies, each round names its collector in ``Collected`` and
+:meth:`learners` declares all three up front, so the layer above can give each
+one its own update rule. Without that the exploiters' samples would be applied
+to the main agent's weights — an off-policy update on 2 of every 3 rounds.
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ import random
 import numpy as np
 
 from mjai.agents.base import Policy
-from mjai.algos.controller import RolloutRunnerProtocol, SelfPlayController
+from mjai.algos.controller import Collected, RolloutRunnerProtocol, SelfPlayController
 from mjai.algos.transition import Batch
 from mjai.league.checkpoint_store import Role
 from mjai.league.manager import LeagueManager
@@ -71,11 +76,22 @@ class LeagueSelfPlay(SelfPlayController):
         self._main = policy
         self.manager.main = policy  # keep the manager's main pointer fresh
 
-    def collect(self) -> Batch:
+    def learners(self) -> tuple[Policy, ...]:
+        """The three policies :meth:`collect` may return a batch for.
+
+        The caller (which owns update rules; this layer must not — AGENTS.md
+        §2) builds one rule per entry, so each role trains its own weights.
+        """
+        return (self.manager.main, self.manager.main_exploiter, self.manager.league_exploiter)
+
+    def collect(self) -> Collected:
         if self._main is None:
             raise RuntimeError("LeagueSelfPlay.collect called before set_learner")
         role = self.role_schedule[self._round_idx % len(self.role_schedule)]
         self._round_idx += 1
+        # Apply any reset this role earned last time it played, before its
+        # weights are read for rollout (see LeagueManager.begin_round).
+        self.manager.begin_round(role)
 
         learner = (
             self.manager.main
@@ -105,8 +121,14 @@ class LeagueSelfPlay(SelfPlayController):
         # The rollout runner places the learner in seat 0 and the opponent in
         # seat 1. Return only the learner's transitions so each learner trains
         # on its own seat's data (the opponent seat belongs to a different
-        # learner with a different objective).
-        return batch.for_player(player=0)
+        # learner with a different objective), tagged with WHICH learner they
+        # belong to so the Trainer updates that role's own weights.
+        #
+        # sampled_steps is the FULL batch: the opponent seat was simulated too,
+        # and dropping its transitions does not refund its cost.
+        return Collected(
+            batch=batch.for_player(player=0), learner=learner, sampled_steps=batch.size
+        )
 
     @property
     def name(self) -> str:

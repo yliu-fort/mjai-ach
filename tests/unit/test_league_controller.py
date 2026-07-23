@@ -55,11 +55,11 @@ def test_collect_before_set_learner_raises():
 def test_collect_returns_batch_with_learner_transitions():
     ctrl, _, main = _make_league()
     ctrl.set_learner(main)
-    batch = ctrl.collect()
-    assert isinstance(batch, Batch)
+    collected = ctrl.collect()
+    assert isinstance(collected.batch, Batch)
     # BRPS, 10 episodes, 2 simultaneous players each => up to 20 transitions
     # before filtering; after filtering to seat 0 => ~10.
-    assert batch.size > 0
+    assert collected.batch.size > 0
 
 
 def test_collect_rotates_through_roles():
@@ -95,7 +95,7 @@ def test_collect_filters_to_learner_seat_only():
     """Returned batch contains only seat-0 transitions (the learner's)."""
     ctrl, _, main = _make_league()
     ctrl.set_learner(main)
-    batch = ctrl.collect()
+    batch = ctrl.collect().batch
     if batch.size > 0:
         # All transitions belong to player 0.
         assert (batch.players == 0).all()
@@ -105,5 +105,38 @@ def test_league_runs_full_loop_on_kuhn():
     ctrl, _mgr, main = _make_league("kuhn", main_save_every_rounds=2)
     ctrl.set_learner(main)
     for _ in range(6):
-        batch = ctrl.collect()
-        assert batch.size >= 0  # no exception
+        collected = ctrl.collect()
+        assert collected.batch.size >= 0  # no exception
+
+
+def test_collect_names_the_role_that_produced_the_batch():
+    """Each round reports its own collector, not the main agent.
+
+    This is what lets the Trainer update the right weights: without it, two of
+    every three rounds would apply an exploiter's samples to the main policy.
+    """
+    ctrl, mgr, main = _make_league()
+    ctrl.set_learner(main)
+    collectors = [ctrl.collect().learner for _ in range(6)]
+    expected = [mgr.main, mgr.main_exploiter, mgr.league_exploiter] * 2
+    assert collectors == expected
+
+
+def test_learners_declares_every_collecting_role():
+    ctrl, mgr, main = _make_league()
+    ctrl.set_learner(main)
+    assert set(map(id, ctrl.learners())) == {
+        id(mgr.main),
+        id(mgr.main_exploiter),
+        id(mgr.league_exploiter),
+    }
+
+
+def test_sampled_steps_counts_the_discarded_seat_too():
+    """The opponent seat was simulated; dropping it does not refund its cost."""
+    ctrl, _, main = _make_league()
+    ctrl.set_learner(main)
+    collected = ctrl.collect()
+    # BRPS is simultaneous: both seats act at every decision point, so the
+    # full rollout is exactly twice the retained (seat-0-only) batch.
+    assert collected.sampled_steps == 2 * collected.batch.size

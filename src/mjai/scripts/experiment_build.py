@@ -278,6 +278,11 @@ def build_controller(
             gae_lambda=cfg.gae_lambda,
             seed=cfg.seed,
             target_samples=cfg.target_samples,
+            # League keeps only the collecting role's seat, so only that seat
+            # may count toward the target — otherwise its batches come out at
+            # half the protocol's size while mirror's are full (AGENTS.md §9:
+            # the batch size is a config value, not a mode side effect).
+            target_seat=0 if cfg.self_play_mode == "league" else None,
         ),
     )
     if cfg.self_play_mode == "mirror":

@@ -80,8 +80,31 @@ def test_promotion_resets_exploiter_to_main_weights(reset_mode="to_main"):
     main.get_logits([1.0])[0] = 9.0  # main now has a row the exploiter doesn't
     for _ in range(2):
         mgr.record_exploiter_match(Role.MAIN_EXPLOITER, opponent=main, won=True)
+    # The reset is owed, not yet applied: the round that earned the promotion
+    # has a batch in flight that must stay on-policy for these weights.
+    mgr.begin_round(Role.MAIN_EXPLOITER)
     # After promotion + reset-to-main, the exploiter should now have main's row.
     assert mgr.main_exploiter.get_logits([1.0])[0] == 9.0
+
+
+def test_promotion_defers_the_reset_to_the_next_round():
+    """Promotion must not overwrite weights a collected batch still refers to."""
+    mgr, main = _make_manager(main_exploiter_promo=0.5, promo_window=2, reset_mode="to_main")
+    main.get_logits([1.0])[0] = 9.0
+    for _ in range(2):
+        mgr.record_exploiter_match(Role.MAIN_EXPLOITER, opponent=main, won=True)
+    assert len(mgr.store) >= 1  # the snapshot IS taken immediately
+    assert mgr.main_exploiter.get_logits([1.0])[0] != 9.0  # ...the reset is not
+    mgr.begin_round(Role.MAIN_EXPLOITER)
+    assert mgr.main_exploiter.get_logits([1.0])[0] == 9.0
+
+
+def test_begin_round_is_idempotent_without_a_pending_reset():
+    mgr, main = _make_manager(main_exploiter_promo=0.5, promo_window=2)
+    mgr.main_exploiter.get_logits([1.0])[0] = 3.0
+    mgr.begin_round(Role.MAIN_EXPLOITER)
+    mgr.begin_round(Role.MAIN_EXPLOITER)
+    assert mgr.main_exploiter.get_logits([1.0])[0] == 3.0
 
 
 def test_promotion_resets_exploiter_randomly():
@@ -89,6 +112,7 @@ def test_promotion_resets_exploiter_randomly():
     rows_before = mgr.main_exploiter.num_rows()
     for _ in range(2):
         mgr.record_exploiter_match(Role.MAIN_EXPLOITER, opponent=mgr.main, won=True)
+    mgr.begin_round(Role.MAIN_EXPLOITER)
     # After reset-random, the exploiter is a fresh policy (empty rows here).
     assert mgr.main_exploiter.num_rows() == 0 or rows_before == 0
 

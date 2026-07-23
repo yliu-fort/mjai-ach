@@ -7,8 +7,10 @@ import pytest
 from mjai.agents.base import Policy
 from mjai.agents.tabular import TabularPolicy
 from mjai.algos.controller import (
+    Collected,
     MirrorSelfPlay,
     RolloutRunnerProtocol,
+    SelfPlayController,
     Trainer,
 )
 from mjai.algos.tabular_updates import TabularPPOUpdate
@@ -105,3 +107,75 @@ def test_rollout_runner_protocol_is_just_a_protocol():
     # The Protocol should accept any object with run_episode, not require inheritance.
     runner: RolloutRunnerProtocol = _ScriptedRunner()  # type-checks structurally
     assert hasattr(runner, "run_episode")
+
+
+def test_mirror_round_prices_every_simulated_step():
+    """Mirror keeps both seats, so retained samples == simulated cost."""
+    p = TabularPolicy(num_actions=2, seed=0)
+    ctrl = MirrorSelfPlay(_ScriptedRunner())
+    round_ = Trainer(policy=p, update_rule=TabularPPOUpdate(p), controller=ctrl).step()
+    assert round_.batch_size == round_.env_steps == 4
+
+
+class _RotatingController(SelfPlayController):
+    """Collects for a fixed cycle of learners, like the league's role rotation."""
+
+    def __init__(self, learners: list[Policy]) -> None:
+        self._learners = learners
+        self._i = 0
+
+    def set_learner(self, policy: Policy) -> None:
+        self._learners[0] = policy
+
+    def collect(self) -> Collected:
+        learner = self._learners[self._i % len(self._learners)]
+        self._i += 1
+        return Collected(batch=_toy_batch(), learner=learner, sampled_steps=8)
+
+    @property
+    def name(self) -> str:
+        return "rotating"
+
+    def learners(self) -> tuple[Policy, ...]:
+        return tuple(self._learners)
+
+
+def test_trainer_updates_the_policy_that_collected_the_batch():
+    """A rotating controller must not train one learner on another's samples."""
+    obs = [0.0, 0.0]
+    main = TabularPolicy(num_actions=2, seed=0)
+    other = TabularPolicy(num_actions=2, seed=0)
+    ctrl = _RotatingController([main, other])
+    trainer = Trainer(
+        policy=main,
+        update_rule=TabularPPOUpdate(main),
+        controller=ctrl,
+        extra_rules=[TabularPPOUpdate(other)],
+    )
+    main_before, other_before = main.get_logits(obs)[0], other.get_logits(obs)[0]
+    trainer.step()  # round 0 -> main collects
+    assert main.get_logits(obs)[0] != main_before
+    assert other.get_logits(obs)[0] == other_before  # untouched by main's batch
+    main_after = main.get_logits(obs)[0]
+    trainer.step()  # round 1 -> other collects
+    assert other.get_logits(obs)[0] != other_before
+    assert main.get_logits(obs)[0] == main_after  # untouched by other's batch
+
+
+def test_trainer_refuses_a_batch_from_a_learner_it_has_no_rule_for():
+    """No silent fallback to the main rule (AGENTS.md §11)."""
+    main = TabularPolicy(num_actions=2, seed=0)
+    stranger = TabularPolicy(num_actions=2, seed=1)
+    ctrl = _RotatingController([main, stranger])
+    trainer = Trainer(policy=main, update_rule=TabularPPOUpdate(main), controller=ctrl)
+    trainer.step()  # main's own round is fine
+    with pytest.raises(RuntimeError, match="no\n?\\s*UpdateRule|UpdateRule"):
+        trainer.step()
+
+
+def test_round_reports_simulated_cost_separately_from_batch_size():
+    main = TabularPolicy(num_actions=2, seed=0)
+    ctrl = _RotatingController([main])
+    round_ = Trainer(policy=main, update_rule=TabularPPOUpdate(main), controller=ctrl).step()
+    assert round_.batch_size == 4  # retained
+    assert round_.env_steps == 8  # simulated, including the discarded seat

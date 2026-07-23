@@ -40,12 +40,19 @@ class RolloutConfig:
             least this many transitions (decision points). The paper's batch
             size is 64 samples (p28 Table 8); episodes are never truncated
             mid-game. ``None`` disables (collect exactly ``n_episodes``).
+        target_seat: which seat's transitions count toward ``target_samples``.
+            ``None`` (default) counts both seats — right for mirror self-play,
+            where the shared policy trains on every transition. A controller
+            that keeps only one seat must set this to that seat, or the batch
+            it actually trains on comes out at roughly half ``target_samples``
+            and its updates are quietly weaker than the protocol's.
     """
 
     n_episodes: int = 1
     gae_lambda: float = 0.95
     seed: int | None = None
     target_samples: int | None = 64
+    target_seat: int | None = None
 
 
 @dataclass
@@ -92,22 +99,33 @@ class RolloutWorkerCore:
 
         Implements RolloutRunnerProtocol: the controller calls this with the
         learner in the ``learner`` seat and (for mirror) the same policy as the
-        opponent. Plays whole episodes until ``n_episodes`` is reached OR the
-        pooled batch holds at least ``config.target_samples`` transitions
-        (never truncates an episode mid-game).
+        opponent. Plays whole episodes until ``n_episodes`` is reached OR
+        ``config.target_samples`` counted transitions have accumulated (never
+        truncates an episode mid-game). ``config.target_seat`` decides which
+        transitions count; the returned batch always holds both seats, and the
+        caller filters.
         """
         all_transitions: list[Transition] = []
+        counted = 0
         self.last_episode_count = 0
         for _ in range(self.config.n_episodes):
             target = self.config.target_samples
-            if target is not None and len(all_transitions) >= target:
+            if target is not None and counted >= target:
                 break
             transitions, returns = self._play_one_episode(learner, opponent)
             self._assign_returns(transitions, returns)
             all_transitions.extend(transitions)
+            counted += self._count_toward_target(transitions)
             self._last_returns = returns
             self.last_episode_count += 1
         return make_batch(all_transitions, num_actions=self.game_spec.num_actions)
+
+    def _count_toward_target(self, transitions: list[Transition]) -> int:
+        """How many of ``transitions`` count against ``target_samples``."""
+        seat = self.config.target_seat
+        if seat is None:
+            return len(transitions)
+        return sum(1 for t in transitions if t.player == seat)
 
     def _play_one_episode(
         self, learner: Policy, opponent: Policy

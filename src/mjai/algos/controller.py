@@ -20,6 +20,7 @@ so it's where league can hook in without circular imports.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -34,8 +35,29 @@ class BatchSink(Protocol):
     def receive(self, batch: Batch) -> None: ...
 
 
+@dataclass(frozen=True)
+class Collected:
+    """One collect round's output: the batch, WHO collected it, and its cost.
+
+    ``learner`` is what makes a multi-learner controller safe. A controller
+    that rotates roles produces batches belonging to different policies, and a
+    gradient step is only valid on the policy that generated its samples — so
+    the collecting policy travels with the batch instead of being assumed.
+
+    ``sampled_steps`` is every decision point the rollout actually played,
+    including seats whose transitions were dropped from ``batch``. It is the
+    environment-interaction cost of the round, which ``batch.size`` is not:
+    mirror keeps both seats, league keeps one, so counting retained samples
+    would price the same simulation differently per mode.
+    """
+
+    batch: Batch
+    learner: Policy
+    sampled_steps: int
+
+
 class SelfPlayController(ABC):
-    """Decides who plays whom and produces a Batch per :meth:`collect`.
+    """Decides who plays whom and produces a :class:`Collected` per round.
 
     Implementations:
       - :class:`MirrorSelfPlay` (below) — both seats = current policy.
@@ -52,20 +74,37 @@ class SelfPlayController(ABC):
         """Inject the up-to-date learner policy for the next rollout round."""
 
     @abstractmethod
-    def collect(self) -> Batch:
-        """Play episodes and return the transitions as a :class:`Batch`."""
+    def collect(self) -> Collected:
+        """Play episodes and return the round's transitions + provenance."""
 
     @property
     @abstractmethod
     def name(self) -> str:
         """Controller identifier (e.g. ``"mirror"``, ``"league"``)."""
 
+    def learners(self) -> tuple[Policy, ...]:
+        """Every policy this controller may return a batch for, besides the
+        Trainer's own.
+
+        Declared here rather than discovered by ``isinstance`` (AGENTS.md §3.3)
+        so the layer that owns update rules can build one per learner without
+        the league layer having to know that update rules exist at all
+        (AGENTS.md §2: league must not import concrete algos).
+        """
+        return ()
+
 
 @dataclass(frozen=True)
 class TrainRound:
-    """Result of one Trainer.step(): the batch consumed + the algo's stats."""
+    """Result of one Trainer.step(): what the round cost + the algo's stats.
+
+    ``batch_size`` is the samples the update consumed; ``env_steps`` is the
+    decision points the rollout played to produce them. They coincide under
+    mirror self-play and diverge under any controller that discards a seat.
+    """
 
     batch_size: int
+    env_steps: int
     stats_keys: tuple[str, ...]
 
 
@@ -75,6 +114,14 @@ class Trainer:
     The Trainer is the only object the pipeline constructs; it hides the
     UpdateRule/controller wiring from callers. Adding an algorithm or a new
     self-play mode requires no Trainer edits (AGENTS.md §4).
+
+    A controller may collect for several learners (the league's main and its
+    two exploiters). Each learner needs its OWN rule, because a gradient step
+    is only valid on the policy that generated the batch — applying one
+    learner's samples to another's parameters is an off-policy update with a
+    behavior policy nobody chose. Pass those rules as ``extra_rules``; the
+    Trainer dispatches on the collecting policy's identity and refuses a batch
+    from a learner it has no rule for (AGENTS.md §11: no silent fallback).
     """
 
     def __init__(
@@ -82,21 +129,37 @@ class Trainer:
         policy: Policy,
         update_rule: UpdateRule,
         controller: SelfPlayController,
+        *,
+        extra_rules: Sequence[UpdateRule] = (),
     ) -> None:
         self.policy = policy
         self.update_rule = update_rule
         self.controller = controller
+        self._rules: tuple[UpdateRule, ...] = (update_rule, *extra_rules)
         self.controller.set_learner(policy)
 
     def step(self) -> TrainRound:
-        """One train round: collect a batch under the current policy, then update."""
+        """One train round: collect a batch, then update ITS learner."""
         self.controller.set_learner(self.policy)
-        batch = self.controller.collect()
-        stats = self.update_rule.step(batch)
+        collected = self.controller.collect()
+        stats = self._rule_for(collected.learner).step(collected.batch)
         self._last_stats = stats
         return TrainRound(
-            batch_size=batch.size,
+            batch_size=collected.batch.size,
+            env_steps=collected.sampled_steps,
             stats_keys=tuple(k for k in stats.__dict__ if k != "extra"),
+        )
+
+    def _rule_for(self, learner: Policy) -> UpdateRule:
+        """The rule that owns ``learner``, matched by identity."""
+        for rule in self._rules:
+            if rule.policy is learner:
+                return rule
+        raise RuntimeError(
+            f"{type(self.controller).__name__} collected a batch for a policy with no "
+            f"UpdateRule ({type(learner).__name__} at {id(learner):#x}); the Trainer holds "
+            f"{len(self._rules)} rule(s). Every learner a controller reports via learners() "
+            "must get its own rule — see Trainer's docstring."
         )
 
     @property
@@ -124,11 +187,14 @@ class MirrorSelfPlay(SelfPlayController):
     def set_learner(self, policy: Policy) -> None:
         self._learner = policy
 
-    def collect(self) -> Batch:
+    def collect(self) -> Collected:
         if self._learner is None:
             raise RuntimeError("MirrorSelfPlay.collect called before set_learner")
         # Both seats play the learner; the runner handles env stepping.
-        return self._runner.run_episode(learner=self._learner, opponent=self._learner)
+        batch = self._runner.run_episode(learner=self._learner, opponent=self._learner)
+        # Both seats belong to the learner, so nothing is discarded and the
+        # retained batch IS the simulated cost.
+        return Collected(batch=batch, learner=self._learner, sampled_steps=batch.size)
 
     @property
     def name(self) -> str:

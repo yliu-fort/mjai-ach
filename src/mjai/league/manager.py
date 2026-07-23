@@ -92,6 +92,8 @@ class LeagueManager:
         # Telemetry counters (B7), surfaced via stats().
         self._promotions_total: int = 0
         self._main_snapshots_total: int = 0
+        # Roles whose live weights are owed a reset, applied by begin_round.
+        self._pending_reset: set[Role] = set()
 
     # ---- per-round matchup decisions ----
 
@@ -207,16 +209,32 @@ class LeagueManager:
         if beaten / total >= self.config.league_exploiter_share:
             self._promote(Role.LEAGUE_EXPLOITER, self._clone(self.league_exploiter))
 
-    def _promote(self, role: Role, snapshot: Policy) -> None:
-        """Save the exploiter snapshot to the pool and reset its live weights."""
-        self.store.add(snapshot, role, train_step=self._main_steps)
-        self._promotions_total += 1
-        target = self.main_exploiter if role == Role.MAIN_EXPLOITER else self.league_exploiter
+    def begin_round(self, role: Role) -> None:
+        """Apply any reset owed to ``role`` before it collects again.
+
+        Promotion is decided from a round's OUTCOME, so it necessarily happens
+        after that round's batch was collected — but the batch has not been
+        learned from yet. Resetting the live weights right there would leave
+        the caller holding samples drawn from weights that no longer exist,
+        making the ensuing gradient step off-policy through no fault of the
+        algorithm. Deferring the reset to the start of the role's next round
+        keeps every batch on-policy for the weights it updates.
+        """
+        if role not in self._pending_reset:
+            return
+        self._pending_reset.discard(role)
+        target = self._policy_for_role(role)
         if self.config.reset_mode == "random":
-            fresh = self._make_policy()
-            self._copy_weights(fresh, target)
+            self._copy_weights(self._make_policy(), target)
         else:  # "to_main" — locked default
             self._copy_weights(self.main, target)
+
+    def _promote(self, role: Role, snapshot: Policy) -> None:
+        """Save the exploiter snapshot to the pool and queue its reset."""
+        self.store.add(snapshot, role, train_step=self._main_steps)
+        self._promotions_total += 1
+        # The reset itself lands in begin_round (see there for why).
+        self._pending_reset.add(role)
         # Clear the window so the reset exploiter re-earns its record.
         if role == Role.MAIN_EXPLOITER:
             self._me_window.clear()
@@ -226,11 +244,19 @@ class LeagueManager:
     # ---- helpers ----
 
     def stats(self) -> dict[str, int]:
-        """League health counters for the runner's telemetry (B7, AGENTS.md §6)."""
+        """League health counters for the runner's telemetry (B7, AGENTS.md §6).
+
+        The per-role pool composition is reported alongside the total size:
+        eviction prefers the oldest MAIN snapshot (CheckpointStore), so a pool
+        fed more promotions than snapshots silently loses its entire history
+        bucket — which the sampler then falls back out of, into the current
+        main. ``pool_size`` alone cannot show that; the breakdown can.
+        """
         return {
             "pool_size": len(self.store),
             "promotions_total": self._promotions_total,
             "main_snapshots_total": self._main_snapshots_total,
+            **{f"pool_{role}": count for role, count in self.store.snapshot_summary().items()},
         }
 
     def _policy_for_role(self, role: Role) -> Policy:

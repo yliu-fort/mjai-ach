@@ -110,8 +110,11 @@ def test_b1_promotion_reset_makes_exploiter_identical_to_main():
         for p in main.parameters():
             p.add_(0.05)
     assert not _params_equal(main, mgr.main_exploiter)
-    # One won round of 4 episodes fills the window past the threshold.
+    # One won round of 4 episodes fills the window past the threshold. The
+    # reset is applied at the start of the role's next round, so that the batch
+    # collected by the promoting round stays on-policy for its own weights.
     mgr.record_exploiter_match(Role.MAIN_EXPLOITER, opponent=main, won=True, n_episodes=4)
+    mgr.begin_round(Role.MAIN_EXPLOITER)
     assert _params_equal(main, mgr.main_exploiter)
     obs = [0.25, -0.5, 1.0, 0.75]
     legal = [0, 1, 2]

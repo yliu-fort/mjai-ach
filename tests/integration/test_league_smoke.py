@@ -48,14 +48,21 @@ def _build_trainer(rule_cls, **rule_kwargs):
 
     cfg = LeagueConfig(main_save_every_rounds=2, capacity=8, promo_window=4)
     mgr = LeagueManager(main, make_policy, copy_weights, config=cfg)
-    # ACH (CFR+ wrapper) requires the GameSpec; PPO doesn't.
-    if rule_cls is TabularACHUpdate:
-        rule = rule_cls(main, spec, AlgoConfig(learning_rate=0.1), **rule_kwargs)
-    else:
-        rule = rule_cls(main, AlgoConfig(learning_rate=0.1), **rule_kwargs)
+
+    def make_rule(policy: TabularPolicy):
+        # ACH (CFR+ wrapper) requires the GameSpec; PPO doesn't.
+        if rule_cls is TabularACHUpdate:
+            return rule_cls(policy, spec, AlgoConfig(learning_rate=0.1), **rule_kwargs)
+        return rule_cls(policy, AlgoConfig(learning_rate=0.1), **rule_kwargs)
+
+    rule = make_rule(main)
     runner = RolloutWorkerCore(spec, learner_player=0, config=RolloutConfig(n_episodes=20, seed=42))
     ctrl = LeagueSelfPlay(mgr, runner, episodes_per_round=20)
-    return Trainer(policy=main, update_rule=rule, controller=ctrl), mgr, main
+    # One rule per collecting role: the exploiters train their own weights
+    # rather than pushing their samples through the main agent's rule.
+    extra = [make_rule(p) for p in ctrl.learners() if p is not main]
+    trainer = Trainer(policy=main, update_rule=rule, controller=ctrl, extra_rules=extra)
+    return trainer, mgr, main
 
 
 @pytest.mark.slow

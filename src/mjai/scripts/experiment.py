@@ -81,7 +81,18 @@ def run_experiment(cfg: ExperimentConfig) -> Path:
     policy = build_policy(spec, cfg, seed=cfg.seed)
     rule = build_update_rule(policy, cfg, spec)
     controller = build_controller(spec, policy, cfg, rng=rng)
-    trainer = Trainer(policy=policy, update_rule=rule, controller=controller)
+    # A league controller collects for its exploiters as well as the main
+    # agent; each needs its own rule so a role's samples update that role's
+    # weights. This layer sits above both algos and league, so it is the one
+    # place allowed to pair them (AGENTS.md §2).
+    extra_rules = [
+        build_update_rule(learner, cfg, spec)
+        for learner in controller.learners()
+        if learner is not policy
+    ]
+    trainer = Trainer(
+        policy=policy, update_rule=rule, controller=controller, extra_rules=extra_rules
+    )
 
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -144,13 +155,22 @@ def _train_loop(
         )
     while _should_continue(cfg, step, env_steps):
         step += 1
-        batch_size = trainer.step().batch_size
-        env_steps += batch_size  # 1 env-step = 1 sampled decision point
+        round_ = trainer.step()
+        # 1 env-step = 1 decision point the rollout actually played, INCLUDING
+        # seats whose transitions the controller discarded. Counting only the
+        # retained samples would let a mode that drops a seat buy twice the
+        # simulation for the same nominal budget (mirror keeps both seats,
+        # league keeps one), which makes the two modes' curves incomparable.
+        env_steps += round_.env_steps
         if bar is not None:
-            bar.update(batch_size)
+            bar.update(round_.env_steps)
         stats = trainer.last_stats
         if stats:
             _log_stats(writer, step, stats)
+        # The round's two costs, logged separately so an audit never has to
+        # infer one from the other (tools/league_diagnose.py reads both).
+        writer.add_scalar("train/sampled_steps", float(round_.env_steps), step)
+        writer.add_scalar("train/batch_size", float(round_.batch_size), step)
         log_league_health(writer, step, trainer.controller)  # B7: league/* scalars
         if cfg.verbose and step % max(1, cfg.n_steps // 20) == 0:
             _print_progress(cfg, step, stats, env_steps=env_steps)
