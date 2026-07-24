@@ -83,6 +83,42 @@ def read_tags(tb_dir: str | Path, tags: Sequence[str]) -> dict[str, list[tuple[i
     return out
 
 
+def downsample(
+    points: list[tuple[int, float]], max_points: int, *, preserve_peaks: bool = False
+) -> list[tuple[int, float]]:
+    """Thin a ``[(step, value)]`` curve to at most ``max_points`` for DISPLAY.
+
+    Read-side only — the event files keep their full per-update resolution
+    (experiment.py logs ``train/*`` at every update on purpose, because the
+    blow-ups the telemetry exists to catch are intermittent). This just bounds
+    what a plot has to carry: a paper-budget run is ~1.5e5 updates per tag, and
+    plotting or pickling every point across seeds x tags is the cost the
+    notebooks were paying.
+
+    ``max_points <= 0`` disables thinning. Points are bucketed into
+    ``max_points`` contiguous index ranges and one representative is kept per
+    bucket:
+
+    - default: the bucket's LAST point (uniform stride; the exact tail value
+      survives, which matters for "final" readouts);
+    - ``preserve_peaks``: the bucket's largest-magnitude point, so an
+      intermittent grad-norm spike is not strided away. The kept point carries
+      its own step, so the spike still plots at the right x.
+    """
+    n = len(points)
+    if max_points <= 0 or n <= max_points:
+        return points
+    out: list[tuple[int, float]] = []
+    for b in range(max_points):
+        lo = (b * n) // max_points
+        hi = ((b + 1) * n) // max_points
+        if lo >= hi:
+            continue
+        bucket = points[lo:hi]
+        out.append(max(bucket, key=lambda sv: abs(sv[1])) if preserve_peaks else bucket[-1])
+    return out
+
+
 def _read_one(args: tuple[str, str]) -> tuple[str, list[tuple[int, float]]]:
     tb_dir, tag = args
     return tb_dir, read_eval_curve(tb_dir, tag)
@@ -97,6 +133,46 @@ def read_many(
         return {}
     with ProcessPoolExecutor(max_workers=min(workers, len(jobs))) as pool:
         return dict(pool.map(_read_one, jobs))
+
+
+def _read_tags_downsampled(
+    args: tuple[str, tuple[str, ...], int, tuple[str, ...]],
+) -> tuple[str, dict[str, list[tuple[int, float]]]]:
+    tb_dir, tags, max_points, peak_tags = args
+    peaks = set(peak_tags)
+    series = read_tags(tb_dir, tags)  # ONE pass over the file for all tags
+    thinned = {
+        tag: downsample(pts, max_points, preserve_peaks=tag in peaks) for tag, pts in series.items()
+    }
+    return tb_dir, thinned
+
+
+def read_many_tags(
+    tb_dirs: list[str | Path],
+    tags: Sequence[str],
+    *,
+    max_points: int = 2000,
+    peak_tags: Sequence[str] = (),
+    workers: int = 6,
+) -> dict[str, dict[str, list[tuple[int, float]]]]:
+    """Parallel, single-pass, downsampled read of many per-update ``train/*`` curves.
+
+    The telemetry cells used to call :func:`read_many` once per tag — N full
+    scans of each (often 50-90 MB) event file — and then shipped and plotted
+    every per-update point. This reads ALL ``tags`` in ONE pass per file
+    (:func:`read_tags`) and thins each curve to ``max_points`` INSIDE the
+    worker, so the full-resolution list never crosses the process boundary or
+    reaches matplotlib. Tags in ``peak_tags`` keep their spikes
+    (``preserve_peaks``); everything else is strided.
+
+    Returns ``{tb_dir_str: {tag: [(step, value)]}}``; tags absent from a file
+    are absent from its inner dict (never a misleading empty list).
+    """
+    jobs = [(str(d), tuple(tags), max_points, tuple(peak_tags)) for d in tb_dirs]
+    if not jobs:
+        return {}
+    with ProcessPoolExecutor(max_workers=min(workers, len(jobs))) as pool:
+        return dict(pool.map(_read_tags_downsampled, jobs))
 
 
 if __name__ == "__main__":

@@ -162,6 +162,7 @@ edit the builder and regenerate):
 | `phase1_one_click.ipynb` | `tools/build_notebook.py` | the whole Phase-1 matrix |
 | `ab_<game>.ipynb` | `tools/build_league_notebooks.py` | mirror vs league (F2) |
 | `theta_<game>.ipynb` | `tools/build_theta_notebooks.py` | PPO⟷ACH theta scan (D11) |
+| `ppo_vs_ach_<game>.ipynb`, `sgd_vs_adam_<game>.ipynb` | `tools/build_ab_factor_notebooks.py` | single-factor A/B isolating one axis (algorithm or optimizer) on liar's dice, mirror — backed by `tools/ab_factor_probe.py`. Adds one arm per side; `ppo_vs_ach` separates "policy term alone" (theta=0 on the ACH scaffold) from "each algorithm as its authors intended" (tuned-PPO config); `sgd_vs_adam` holds ACH fixed and varies the optimizer (the Adam arms emit the expected `ACHFidelityWarning`). |
 
 `notebooks/phase1_one_click.ipynb` is the single human-facing entry point:
 - One parameterized cell at the top (game, algo, mode, or "run all 28 cells").

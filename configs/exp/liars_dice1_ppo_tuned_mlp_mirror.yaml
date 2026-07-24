@@ -1,0 +1,54 @@
+# PPO under its OWN best practices — the "tuned PPO" arm of the PPO-vs-ACH A/B
+# (notebooks/ppo_vs_ach_liars_dice1.ipynb).
+#
+# This is the experiment liars_dice1_ppo_mlp_mirror.yaml's header points at:
+# that file is PPO's clipped-surrogate policy term on ACH's SGD scaffolding, so
+# it differs from the ACH arm by the policy term ALONE (a valid theta control).
+# THIS file instead turns on the knobs Engstrom et al.'s "37 implementation
+# details" recommend for PPO, so the comparison is "each algorithm as its
+# authors intended", not a one-factor swap. It is deliberately NOT paper-faithful
+# ACH scaffolding; the ACH term carries zero weight here (theta=0), so no
+# ACHFidelityWarning fires.
+game: liars_dice1
+algo: ppo                 # theta=0: PPO clipped surrogate (no ACH term)
+self_play_mode: mirror
+policy_kind: mlp
+# Network (p25): 1 hidden FC layer of 128 units + ReLU, then two linear heads.
+hidden_sizes: [128]
+activation: relu
+# --- PPO best practices (the knobs the ACH scaffold deliberately leaves off) ---
+optimizer: adam           # 37-details #3: Adam, not constant-LR SGD
+learning_rate: 0.0003     # 37-details #1: Adam LR 3e-4 (SGD's 1e-3 is too hot for Adam)
+adam_eps: 1.0e-5          # 37-details #3: Adam epsilon 1e-5
+normalize_advantages: true  # 37-details #7: per-batch advantage normalization
+max_grad_norm: 0.5        # 37-details #11: global grad clipping at 0.5
+n_epochs: 4               # 37-details #6: multiple update epochs per batch
+clip_eps: 0.2             # PPO clip range (37-details #8)
+# --- Shared with the ACH arm (network, coefficients, batch, eval cadence) ---
+value_coef: 1.0           # alpha=2.0 (p27 Table 7) <=> value_coef=1.0 in alpha/2*MSE form
+entropy_coef: 0.01        # beta = 1e-2 (p28 Table 8)
+gae_lambda: 0.95          # spec assumption A1
+eta: 1.0   # ACH-only; inert at theta=0
+l_th: 2.0   # ACH-only; inert at theta=0
+ratio_eps: 0.5   # ACH-only; inert at theta=0
+# Batch = 64 samples (p28 Table 8): whole episodes until >=64 transitions.
+target_samples: 64
+episodes_per_round: 200  # safety cap only (target_samples stops first)
+# Env-step protocol (p25-26): evaluate every 1e5 steps, train to 1e7 steps.
+total_env_steps: 10000000
+eval_every_env_steps: 100000
+# Legacy round-mode fields (unused while total_env_steps is set).
+n_steps: 1000000
+save_every_steps: 1000
+eval_every_steps: 1000
+eval_during_training: true
+verbose: false
+seed: 0
+out_dir: runs/liars_dice1_ppo_tuned_mlp_mirror
+hedge_eta: null
+league_capacity: 16
+device: null
+# Logit-scale handling shared with the ACH arm (docs/reproduce_report.md §6.5).
+trunk_layernorm: true
+gate_centered_logits: false   # ACH-only; inert at theta=0
+loss_centered_logits: false   # ACH-only; inert at theta=0
