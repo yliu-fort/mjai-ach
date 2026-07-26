@@ -15,23 +15,25 @@ evidence. Verify the current code still reproduces it::
     uv run python tools/gen_nn_golden.py --check   # must print OK
 
 The check requires every recorded parameter tensor and every recorded stat to
-match exactly; telemetry keys the fixture does not carry are allowed to be
-added (the merge did exactly that — ``grad_norm`` became available on the PPO
-arms, which the old PPO endpoint never computed). Removing or changing a
-recorded value fails.
+be reproduced to within the tolerance defined below; telemetry keys the fixture
+does not carry are allowed to be added (the merge did exactly that —
+``grad_norm`` became available on the PPO arms, which the old PPO endpoint
+never computed). Removing or changing a recorded value fails.
 
 Scenario configs are plain :class:`AlgoConfig` kwargs; pre-merge a small
 adapter mapped them onto the two old constructors and asserted that every
 knob that did not exist yet carried the value the old code hardcoded.
 
 All tensors are stored as Python floats (doubles), which round-trip float32
-exactly, so equality checks are exact rather than tolerance-based.
+exactly, so the fixture itself loses nothing; the tolerance exists purely to
+absorb the platform's float32 rounding, not the serialization's.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -41,6 +43,43 @@ import torch
 
 REPO = Path(__file__).resolve().parents[1]
 OUT_PATH = REPO / "tests" / "unit" / "data" / "nn_updates_golden.json"
+
+# ---- reproduction tolerance (AGENTS.md §5) ----------------------------------
+#
+# The fixture records float32 arithmetic. Re-running it on a different platform
+# (BLAS/oneDNN build, SIMD width, FMA contraction, torch release) evaluates the
+# SAME expressions in a different association order, so the last bits move. That
+# is not a numerics change and must not fail the gate; exact equality made this
+# check pass only on the machine that happened to generate the fixture.
+#
+# Measured spread, fixture platform vs. a Linux/x86-64 CPU torch build (both
+# agree with the macOS/CPU build that first exposed the exact-equality failure):
+#
+#   post-step parameter tensors   <= 1.4 float32 ulp   (rel <= 1.7e-07)
+#   scalar stats                  <= 4.4 float32 ulp   (rel <= 5.3e-07)
+#
+# Parameters stay within ~1 ulp of their own magnitude because each is a direct
+# arithmetic result. The stats run wider only where a diagnostic is built by
+# cancellation -- ``explained_variance`` is ``1 - var(resid)/var(returns)``, so a
+# 1-ulp error on its O(1) inputs shows up as several ulp relative to a result of
+# 0.23. That amplification is a fixed property of the frozen scenarios, not
+# something that drifts per platform, so bounding it is safe.
+#
+# Hence a relative tolerance of 1e-6 (~8 float32 ulp: 1e-6 / 2**-23 = 8.4),
+# roughly 5x the observed spread. The stats additionally get an absolute floor
+# of 1e-6 -- ~8 ulp of the O(1) scale those cancelling diagnostics are actually
+# computed at -- which is what buys headroom on a small-magnitude result like
+# the 0.23 above. Parameters get NO absolute floor: the smallest one recorded is
+# 7.0e-04, and a 1e-6 floor there would swamp the value itself.
+#
+# This stays a real gate. The tolerance is three orders of magnitude below the
+# smallest genuine numerics change that could be constructed against these
+# scenarios: nudging ``eta`` by 0.1% moves the stats by 1.2e-03, and flipping
+# ``loss_centered_logits`` moves them by 1.1e+00. Even a 1-part-per-million
+# change to the learning rate still shows up in the parameters at 4.1e-06.
+STAT_REL_TOL = 1e-6
+STAT_ABS_TOL = 1e-6
+PARAM_REL_TOL = 1e-6
 
 # Shared ACH knobs: the shipped reproduction defaults (configs/exp/*_ach_mlp_*.yaml
 # -- SGD lr=1e-3, alpha=2.0 <=> value_coef=1.0, beta=1e-2, no grad clipping,
@@ -77,6 +116,42 @@ PPO_LEGACY: dict[str, Any] = {
     "optimizer": "adam",
     "normalize_advantages": True,
 }
+
+
+def relative_deviation(want: float, got: float) -> float:
+    """``|want - got|`` over the larger magnitude; ``inf`` if only one is zero."""
+    if want == got:
+        return 0.0
+    scale = max(abs(want), abs(got))
+    return math.inf if scale == 0.0 else abs(want - got) / scale
+
+
+def stat_matches(want: float, got: float) -> bool:
+    """Compare one recorded scalar stat (tolerance rationale at the top)."""
+    return math.isclose(want, got, rel_tol=STAT_REL_TOL, abs_tol=STAT_ABS_TOL)
+
+
+def param_matches(want: Any, got: Any) -> bool:
+    """Compare one recorded parameter tensor elementwise, shape included."""
+    if isinstance(want, list) != isinstance(got, list):
+        return False
+    if isinstance(want, list):
+        return len(want) == len(got) and all(
+            param_matches(w, g) for w, g in zip(want, got, strict=True)
+        )
+    return math.isclose(want, got, rel_tol=PARAM_REL_TOL)
+
+
+def param_deviation(want: Any, got: Any) -> float:
+    """Worst elementwise relative deviation; ``inf`` if the shapes disagree."""
+    if isinstance(want, list) or isinstance(got, list):
+        if not (isinstance(want, list) and isinstance(got, list)) or len(want) != len(got):
+            return math.inf
+        return max(
+            (param_deviation(w, g) for w, g in zip(want, got, strict=True)),
+            default=0.0,
+        )
+    return relative_deviation(want, got)
 
 
 def _scenarios() -> list[dict[str, Any]]:
@@ -328,9 +403,12 @@ def build_fixture() -> dict[str, Any]:
 def diff_against_committed(fixture: dict[str, Any], committed: dict[str, Any]) -> list[str]:
     """Return human-readable differences; empty list means the fixture holds.
 
-    Every recorded parameter and stat must match exactly. Telemetry keys absent
-    from the committed fixture may be present in the fresh run (additive
-    observability is not a numerics change); the reverse is a failure.
+    Every recorded parameter and stat must be reproduced to within the tolerance
+    at the top of this module -- the same comparison
+    ``tests/unit/test_algos_nn_theta.py`` applies, so the two gates cannot
+    disagree. Telemetry keys absent from the committed fixture may be present in
+    the fresh run (additive observability is not a numerics change); the reverse
+    is a failure.
     """
     diffs: list[str] = []
     fresh_by_name = {sc["name"]: sc for sc in fixture["scenarios"]}
@@ -346,13 +424,23 @@ def diff_against_committed(fixture: dict[str, Any], committed: dict[str, Any]) -
             for key, value in a.items():
                 if key == "extra":
                     for ek, ev in value.items():
-                        if b["extra"].get(ek) != ev:
-                            diffs.append(f"{name} step{i} extra.{ek}: {ev} != {b['extra'].get(ek)}")
-                elif b.get(key) != value:
-                    diffs.append(f"{name} step{i} {key}: {value} != {b.get(key)}")
+                        fresh = b["extra"].get(ek)
+                        if fresh is None or not stat_matches(ev, fresh):
+                            diffs.append(f"{name} step{i} extra.{ek}: {ev} != {fresh}")
+                else:
+                    fresh = b.get(key)
+                    if fresh is None or not stat_matches(value, fresh):
+                        diffs.append(f"{name} step{i} {key}: {value} != {fresh}")
         for pname, pvals in want["expected"]["params"].items():
-            if got["expected"]["params"].get(pname) != pvals:
-                diffs.append(f"{name}: parameter {pname} differs after the update")
+            fresh_p = got["expected"]["params"].get(pname)
+            if fresh_p is None:
+                diffs.append(f"{name}: parameter {pname} missing from the fresh run")
+            elif not param_matches(pvals, fresh_p):
+                diffs.append(
+                    f"{name}: parameter {pname} differs after the update "
+                    f"(worst relative deviation {param_deviation(pvals, fresh_p):.3e}, "
+                    f"tolerance {PARAM_REL_TOL:.0e})"
+                )
     return diffs
 
 
