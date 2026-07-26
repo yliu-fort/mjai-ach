@@ -124,6 +124,32 @@ current 0.205→0.182，作为候选默认（论文偏离，需治理决策）�
 **梯度方向**——B2（legalmean，去非法漂移污染）+ B3（seqform BR 当 oracle 优势教师，去
 评论家噪声），让 current 能"抓住"高 l_th 访问到的更优策略（best 0.148），而非振荡丢弃。
 
+### Phase C 多 seed 确认 + 更紧截断探针
+
+补 B1 获胜臂（l_th=2, iw_clip=20）seed 1–3 + 更紧的 iw_clip=10 探针。同时确认 **B2
+（legalmean）在当前 LayerNorm + raw-logit 门控下是空操作**（`gate_centered=false` 且
+`loss_centered=false` 时，`centered`（legalmean 编辑的对象）根本不进损失/门控——非法漂移
+已被 LayerNorm+raw-gate 化解，§6.2 是 pre-LayerNorm 现象）：
+
+| 臂 | current | avg | best |
+|---|---|---|---|
+| B1 seed 0 (iw20) | 0.182 | 0.159 | 0.163 |
+| B1 seed 1 (iw20) | 0.183 | **0.158** | 0.159 |
+| B1 seed 2 (iw20) | 0.193 | 0.170 | 0.160 |
+| B1 seed 3 (iw20) | 0.178 | 0.166 | 0.155 |
+| iw_clip=10 seed 0 | 0.209 | 0.168 | 0.169 |
+
+- **B1 (iw20) 4-seed avg = 0.159 / 0.158 / 0.170 / 0.166，均值 ~0.163，四个 seed 全部低于
+  论文 0.171 和 baseline 0.184**；current 4-seed 均值 ~0.184（vs baseline 0.205）。**修复
+  稳健、可落地，不是 seed 0 运气。**
+- **iw_clip=10 反而更差**（avg 0.168 vs iw20 的 0.159；current 0.209 vs 0.182）——截断过紧
+  伤策略。**iw_clip=20 是甜点**，不是"越紧越好"。
+
+→ **最终结论：`iw_clip=20` 是 liars 地板的稳健修复**（avg floor 0.184→0.163 破论文；
+current 0.205→0.184，4-seed 一致）。建议作为候选默认（论文偏离，治理决策）。再往下逼近 0
+只剩 B3（oracle 优势，半监督，换算法）——已超出 model-free ACH 范畴，留作独立课题；B2 在
+本配置下无效，已排除。
+
 ## 5. 方法论与限制
 
 - **单 seed**：β-sweep（5 点趋势）与 l_th 熵单调性都鲁棒；决赛修复臂（B1+B4）需 2–3 seed。
@@ -135,7 +161,8 @@ current 0.205→0.182，作为候选默认（论文偏离，需治理决策）�
 
 - Phase A 配置：`configs/exp/liars_dice1_ach_mlp_beta_{3e-3,1e-3,1e-4,0}.yaml`。
 - Phase B 配置：`configs/exp/liars_dice1_ach_mlp_lth_{1,4,8,1e6}.yaml`（l_th=2 = anchor）。
-- Phase C 配置：`configs/exp/liars_dice1_ach_mlp_fix_{lth2_iw20,lth4_iw20,lth8_iw20,lth8_iw100}.yaml`。
+- Phase C 配置：`configs/exp/liars_dice1_ach_mlp_fix_{lth2_iw20,lth4_iw20,lth8_iw20,lth8_iw100}.yaml`；
+  多 seed 确认：`..._fix_lth2_iw20_s{1,2,3}.yaml` + `..._fix_lth2_iw10.yaml`。
 - Phase C 旋钮：`AlgoConfig.iw_clip`（`update_rule.py` / `nn_losses.py` /
   `nn_updates.py` / `experiment_build.py`；默认 `None`=论文忠实，损失逐位不变）。
 - 分析：`tools/beta_floor_sweep.py`、`tools/lth_floor_sweep.py`、`tools/fix_floor.py` →
