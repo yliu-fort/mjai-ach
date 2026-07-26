@@ -137,6 +137,25 @@ protects the paper reproduction from collateral damage.
 - Tests do not require GPU unless explicitly marked `@pytest.mark.gpu`; the fast
   unit suite (run at pre-commit) is CPU-only and <20s.
 - A test that fails intermittently is a bug. Fix it or mark it `xfail` with a reason.
+  **A test that passes only on the machine that produced its fixture is the same
+  bug**, even though it fails deterministically. Float32 results are reproducible
+  per platform, not across them: a different BLAS, SIMD width, FMA contraction, or
+  torch build evaluates the same expression in a different association order and
+  moves the last bits. Assert a tolerance, not equality.
+- **Tolerance for float32 golden comparisons.** `rel_tol = 1e-6` (~8 float32 ulp)
+  is this repo's default, with a `1e-6` absolute floor for cancellation-heavy
+  scalars (`explained_variance` and friends carry the rounding error of their
+  O(1) inputs, not of their own smaller magnitude) and **no** absolute floor for
+  parameter tensors, whose recorded values run as small as 7e-04. It is set from
+  measurement, not taste: the observed cross-platform spread on
+  `tests/unit/data/nn_updates_golden.json` is ≤4.4 ulp, while the mildest genuine
+  numerics change those scenarios can express moves values by 1.2e-03 — so the
+  tolerance sits ~5x above the noise and ~1000x below the signal. The comparison
+  itself lives in `tools/gen_nn_golden.py` (`stat_matches` / `param_matches`) and
+  is imported by `tests/unit/test_algos_nn_theta.py`, so the D11 fixture gate and
+  the §4 `--check` gate cannot drift apart. Widening it is a decision about D11's
+  evidence: `test_golden_tolerance_still_rejects_a_real_numerics_change` fails if
+  the tolerance ever grows enough to swallow a changed ACH operator.
 
 ---
 

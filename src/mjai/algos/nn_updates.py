@@ -20,8 +20,9 @@ Turning on a knob the paper contradicts while ``theta > 0`` emits an
 
 The loss math itself lives in :mod:`mjai.algos.nn_losses`, so there is exactly
 one implementation of the ACH operator in the repo. ``theta=1`` with the
-shipped ACH config is pinned bit-exactly by
-``tests/unit/data/nn_updates_golden.json`` (see ``tools/gen_nn_golden.py``).
+shipped ACH config is pinned numerically by
+``tests/unit/data/nn_updates_golden.json`` (see ``tools/gen_nn_golden.py``,
+which owns the comparison tolerance and the measurements behind it).
 """
 
 from __future__ import annotations
