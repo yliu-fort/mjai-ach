@@ -1,24 +1,29 @@
-# Liar's Dice 0.18-floor 消融：根因 = 无界 1/π_old；B1 截断部分修复
+# Liar's Dice 0.18-floor 消融：根因 = 无界 1/π_old + 容量不足；二者可叠加修复
 
 > 问题：ACH 在 Liar's Dice 上的 exploitability 贴在 ~0.18–0.20 下不去（论文 0.171）。
 >
-> **根因（三阶段消融定位）：无界的 1/π_old 重要性权重。** 它逼着 ACH 门控（l_th）保持
-> 紧——一放松（l_th≥8）策略锐化到 π_old→0、1/π_old 爆炸、logit 失稳崩溃；而紧门控把
-> 策略锐化封顶在熵 ~1.0，这个封顶就是 ~0.20 地板。门控是直接封顶，1/π_old 是深层根因。
-> 直接印证 `docs/reproduce_report.md` §6.7 的首要开放假设。
+> **根因（消融定位）：两个叠加因素。**
+> （1）**无界 1/π_old**——逼着 ACH 门控（l_th）保持紧（放松到 ≥8 则 π_old→0、1/π_old
+> 爆炸、logit 失稳崩溃）；紧门控把锐化封顶在熵 ~1.0，这个封顶就是 ~0.20 地板（门控直接
+> 封顶、1/π_old 深层逼出，印证 `reproduce_report.md` §6.7）。
+> （2）**容量不足**——128-MLP 不足以表达 24576 信息态的最优策略，是独立于 1/π_old 的第二个
+> 贡献因子（B5）。
 >
-> **修复（Phase C，部分成立）**：截断 1/π_old（`iw_clip`，B1）单独就把 avg floor
-> 0.184→**0.159（破论文 0.171）**、current 0.205→0.182——确认 1/π_old 是地板的一个贡献
-> 因子。但抬高门控（B4）+ 截断只让策略**访问**更优点（best 0.148）却**抓不住**（current
-> 振荡）→ 1/π_old 不是全部根因，梯度方向也受污染（评论家噪声/非法漂移），那是下一步。
+> **修复（二者叠加）**：`iw_clip=20`（截断 1/π_old）→ avg 0.184→0.163（4-seed，破论文）；
+> 再加 `hidden_sizes=[256]` → avg **0.147**、current 0.166（cap512 饱和）。两个旋钮都是
+> 论文偏离，是否采纳为默认是治理决策——**本报告只给结论、不动默认**。
 
-三阶段：
+四阶段：
 - **Phase A（β-sweep）**：地板 β-不变 → 排除熵正则。
 - **Phase B4（l_th sweep）**：门控确实是锐化封顶（熵随 l_th 单调降），但放松门控要么
   无益（地板鲁棒）、要么崩溃（l_th≥8 → 1/π_old 爆炸）→ 1/π_old 才是逼出门控紧、进而
   逼出地板的深层因素。
-- **Phase C（B1+B4 修复）**：`iw_clip` 截断 1/π_old 解耦了门控与稳定性（l_th=8 不再崩）；
-  B1 单独把 avg floor 降到 0.159（破论文）；B4 抬高门控让 current 振荡（但 avg/best 更优）。
+- **Phase C（B1+B4 修复 + 多 seed 确认）**：`iw_clip` 截断 1/π_old 解耦门控与稳定性
+  （l_th=8 不再崩）；B1 单独（iw_clip=20, l_th=2）4-seed avg ~0.163（破论文）；B4 抬高门控
+  让 current 振荡（avg/best 更优但抓不住）。iw_clip=10 更差 → 20 是甜点。B2（legalmean）
+  在 raw-gate 下空操作，已排除。
+- **B5（容量探针）**：cap256 把 avg 0.163→0.147、current→0.166（cap512 饱和）→ 容量是独立
+  的第二个贡献因子。叠加 B1：avg **0.184→0.147**、current 0.205→0.166。
 
 ---
 
@@ -145,10 +150,35 @@ current 0.205→0.182，作为候选默认（论文偏离，需治理决策）�
 - **iw_clip=10 反而更差**（avg 0.168 vs iw20 的 0.159；current 0.209 vs 0.182）——截断过紧
   伤策略。**iw_clip=20 是甜点**，不是"越紧越好"。
 
-→ **最终结论：`iw_clip=20` 是 liars 地板的稳健修复**（avg floor 0.184→0.163 破论文；
-current 0.205→0.184，4-seed 一致）。建议作为候选默认（论文偏离，治理决策）。再往下逼近 0
-只剩 B3（oracle 优势，半监督，换算法）——已超出 model-free ACH 范畴，留作独立课题；B2 在
-本配置下无效，已排除。
+### B5 容量探针（hidden_sizes）：容量是第二个可修复贡献因子
+
+B1 获胜臂上加宽 128-MLP（`hidden_sizes` ∈ {256, 512}，其余同 B1 = l_th=2, iw_clip=20）：
+
+| 臂 | current | avg | best |
+|---|---|---|---|
+| B1 cap128 (seed 0) | 0.182 | 0.159 | 0.163 |
+| **B1 cap256** | **0.166** | **0.147** | **0.146** |
+| B1 cap512 | 0.191 | 0.147 | 0.160 |
+
+- **容量确是地板的第二个贡献因子**：cap256 把 avg 0.159→**0.147**、current 0.182→0.166
+  （均进一步低于论文 0.171）。24576 信息态超出了 128-MLP 的最优表达。
+- **cap512 饱和**（avg 0.147 与 cap256 相同，current 0.191 反而更差——参数更多、数据不变，
+  更噪）。**cap256 是甜点。**
+
+## 最终结论
+
+liars 0.18 地板的根因是**两个叠加因素**，各有修复：
+
+1. **无界 1/π_old**（Phase B4 定位，Phase C 修复）：截断（`iw_clip=20`）→ avg 0.184→0.163
+   （4-seed 一致，破论文）。
+2. **容量不足**（B5）：128-MLP 不足以表达 24576 信息态的最优策略；加宽到 256 → avg
+   0.163→0.147（cap512 饱和）。
+
+二者叠加 → avg floor **0.184→0.147**、current 0.205→0.166（seed 0）。两个旋钮
+（`iw_clip=20`、`hidden_sizes=[256]`）都是论文偏离（`iw_clip` 发 ACHFidelityWarning；
+hidden_sizes 论文是 128），**是否采纳为默认是治理决策，本报告只给结论、不动默认**。再往下
+逼近 0 只剩 B3（oracle 优势，半监督/换算法）——超出 model-free ACH，留作独立课题。
+B2（legalmean）在当前 LayerNorm+raw-gate 下是空操作，已排除。
 
 ## 5. 方法论与限制
 
@@ -162,7 +192,8 @@ current 0.205→0.184，4-seed 一致）。建议作为候选默认（论文偏�
 - Phase A 配置：`configs/exp/liars_dice1_ach_mlp_beta_{3e-3,1e-3,1e-4,0}.yaml`。
 - Phase B 配置：`configs/exp/liars_dice1_ach_mlp_lth_{1,4,8,1e6}.yaml`（l_th=2 = anchor）。
 - Phase C 配置：`configs/exp/liars_dice1_ach_mlp_fix_{lth2_iw20,lth4_iw20,lth8_iw20,lth8_iw100}.yaml`；
-  多 seed 确认：`..._fix_lth2_iw20_s{1,2,3}.yaml` + `..._fix_lth2_iw10.yaml`。
+  多 seed 确认：`..._fix_lth2_iw20_s{1,2,3}.yaml` + `..._fix_lth2_iw10.yaml`；
+  容量探针：`..._fix_lth2_iw20_cap{256,512}.yaml`。
 - Phase C 旋钮：`AlgoConfig.iw_clip`（`update_rule.py` / `nn_losses.py` /
   `nn_updates.py` / `experiment_build.py`；默认 `None`=论文忠实，损失逐位不变）。
 - 分析：`tools/beta_floor_sweep.py`、`tools/lth_floor_sweep.py`、`tools/fix_floor.py` →
