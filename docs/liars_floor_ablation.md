@@ -1,29 +1,27 @@
-# Liar's Dice 0.18-floor 消融（Phase A：β-sweep）
+# Liar's Dice 0.18-floor 消融：根因 = 无界 1/π_old
 
 > 问题：ACH 在 Liar's Dice 上的 exploitability 贴在 ~0.18–0.20 下不去（论文 0.171）。
-> 根本原因是**熵正则**（β=1e-2 把不动点推向软均衡），还是**优化/架构误差**？
 >
-> **结论（决定性）：不是熵正则。** 把 β 从 1e-2 一路降到 0，地板和策略熵都不动。
-> 地板是 ACH 更新机制本身（门控 + 1/π_old + 非法 logit 漂移）封顶了策略锐化，
-> 与 β 无关。→ 进入 Phase B，门控 l_th 成为首要去验证的封顶因素。
+> **根因（两阶段消融定位）：无界的 1/π_old 重要性权重。** 它逼着 ACH 门控（l_th）保持
+> 紧——一放松（l_th≥8）策略锐化到 π_old→0、1/π_old 爆炸、logit 失稳崩溃；而紧门控把
+> 策略锐化封顶在熵 ~1.0，这个封顶就是 ~0.20 地板。门控是直接封顶，1/π_old 是深层根因。
+> 直接印证 `docs/reproduce_report.md` §6.7 的首要开放假设。
+
+两阶段：
+- **Phase A（β-sweep）**：地板 β-不变 → 排除熵正则。
+- **Phase B4（l_th sweep）**：门控确实是锐化封顶（熵随 l_th 单调降），但放松门控要么
+  无益（地板鲁棒）、要么崩溃（l_th≥8 → 1/π_old 爆炸）→ 1/π_old 才是逼出门控紧、进而
+  逼出地板的深层因素。
 
 ---
 
-## 1. 实验设计
+## 1. Phase A — β-sweep：排除熵正则
 
-β-sweep：β ∈ {1e-2, 3e-3, 1e-3, 1e-4, 0}，LayerNorm + raw-logit 臂（论文忠实 mirror +
-D16 平均追踪器），seed 0，跑满 1e7 env-steps，CPU。其余超参全同 anchor。β=1e-2 是已提交
-的 anchor run；另 4 臂为 `configs/exp/liars_dice1_ach_mlp_beta_*.yaml`。
+β ∈ {1e-2, 3e-3, 1e-3, 1e-4, 0}，LayerNorm + raw-logit 臂，seed 0，1e7 env-steps，CPU。
+β=1e-2 是已提交 anchor run；另 4 臂为 `configs/exp/liars_dice1_ach_mlp_beta_*.yaml`。
+全部报 exploitability = NashConv/2（仓库/论文口径）。
 
-判定逻辑：若 current exploitability 随 β→0 **趋于 0**，地板是熵正则的软均衡点
-（ACH 停在自己目标函数的地板上，无 bug，论文也在那）；若**卡在 ~0.18 不动**，地板是
-优化误差，Phase B 接手。
-
----
-
-## 2. 结果（seed 0，1e7 env-steps，exploitability = NashConv/2）
-
-| β | current (tail-10%) | uniform-avg | best-iterate | tail 策略熵 |
+| β | current (tail) | uniform-avg | best-iter | tail 策略熵 |
 |---|---|---|---|---|
 | 1e-2 | 0.2053 | 0.1839 | 0.1805 | 1.038 |
 | 3e-3 | 0.2044 | 0.1879 | 0.1772 | 1.111 |
@@ -33,62 +31,78 @@ D16 平均追踪器），seed 0，跑满 1e7 env-steps，CPU。其余超参全�
 
 ![β floor](figs/liars_beta_floor.png)
 
-- **current exploitability 随 β 几乎不变**：β=1e-2 → 0.205，β=0 → 0.206（比值 1.03×）。
-  best-iterate（~0.177–0.187）和 uniform-avg（~0.18–0.19）同样 β-不变。
-- **策略熵也 β-不变**：tail 熵全程 ~1.0，β=0（无熵奖励）和 β=1e-2 一样停在 ~1.0。
-  （早期有弱 β 效应：β=1e-2 首 3 点熵 1.26 vs β=0 1.19，确认 β 已接线生效，只是被地板吞掉。）
+- **current exploitability 随 β 几乎不变**（β=1e-2 → 0.205，β=0 → 0.206，比值 1.03×）；
+  best-iterate、uniform-avg 同样 β-不变。
+- **策略熵也 β-不变**（全程 ~1.0；β=0 无熵奖励仍停在 ~1.0）。
+- 判定：地板**不是熵正则**。β 只加熵、不减熵；即使取消熵奖励，策略也锐化不下去——
+  封顶的是 ACH 更新机制本身。β 在该封顶绑定之后才起作用，毫无杠杆。
 
----
+## 2. Phase B4 — l_th sweep：门控是锐化封顶，1/π_old 是深层根因
 
-## 3. 判定
+Phase A 的"熵-不变性"最直接预测：**门控 l_th 封顶了锐化**（centered logit 触 l_th 即停
+更新）。扫 l_th ∈ {1, 2(anchor), 4, 8, 1e6(=no gate)}，β=1e-2 固定，seed 0，1e7。配置
+`configs/exp/liars_dice1_ach_mlp_lth_*.yaml`。
 
-**地板不是熵正则。** 把 β 完全关掉（β=0），exploitability 仍 0.206、熵仍 1.01——与
-β=1e-2 不可区分。这同时排除了两种熵解释：
+| l_th | current (tail) | uniform-avg | best-iter | tail 策略熵 | 状态 |
+|---|---|---|---|---|---|
+| 1 | 0.455 | 0.452 | 0.447 | 1.588 | 完整（门更紧 → 更软 → 更差）|
+| 2 | **0.205** | 0.184 | 0.181 | 1.038 | 完整（anchor，最佳稳定点）|
+| 4 | 0.238 | 0.226 | 0.184 | 0.927 | 完整（轻度锐化，地板并未变好）|
+| 8 | 0.66 | 0.62 | 0.53 | 0.101 | **崩溃 @1.2e6**（1/π_old 爆炸 → illegal action）|
+| 1e6 (no gate) | 0.49 | 0.54 | 0.44 | 0.112 | **崩溃 @5e5**（同上）|
 
-1. ~~"β=1e-2 的软均衡 exploitability 就是 0.18"~~ —— 若如此，β=0 应让地板掉向 0；它没掉。
-2. ~~"熵奖励把策略撑在软平台"~~ —— 若如此，β=0 应让策略锐化、熵下降；熵仍 ~1.0。
+![l_th floor](figs/liars_lth_floor.png)
 
-**真正机制：策略被钉在熵 ~1.0 的软平台上，且这个钉子与 β 无关。** β 只加熵、不减熵；
-即使取消熵奖励（β=0），策略也锐化不下去——说明封顶的是 ACH 更新机制本身。与
-`docs/reproduce_report.md` §6.2 一致：**门控（l_th=2.0）+ 非法动作 logit 漂移**把最优
-合法动作的正优势更新误门掉（10M 步时 55.7% 信息态被误判饱和），策略无法锐化，停在
-高熵软平台。β 在门控绑定之后才起作用，所以毫无杠杆。
+三条结论：
 
-> 副产物：Liar's Dice 的"平均 vs 当前"几乎无差距（0.21 vs 0.18，0.05 O，见
-> `docs/average_policy_anchor.md`）也是同一现象——当前策略在软平台上窄幅振荡，
-> 平均只能削掉这点振荡。地板是硬上限，不是振荡。
+1. **门控就是锐化封顶（Phase A 预测确认）**：策略熵随 l_th **单调下降** 1.59 → 1.04 →
+   0.93 → 0.10 → 0.11。Phase A 的"策略钉在熵 ~1.0"正是 l_th=2 门控在绑定。
+2. **但放松门控救不了地板**：l_th=4 只把熵从 1.04 降到 0.93，地板反而略升（0.205→0.238）；
+   地板对中等 l_th 鲁棒。l_th=2 是稳定点中的最佳。
+3. **激进放松直接崩**：l_th=8 / no-gate 把熵压到 ~0.1（策略剧烈锐化），随后 π_old 在稀有
+   动作上 →0，无界的 1/π_old 项 `η·y·c·A/π_old` 爆炸（lth8 崩前 pterm_max=258 vs
+   baseline ~10），logit 失稳，rollout 选出 illegal action（`bidnum=-1`）崩溃。
 
----
+→ **门控的"紧"是被 1/π_old 稳定性逼出来的**：不紧就崩。所以深层根因是 1/π_old，门控是为
+保 1/π_old 稳定而不得不紧的"刹车"，副作用就是熵 ~1.0 的封顶 = ~0.20 地板。
 
-## 4. Phase B 计划（β-sweep 重新排序后的优先级）
+## 3. 根因链
 
-熵-不变性把矛头从"1/π_old"（§6.7 原首要假设）转向**门控 l_th**：若门控封顶锐化，
-抬高 l_th 应让熵下降、地板下降。逐臂单因子（固定 β=1e-2，LayerNorm 臂），跑满 1e7：
+```
+无界 1/π_old（§6.7）
+   └─► 门控必须保持紧（l_th≈2；放松到 ≥8 则 π_old→0 → 1/π_old 爆炸 → illegal action 崩）
+          └─► 紧门控把策略锐化封顶在熵 ~1.0
+                 └─► 熵 ~1.0 的软平台 = exploitability ~0.20 地板
+                        └─► 平均策略也只比当前低 0.05 O（窄幅振荡，见 average_policy_anchor.md）
+```
 
-| 臂 | 测的假设 | 优先级（Phase A 后） |
-|---|---|---|
-| **B4. l_th sweep {1, 2, 4, 8}** | 门控阈值是否就是锐化封顶；熵-不变性最直接的预测 | **最高** |
-| B1. 1/π_old 截断（floor π_old∈{0.01,0.05}） | §6.7：稀有动作 π_old→0 → 梯度爆炸封顶锐化 | 高 |
-| B2. legalmean（§6.2 非法漂移）+ B4 组合 | 非法 logit 污染门控均值；与 l_th 是否叠加 | 高 |
-| B3. 评论家：独立/多次 critic 更新；seqform BR 当 oracle 教师 | explained_variance≈0.15，GAE 优势噪声 | 中 |
-| B5. 容量 {128,256,512} | 24576 信息态是否超出 128-MLP 表达 | 中 |
+门控是地板的**直接**封顶；**1/π_old 是逼出门控紧、进而逼出地板的深层根因。** 这把
+`reproduce_report.md` §6.7 列为"最贴合失败特征"的 1/π_old 假设，从推测升级为定位结论：
+唯一能让熵突破 ~1.0 的设置（l_th≥8）恰恰触发 1/π_old 崩溃。
 
-**B4 是 Phase A 的直接推论**：熵-不变性说"有东西在熵 ~1.0 处封顶"，门控是最自然的候选
-（centered logit 触 l_th=2.0 即停更新）。若 l_th=8 让熵掉到 ~0.5 且 exploitability 掉到
-~0.1 以下，门控就是元凶；组合 B2（legalmean）看是否把非法漂移的污染也一并解掉。
+## 4. 修复方向（未跑，下一实验）
+
+根因是 1/π_old，所以修复是**解耦门控与 1/π_old 稳定性**：
+
+- **B1 + B4 组合臂**：先给 1/π_old 加下界（floor π_old∈{0.01,0.05}，即 importance
+  weight 截断），再抬高 l_th（{4,8}）。预测：截断 1/π_old 后可以安全锐化（熵降到 ~0.3–0.5
+  而不崩），exploitability 掉到 ~0.1 以下。这才是"破地板"的正面实验。
+- 注意 B1 单独（floor 1/π_old 但仍 l_th=2）可能不够——门控本身还在 ~1.0 封顶；需 B1+B4
+  联用。B2（legalmean，§6.2 非法漂移）可与 B1+B4 叠加看是否进一步改善。
+
+> 这是"测修复"，超出"研究根因"本身——故未自动启动，留作下一步决策。
 
 ## 5. 方法论与限制
 
-- **单 seed**：β-sweep 的结论（地板 β-不变）是 5 个 β 点一致的**趋势**，比单点排序稳健；
-  仍建议 Phase B 的决赛臂补 2–3 seed。
-- **β=0 未爆**：无熵奖励下 1/π_old 没有数值崩溃（exploitability 0.206、无 NaN）——
-  说明地板不是 β=0 引发的失稳，而是β-无关的结构性封顶（弱化了"1/π_old 爆炸"作为
-  地板主因的嫌疑，把它降到 B1 而非首位）。
+- **单 seed**：β-sweep（5 点趋势）与 l_th 熵单调性都鲁棒；决赛修复臂（B1+B4）需 2–3 seed。
+- **崩溃臂的数据仍可用**：l_th=8/no-gate 崩前已显示熵→~0.1（锐化发生）和 pterm→258
+  （1/π_old 爆炸），正是定根因的关键证据。
 - 全程报 **exploitability**（= NashConv/2），见 memory `exploitability-vs-nashconv-units`。
 
 ## 6. 代码与产物
 
-- 配置：`configs/exp/liars_dice1_ach_mlp_beta_{3e-3,1e-3,1e-4,0}.yaml`（β=1e-2 =
-  `liars_dice1_ach_mlp_anchor.yaml`）。
-- 分析：`tools/beta_floor_sweep.py` → `docs/figs/liars_beta_floor.png`。
-- run 数据：`runs/ab_beta/liars_beta*_seed0/train_curve.json`（gitignored）。
+- Phase A 配置：`configs/exp/liars_dice1_ach_mlp_beta_{3e-3,1e-3,1e-4,0}.yaml`。
+- Phase B 配置：`configs/exp/liars_dice1_ach_mlp_lth_{1,4,8,1e6}.yaml`（l_th=2 = anchor）。
+- 分析：`tools/beta_floor_sweep.py`、`tools/lth_floor_sweep.py` →
+  `docs/figs/liars_beta_floor.png`、`docs/figs/liars_lth_floor.png`。
+- run 数据：`runs/ab_beta/`、`runs/ab_lth/`（gitignored）。
