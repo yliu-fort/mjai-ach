@@ -123,7 +123,9 @@ class SequenceForm:
         ordering (the D14 parity check does) should permute through this rather
         than assume the orders agree.
         """
-        for row, (owner, name) in enumerate(zip(self.infoset_player.tolist(), self.infoset_keys, strict=True)):
+        for row, (owner, name) in enumerate(
+            zip(self.infoset_player.tolist(), self.infoset_keys, strict=True)
+        ):
             if owner == player and name == key:
                 return row
         raise KeyError(f"{self.game_name}: no information set {key!r} for player {player}")

@@ -66,9 +66,7 @@ def kuhn_alpha_behavior(sf, alpha: float) -> torch.Tensor:
 
 def random_behavior(sf, seed: int) -> torch.Tensor:
     generator = torch.Generator().manual_seed(seed)
-    logits = torch.randn(
-        sf.num_infosets, sf.max_actions, dtype=torch.float64, generator=generator
-    )
+    logits = torch.randn(sf.num_infosets, sf.max_actions, dtype=torch.float64, generator=generator)
     return P.behavior_from_logits(sf, logits)
 
 
@@ -277,7 +275,9 @@ def test_gradient_flows_from_payoff_back_to_logits(kuhn3_sf):
 def test_autograd_matches_a_finite_difference(kuhn_sf):
     """Oracle-track gradients are checked against the definition, not trusted."""
     generator = torch.Generator().manual_seed(12)
-    base = torch.randn(kuhn_sf.num_infosets, kuhn_sf.max_actions, dtype=torch.float64, generator=generator)
+    base = torch.randn(
+        kuhn_sf.num_infosets, kuhn_sf.max_actions, dtype=torch.float64, generator=generator
+    )
 
     def value(logits: torch.Tensor) -> torch.Tensor:
         plans = P.realization_plans(kuhn_sf, P.behavior_from_logits(kuhn_sf, logits))
