@@ -15,22 +15,23 @@ suite is the amended form:
 - **Tolerance is tiered, not zero,** and the tiers are set by measurement rather
   than by guesswork (AGENTS.md D14):
 
-  ===================================  ==================  ==========================
+  ===================================  ==================  ==================
   Pair                                 Measured 2026-07-26  Tolerance here
-  ===================================  ==================  ==========================
+  ===================================  ==================  ==================
   seqform vs OpenSpiel                 0 or 1 ulp          1e-12 absolute
-  seqform vs base stack (either
-  backend)                             6e-10 .. 1.8e-8     1e-6 relative
-  base stack python vs C++ backend     exactly 0           tightest of the above
-  ===================================  ==================  ==========================
+  seqform vs base stack, either
+  backend                              <= 1.5e-14 rel      1e-11 relative
+  base stack python vs C++ backend     exactly 0           1e-12 absolute
+  ===================================  ==================  ==================
 
-  The middle row is **not** backend noise — the two base-stack backends agree
-  with each other to the bit. It is ``Policy.action_logits_batch`` returning
-  float32 (``agents/base.py``), which caps the base stack's exact evaluator at
-  float32 precision no matter which best-response solver runs underneath. That
-  is harmless for training curves, whose seed-to-seed spread is orders of
-  magnitude larger, and it is exactly why Step-0 ground truth is computed in
-  ``mjai.seqform`` at float64 instead of being read off the base stack.
+  The middle row used to read 6e-10 .. 1.8e-8, which was **not** backend noise —
+  the two base-stack backends agreed with each other to the bit even then. It
+  was ``Policy.action_logits_batch`` returning float32, capping the base stack's
+  exact evaluator regardless of which best-response solver ran underneath. That
+  handoff is float64 as of 2026-07-26 and the gap fell four orders of magnitude
+  to pure float64 round-off. Tabular policies now agree with an independent
+  implementation exactly; an NN's residual error is its own float32 weights,
+  which is a property of the model rather than of the metric.
 
 Run this as a regression, not once: it is the standing guarantee that Step-0
 ground truth and the base stack's training-time curves are the same quantity.
@@ -56,7 +57,11 @@ from mjai.seqform.tree import build_sequence_form
 
 # D14 tolerances. See the module docstring for how each was measured.
 TOL_EXACT = 1e-12  # seqform vs OpenSpiel: both float64 end to end
-TOL_BASE_STACK = 1e-6  # seqform vs base stack: capped by float32 logits
+# seqform vs base stack: float64 round-off, worst case 1.5e-14 relative over
+# random / uniform / near-equilibrium policies on all three games. Three orders
+# of headroom for a different platform's BLAS, and still five orders tighter
+# than the float32-era bound this replaces.
+TOL_BASE_STACK = 1e-11
 
 PARITY_GAMES = ["kuhn", "kuhn3", "leduc"]
 
@@ -77,7 +82,11 @@ def _decision_points(spec: GameSpec) -> dict[str, tuple[int, list[int], list[flo
             player = state.current_player()
             key = state.information_state_string(player)
             if key not in out:
-                out[key] = (player, list(state.legal_actions(player)), spec.obs_tensor(state, player))
+                out[key] = (
+                    player,
+                    list(state.legal_actions(player)),
+                    spec.obs_tensor(state, player),
+                )
         actions = (
             [a for a, _ in state.chance_outcomes()]
             if state.is_chance_node()
@@ -209,13 +218,15 @@ def test_base_stack_backends_agree_with_each_other_exactly(name, seed):
     )
 
 
-def test_base_stack_precision_cap_is_float32_and_still_there():
-    """Pins the *cause* of the 1e-6 tier, so the tier can be tightened on sight.
+def test_exact_eval_receives_float64_logits():
+    """Pins the *reason* ``TOL_BASE_STACK`` is allowed to be 1e-11.
 
-    ``TOL_BASE_STACK`` is loose because ``action_logits_batch`` hands the exact
-    evaluator float32 logits. If someone widens that to float64, this test fails
-    and points at the tolerance that should come down with it — rather than the
-    loose bound silently outliving its reason.
+    ``action_logits_batch`` is the exact evaluator's only window onto a policy.
+    While it returned float32 the base stack sat ~1e-8 away from an independent
+    float64 implementation, whatever solver ran underneath. Narrowing it again
+    would reopen that gap silently — the parity assertions above would simply
+    start failing with no indication of why — so the dtype contract is asserted
+    here, next to the tolerance it justifies.
     """
     import numpy as np
 
@@ -223,7 +234,23 @@ def test_base_stack_precision_cap_is_float32_and_still_there():
     policy = TabularPolicy(num_actions=spec.num_actions)
     mask = np.ones((1, spec.num_actions), dtype=bool)
     out = policy.action_logits_batch(np.zeros((1, spec.obs_size), dtype=np.float32), mask)
-    assert np.asarray(out).dtype == np.float32
+    assert np.asarray(out).dtype == np.float64
+
+
+def test_tabular_policies_now_agree_with_seqform_to_round_off():
+    """The sharpest statement the float64 handoff buys: not close, but exact.
+
+    A tabular policy holds Python floats, so once nothing downcasts them the
+    base stack and an independently written float64 evaluator are computing the
+    same real number by two routes. Anything above round-off here is a bug in
+    one of them, not a precision budget.
+    """
+    for name in PARITY_GAMES:
+        spec = load_game(name)
+        table = _random_table(spec, seed=3)
+        ours = _leg_seqform(spec, table)
+        theirs = _leg_base_stack(spec, table, "python")
+        assert abs(ours - theirs) / abs(ours) < 1e-13
 
 
 @pytest.mark.parametrize("name", ["kuhn", "kuhn3"])

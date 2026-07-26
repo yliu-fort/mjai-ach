@@ -20,11 +20,20 @@ Two routes to the same numbers:
     pays ~200 us per query for an NN; on Liar's Dice that is 122 s per eval on
     CPU and 468 s on GPU (one CUDA sync per legal action), versus ~15 s here.
 
-The two agree to ~1e-8 relative, not bit-for-bit: a batched float32 forward
-uses different BLAS blocking than a one-row forward, so the logits differ in
-the last ulp. That is far below the metric's seed-to-seed noise, but it does
-mean eval values are not comparable bit-for-bit with runs from before this
-change. ``tests/unit/test_eval_nash.py`` pins the agreement.
+**How closely the two routes agree depends on the policy, and since 2026-07-26
+only on the policy.** Both now carry float64 out of ``action_logits_batch``
+(AGENTS.md D14), so:
+
+  - **Tabular policies: bit-identical.** Their logits are Python floats, and
+    nothing downcasts them any more.
+  - **NN policies: ~1e-9 to ~1e-8 relative.** A batched float32 forward uses
+    different BLAS blocking than a one-row forward, so the logits differ in the
+    last float32 ulp. That is a property of the float32 network being measured,
+    not of the metric, and it is far below the metric's seed-to-seed noise.
+
+``tests/unit/test_eval_nash.py`` pins the agreement, and
+``tests/unit/test_seqform_parity.py`` pins this module against an independent
+float64 implementation (``mjai.seqform``) at 1e-11 relative.
 
 **Reproducibility caveat.** The fast route's default best-response solver is
 OpenSpiel's C++ ``TabularBestResponseMDP`` (7.9x on Liar's Dice), which sums
@@ -34,6 +43,13 @@ That is ~1e-16 relative — nothing against seed-to-seed spread — but it means
 "same seed, same eval bits" holds only under ``eval_exact_backend="python"``.
 Set that when you need exactly-reproducible curves; the default trades those
 last two digits for the speedup.
+
+**Values shifted on 2026-07-26.** Widening ``action_logits_batch`` to float64
+moved every exact eval number by up to ~1.8e-8 relative (measured on Kuhn, 3p
+Kuhn and Leduc). Curves recorded before that date are therefore not
+bit-comparable with ones recorded after it. No committed result is affected in
+any digit it reports — ``docs/reproduce_report.md`` quotes four significant
+figures and the shift is in the eighth — so nothing was regenerated.
 """
 
 from __future__ import annotations

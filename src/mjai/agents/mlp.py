@@ -139,6 +139,13 @@ class MLPSharedActorCritic(nn.Module, Policy):
         per legal action per row; exact eval calls this with every info state in
         the game, so that path is ~4 orders of magnitude of Python and CUDA-sync
         overhead around a single small matmul.
+
+        The forward stays float32 — that is the network the policy actually is,
+        at rollout time as much as at eval time, and evaluating it in float64
+        would report a model we never run. Only the handoff widens, to match the
+        float64 contract in :meth:`Policy.action_logits_batch`; that cast is
+        lossless and keeps the evaluator from adding rounding on top of the
+        network's own.
         """
         import numpy as np
 
@@ -146,7 +153,7 @@ class MLPSharedActorCritic(nn.Module, Policy):
         with torch.no_grad():
             obs_t = torch.as_tensor(np.asarray(obs_batch, dtype=np.float32), device=self.device)
             logits, _ = self.forward(obs_t)
-            out: Any = logits.float().cpu().numpy()
+            out: Any = logits.double().cpu().numpy()
         out[~mask] = -np.inf
         return out
 

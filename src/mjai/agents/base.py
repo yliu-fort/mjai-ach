@@ -95,13 +95,24 @@ class Policy(ABC):
                 row must have at least one legal action.
 
         Returns:
-            ``(B, num_actions)`` float32 array of logits, with illegal entries
+            ``(B, num_actions)`` **float64** array of logits, with illegal entries
             set to ``-inf`` so the caller can softmax over the row directly.
+
+        The output dtype is float64 because this method is the exact evaluator's
+        only window onto a policy: :func:`mjai.eval.nash.tabular_view_of` softmaxes
+        it and hands the result to a best-response solver. A float32 return here
+        used to cap the base stack's NashConv at ~1e-8 relative — measured against
+        an independent float64 implementation across Kuhn, 3p Kuhn and Leduc — no
+        matter which solver ran underneath (AGENTS.md D14). Widening the *handoff*
+        does not invent precision: a tabular policy holds Python floats, so its
+        logits are now exact, while an MLP's logits stay as precise as its own
+        float32 weights make them. It just stops the metric from adding error of
+        its own to the model's.
         """
         import numpy as np
 
         mask = np.asarray(legal_mask, dtype=bool)
-        out = np.full(mask.shape, -np.inf, dtype=np.float32)
+        out = np.full(mask.shape, -np.inf, dtype=np.float64)
         for i, row in enumerate(mask):
             legal = np.flatnonzero(row).tolist()
             out[i, legal] = self.action_logits(list(obs_batch[i]), legal)
