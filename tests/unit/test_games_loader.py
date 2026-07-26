@@ -1,9 +1,9 @@
 """Unit tests for the game loader (AGENTS.md §4, §5).
 
-Verifies all seven Phase-1 games load, the GameSpec fields match the values
-verified directly against open-spiel 2.0.1, and the observation-encoding
-auto-selection picks information_state where available and falls back to
-observation otherwise.
+Verifies all eight canonical games load (D8's seven plus ``kuhn3``, D13), the
+GameSpec fields match the values verified directly against open-spiel 2.0.1,
+and the observation-encoding auto-selection picks information_state where
+available and falls back to observation otherwise.
 """
 
 from __future__ import annotations
@@ -19,36 +19,58 @@ from mjai.games.loader import (
     load_game_by_string,
 )
 
-# Expected (num_actions, max_length, obs_kind, is_simultaneous) per game,
-# captured from the direct open-spiel probe during Step 2.
+# Expected (num_actions, max_length, obs_kind, is_simultaneous, num_players) per
+# game, captured from the direct open-spiel probe during Step 2; kuhn3's row was
+# probed the same way on 2026-07-26 (D13).
 EXPECTED = {
-    "brps": (3, 1, "information_state", True),
-    "kuhn": (2, 3, "information_state", False),
-    "leduc": (3, 8, "information_state", False),
-    "ttt": (9, 9, "observation", False),  # no info_state tensor -> falls back
-    "goofspiel5_ii": (5, 5, "information_state", True),
-    "liars_dice1": (13, 13, "information_state", False),
-    "oshi_zumo": (6, 20, "observation", True),  # no info_state tensor -> falls back
+    "brps": (3, 1, "information_state", True, 2),
+    "kuhn": (2, 3, "information_state", False, 2),
+    "kuhn3": (2, 5, "information_state", False, 3),
+    "leduc": (3, 8, "information_state", False, 2),
+    "ttt": (9, 9, "observation", False, 2),  # no info_state tensor -> falls back
+    "goofspiel5_ii": (5, 5, "information_state", True, 2),
+    "liars_dice1": (13, 13, "information_state", False, 2),
+    "oshi_zumo": (6, 20, "observation", True, 2),  # no info_state tensor -> falls back
 }
 
 
-def test_all_seven_games_registered():
+def test_all_eight_games_registered():
     assert set(GAME_STRINGS) == set(EXPECTED)
-    assert len(all_game_names()) == 7
+    assert len(all_game_names()) == 8
 
 
 @pytest.mark.parametrize("name", sorted(EXPECTED))
 def test_each_game_loads_with_correct_spec(name):
     spec = load_game(name)
-    exp_actions, exp_len, exp_kind, exp_sim = EXPECTED[name]
+    exp_actions, exp_len, exp_kind, exp_sim, exp_players = EXPECTED[name]
     assert spec.name == name
     assert spec.num_actions == exp_actions
     assert spec.max_game_length == exp_len
     assert spec.obs_kind == exp_kind
     assert spec.is_simultaneous == exp_sim
-    assert spec.num_players == 2
+    assert spec.num_players == exp_players
+    # is_zero_sum is True for CONSTANT_SUM too; kuhn3 is constant- not zero-sum.
     assert spec.is_zero_sum
     assert spec.obs_size > 0
+
+
+def test_kuhn3_tree_size_matches_the_research_plan():
+    """312 terminal histories over 24 deals, 48 information sets (D13).
+
+    These are the numbers Generative-ach.md §1 quotes for the Phase-B decision
+    gate; if OpenSpiel ever changes its 3p Kuhn parameters underneath us, every
+    Step-0 ground-truth artifact silently goes stale, so pin them here.
+    """
+    spec = load_game("kuhn3")
+    terminals = 0
+    stack = [spec.new_state()]
+    while stack:
+        state = stack.pop()
+        if state.is_terminal():
+            terminals += 1
+            continue
+        stack.extend(state.child(a) for a in state.legal_actions())
+    assert terminals == 312
 
 
 def test_obs_tensor_size_matches_spec():

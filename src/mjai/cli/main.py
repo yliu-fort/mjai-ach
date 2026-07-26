@@ -156,26 +156,25 @@ def main(argv: list[str] | None = None) -> int:
     renderer = _load_renderer(chosen.name)
     parser = _load_parser(chosen.name)
 
-    # Seat assignment.
-    seats: list[Seat] = [_assign_seat(spec, seat_idx) for seat_idx in range(2)]
+    # Seat assignment — one prompt per seat the game actually has (D13).
+    seats: list[Seat] = [_assign_seat(spec, seat_idx) for seat_idx in range(spec.num_players)]
 
     print("\n-- Mode --")
     print("  [0] interactive (step through, render each turn)")
-    print("  [1] auto fast (both policies, show only final)")
-    print("  [2] auto step (both policies, render + pause each turn)")
+    print("  [1] auto fast (all policies, show only final)")
+    print("  [2] auto step (all policies, render + pause each turn)")
     mode_idx = _read_int("Choose: ", 0, 2)
     mode = ["interactive", "auto_fast", "auto_step"][mode_idx]
-    # auto_fast/auto_step require both seats to be policies.
+    # auto_fast/auto_step require every seat to be a policy.
     if mode != "interactive" and any(s == "human" for s in seats):
-        print("Auto modes require both seats to be policies. Falling back to interactive.")
+        print("Auto modes require every seat to be a policy. Falling back to interactive.")
         mode = "interactive"
 
     runner = MatchRunner(spec, renderer, parser, seats, rng=random.Random(0))
     print()
     result = runner.run(mode=mode)
-    print(
-        f"\nReturns: seat 0 = {result.returns[0]:+.3f}, seat 1 = {result.returns[1]:+.3f}  ({result.n_steps} steps)"
-    )
+    tally = ", ".join(f"seat {i} = {r:+.3f}" for i, r in enumerate(result.returns))
+    print(f"\nReturns: {tally}  ({result.n_steps} steps)")
     return 0
 
 

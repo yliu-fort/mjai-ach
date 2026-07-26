@@ -60,7 +60,7 @@ def test_auto_match_completes_for_each_game(game_name):
     spec = load_game(game_name)
     renderer = importlib.import_module(f"mjai.cli.renderers.{game_name}").create()
     parser = importlib.import_module(f"mjai.cli.input_parsers.{game_name}").create()
-    seats = [uniform_tabular(spec.num_actions, seed=0), uniform_tabular(spec.num_actions, seed=1)]
+    seats = [uniform_tabular(spec.num_actions, seed=i) for i in range(spec.num_players)]
     terminal_seen = []
 
     def output_fn(s: str) -> None:
@@ -78,21 +78,18 @@ def test_auto_match_completes_for_each_game(game_name):
         rng=random.Random(0),
     )
     result = runner.run(mode="auto_fast")
-    assert len(result.returns) == 2
-    assert abs(sum(result.returns)) < 1e-6  # zero-sum
+    assert len(result.returns) == spec.num_players
+    assert abs(sum(result.returns)) < 1e-6  # zero-sum (kuhn3 is constant-sum at 0)
     assert terminal_seen  # terminal renderer fired
 
 
 def test_auto_match_on_tiny_games_only_in_fast_suite():
-    """Fast-suite sanity: just the two cheapest games (BRPS, Kuhn)."""
-    for game_name in ["brps", "kuhn"]:
+    """Fast-suite sanity: the three cheapest games (BRPS, Kuhn, 3p Kuhn)."""
+    for game_name in ["brps", "kuhn", "kuhn3"]:
         spec = load_game(game_name)
         renderer = importlib.import_module(f"mjai.cli.renderers.{game_name}").create()
         parser = importlib.import_module(f"mjai.cli.input_parsers.{game_name}").create()
-        seats = [
-            uniform_tabular(spec.num_actions, seed=0),
-            uniform_tabular(spec.num_actions, seed=1),
-        ]
+        seats = [uniform_tabular(spec.num_actions, seed=i) for i in range(spec.num_players)]
         runner = MatchRunner(
             spec,
             renderer,
@@ -103,7 +100,7 @@ def test_auto_match_on_tiny_games_only_in_fast_suite():
             rng=random.Random(0),
         )
         result = runner.run(mode="auto_fast")
-        assert len(result.returns) == 2
+        assert len(result.returns) == spec.num_players
 
 
 def test_interactive_match_brps_with_fake_human():
@@ -134,18 +131,37 @@ def test_interactive_match_brps_with_fake_human():
 
 
 def test_match_runner_validates_seat_count():
+    """The count comes from the game, not a hard-coded 2 (D13)."""
     spec = load_game("brps")
     renderer = importlib.import_module("mjai.cli.renderers.brps").create()
     parser = importlib.import_module("mjai.cli.input_parsers.brps").create()
-    with pytest.raises(ValueError, match="2 seats"):
+    with pytest.raises(ValueError, match="exactly 2 seats"):
         MatchRunner(spec, renderer, parser, [uniform_tabular(3)])  # only 1 seat
 
 
-def test_list_games_returns_seven():
+def test_match_runner_rejects_two_seats_on_a_three_player_game():
+    """The regression D13 guards against: 2 seats silently accepted on kuhn3."""
+    spec = load_game("kuhn3")
+    renderer = importlib.import_module("mjai.cli.renderers.kuhn3").create()
+    parser = importlib.import_module("mjai.cli.input_parsers.kuhn3").create()
+    with pytest.raises(ValueError, match="exactly 3 seats"):
+        MatchRunner(spec, renderer, parser, [uniform_tabular(2), uniform_tabular(2)])
+
+
+def test_list_games_returns_eight():
     games = list_games()
-    assert len(games) == 7
+    assert len(games) == 8
     names = {g.name for g in games}
-    assert names == {"brps", "kuhn", "leduc", "ttt", "goofspiel5_ii", "liars_dice1", "oshi_zumo"}
+    assert names == {
+        "brps",
+        "kuhn",
+        "kuhn3",
+        "leduc",
+        "ttt",
+        "goofspiel5_ii",
+        "liars_dice1",
+        "oshi_zumo",
+    }
 
 
 def test_parser_rejects_illegal_action():

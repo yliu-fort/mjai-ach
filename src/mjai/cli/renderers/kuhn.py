@@ -1,23 +1,26 @@
-"""Kuhn Poker renderer: 3-card deck (J/Q/K = 0/1/2), per-player private card.
+"""Kuhn Poker renderer, parameterized by player count (2p and 3p).
 
-Information-state tensor layout for ``kuhn_poker`` (verified empirically against
-pyspiel 2.0.1, length 11):
+Information-state tensor layout for ``kuhn_poker``, verified empirically against
+pyspiel 2.0.1 at both player counts (2p length 11, 3p length 17):
 
-  [0]      player-id bit 0 (P0 = hot here)
-  [1]      player-id bit 1 (P1 = hot here)
-  [2:5]    OWN private card one-hot (J/Q/K = slots 2/3/4; card_id = slot - 2)
-  [5:11]   public action history encoding (bet/call sequence)
+  [0 : N]            player-id one-hot (N = number of players)
+  [N : N + N + 1]    OWN private card one-hot (the deck holds N + 1 cards)
+  [N + N + 1 : ]     public action history encoding (bet/call sequence)
 
-The old renderer read ``info[0:3]`` for the card. Slot 0 is the player-id bit,
-which is hot for P0 regardless of the dealt card, so the renderer always printed
-"your card: J". The card is actually at ``info[2:5]``.
+So the card block starts at slot ``N``, not at slot 0, and its width tracks the
+deck rather than being fixed at 3. The old 2p renderer read ``info[0:3]`` for
+the card; slot 0 is the player-id bit, hot for P0 regardless of the dealt card,
+so it always printed "your card: J". Keeping ONE parameterized implementation
+here (rather than copying it into a kuhn3 module) means that layout knowledge —
+which has already been a bug source once — exists in exactly one place.
 
-``state.history()`` **includes the two opening chance deals** (P0's card, then
-P1's card) before any betting action. The old ``_public_history`` walked the
-entire history and so rendered a freshly dealt hand (history ``[1, 2]``) as the
-bogus sequence "bet check". We skip the leading two chance outcomes.
+``state.history()`` **includes the opening chance deals** — one per player,
+so two in 2p and three in 3p — before any betting action. The old
+``_public_history`` walked the entire history and rendered a freshly dealt hand
+(history ``[1, 2]``) as the bogus sequence "bet check". We skip the leading N
+chance outcomes.
 
-Action semantics (verified via ``action_to_string``):
+Action semantics (verified via ``action_to_string``, identical at both counts):
   - action 0 = "Pass": a check on the first move, a *fold* when facing a bet.
   - action 1 = "Bet": an opening bet, a *call* when facing a bet.
 There is no separate fold/call action id in Kuhn.
@@ -29,20 +32,34 @@ import pyspiel
 
 from mjai.cli.interfaces import GameRenderer
 
-_CARD = {0: "J", 1: "Q", 2: "K"}
-
-# Own private card occupies info-state slots 2..4 (card_id = slot - 2).
-_CARD_SLOT_START = 2
-_CARD_SLOT_END = 5  # exclusive
-# The first two entries of state.history() are the chance deals.
-_N_CHANCE_DEALS = 2
+# Card labels by rank; an N-player deck uses the first N + 1 of them.
+_CARD_LABELS = ("J", "Q", "K", "A", "2", "3")
 
 
 def create() -> GameRenderer:
-    return _KuhnRenderer()
+    """The canonical 2-player Kuhn renderer."""
+    return KuhnRenderer(num_players=2)
 
 
-class _KuhnRenderer:
+class KuhnRenderer:
+    """Renders Kuhn Poker for ``num_players`` seats (deck = num_players + 1).
+
+    Public because ``renderers/kuhn3.py`` constructs it with ``num_players=3``;
+    the CLI itself only ever calls the module-level ``create()``.
+    """
+
+    def __init__(self, *, num_players: int) -> None:
+        if num_players < 2:
+            raise ValueError(f"Kuhn needs at least 2 players, got {num_players}")
+        self.num_players = num_players
+        self.num_cards = num_players + 1
+        # Own private card occupies slots [N, N + num_cards); the leading N
+        # slots are the player-id one-hot.
+        self._card_slot_start = num_players
+        self._card_slot_end = num_players + self.num_cards
+        # One chance deal per player precedes the first betting action.
+        self._n_chance_deals = num_players
+
     def render(self, state: pyspiel.State, observer_player: int | None) -> str:
         if state.is_terminal():
             return self.render_terminal(state)
@@ -51,16 +68,16 @@ class _KuhnRenderer:
         # Private card from the OWN-card one-hot slots (NOT [0:3] — that's player-id).
         card_idx = next(
             (
-                i - _CARD_SLOT_START
-                for i in range(_CARD_SLOT_START, _CARD_SLOT_END)
+                i - self._card_slot_start
+                for i in range(self._card_slot_start, self._card_slot_end)
                 if info[i] > 0.5
             ),
             None,
         )
-        card = _CARD.get(card_idx if card_idx is not None else -1, "?")
+        card = self._label(card_idx)
         history = self._public_history(state)
         lines = [
-            f"Kuhn Poker — you are player {p}, your card: {card}",
+            f"{self._title()} — you are player {p}, your card: {card}",
             f"Pot: {self._pot(state)}    Actions so far: {' '.join(history) or '(none)'}",
         ]
         legal = state.legal_actions(p)
@@ -78,32 +95,47 @@ class _KuhnRenderer:
             return self.render_terminal(state)
         history = self._public_history(state)
         return (
-            "Kuhn Poker — public view.\n"
+            f"{self._title()} — public view.\n"
             f"Pot: {self._pot(state)}    Actions so far: "
             f"{' '.join(history) or '(none)'}"
         )
 
     def render_terminal(self, state: pyspiel.State) -> str:
-        ret = state.returns()
-        if abs(ret[0]) < 1e-9:
+        """Final-result view.
+
+        Reports every seat's return and names the top scorer(s). Three-player
+        Kuhn can split the pot, and "the other player lost" is not a thing once
+        N > 2, so there is no winner/loser pair to shortcut to.
+        """
+        ret = list(state.returns())
+        if all(abs(r) < 1e-9 for r in ret):
             return "Hand over: tie."
-        winner = 0 if ret[0] > 0 else 1
-        return (
-            f"Hand over: player {winner} wins {abs(ret[0]):+.0f}. Returns: {[int(r) for r in ret]}"
-        )
+        best = max(ret)
+        winners = [i for i, r in enumerate(ret) if r >= best - 1e-9]
+        who = ", ".join(f"player {i}" for i in winners)
+        tally = ", ".join(f"p{i} {r:+.0f}" for i, r in enumerate(ret))
+        return f"Hand over: {who} wins {best:+.0f}. Returns: {tally}"
+
+    def _title(self) -> str:
+        return "Kuhn Poker" if self.num_players == 2 else f"Kuhn Poker ({self.num_players}p)"
+
+    def _label(self, card_idx: int | None) -> str:
+        if card_idx is None or not 0 <= card_idx < self.num_cards:
+            return "?"
+        return _CARD_LABELS[card_idx]
 
     def _public_history(self, state: pyspiel.State) -> list[str]:
-        """Betting sequence only, skipping the two opening chance deals.
+        """Betting sequence only, skipping the opening chance deals.
 
         Action 0 = Pass (check or fold), action 1 = Bet (bet or call). Both
         are the same ids in Kuhn — only the round context differs.
         """
         out = []
-        for a in state.history()[_N_CHANCE_DEALS:]:
+        for a in state.history()[self._n_chance_deals :]:
             out.append("bet" if a == 1 else "pass")
         return out
 
     def _pot(self, state: pyspiel.State) -> int:
         # Each player antes 1; a bet adds 1 per player who bets/calls.
-        bets = sum(1 for a in state.history()[_N_CHANCE_DEALS:] if a == 1)
-        return 2 + bets
+        bets = sum(1 for a in state.history()[self._n_chance_deals :] if a == 1)
+        return self.num_players + bets

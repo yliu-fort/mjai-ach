@@ -1,0 +1,14 @@
+# Three-player Kuhn Poker (AGENTS.md D13).
+# 3-player, sequential, imperfect-info, constant-sum. The Phase-B decision gate
+# of the pACH programme (Generative-ach.md §5.2): the smallest game with a
+# genuinely multi-dimensional equilibrium manifold and an exactly enumerable
+# tree, so "predicted vs measured" can be checked against ground truth.
+name: kuhn3
+game_string: kuhn_poker(players=3)
+notes: >
+  Kuhn with a 4-card deck (J/Q/K/A) and three seats. 16 binary information sets
+  per seat = 48 behaviour parameters; 312 terminal histories over 24 deals, so
+  exact tree traversal is trivial. NOT 2p zero-sum: it is constant-sum, and
+  multiplayer constant-sum has no minimax structure, so exploitability is
+  undefined here and NashConv is the metric. CFR is NOT a Nash reference at
+  this player count (AGENTS.md D14).

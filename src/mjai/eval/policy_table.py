@@ -54,6 +54,7 @@ from mjai.games.loader import GameSpec, load_game
 ENUMERABLE: dict[str, int] = {
     "brps": 2,
     "kuhn": 12,
+    "kuhn3": 48,
     "leduc": 936,
     "goofspiel5_ii": 2124,
     "liars_dice1": 24576,
@@ -68,6 +69,9 @@ ENUMERABLE: dict[str, int] = {
 VIEW_MODE: dict[str, str] = {
     "brps": "table",
     "kuhn": "table",
+    # 48 rows x 2 actions still reads as a table, and the pACH programme wants
+    # to eyeball individual 3p Kuhn info states against the atlas (D13).
+    "kuhn3": "table",
     "leduc": "heatmap",
     "goofspiel5_ii": "heatmap",
     "liars_dice1": "top_k",

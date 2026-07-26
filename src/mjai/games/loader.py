@@ -18,13 +18,14 @@ from typing import Any
 
 import pyspiel
 
-# The seven Phase-1 games (AGENTS.md §1 D8). Keys are the short names used in
-# configs and the CLI; values are the canonical pyspiel game strings, verified
+# The eight canonical games (AGENTS.md D8 + D13). Keys are the short names used
+# in configs and the CLI; values are the canonical pyspiel game strings, verified
 # against open-spiel 2.0.1. (A non-biased RPS can still be loaded on the fly
-# via ``load_game_by_string("matrix_rps")`` but is not part of the canonical 7.)
+# via ``load_game_by_string("matrix_rps")`` but is not part of the canonical 8.)
 GAME_STRINGS: dict[str, str] = {
     "brps": "matrix_brps",
     "kuhn": "kuhn_poker",
+    "kuhn3": "kuhn_poker(players=3)",
     "leduc": "leduc_poker",
     "ttt": "tic_tac_toe",
     "goofspiel5_ii": "goofspiel(imp_info=True,num_cards=5,points_order=descending)",

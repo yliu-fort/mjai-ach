@@ -17,7 +17,18 @@ from mjai.config.game_config import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GAMES_DIR = REPO_ROOT / "configs" / "games"
 
-EXPECTED_NAMES = {"brps", "kuhn", "leduc", "ttt", "goofspiel5_ii", "liars_dice1", "oshi_zumo"}
+EXPECTED_NAMES = {
+    "brps",
+    "kuhn",
+    "kuhn3",
+    "leduc",
+    "ttt",
+    "goofspiel5_ii",
+    "liars_dice1",
+    "oshi_zumo",
+}
+# Player count per config; everything is 2p except kuhn3 (AGENTS.md D13).
+EXPECTED_PLAYERS = {name: 3 if name == "kuhn3" else 2 for name in EXPECTED_NAMES}
 
 
 def test_default_games_dir_points_to_repo_configs():
@@ -25,7 +36,7 @@ def test_default_games_dir_points_to_repo_configs():
     assert DEFAULT_GAMES_DIR.is_dir()
 
 
-def test_all_seven_game_configs_present_and_load():
+def test_all_eight_game_configs_present_and_load():
     cfgs = load_all_game_configs()
     assert set(cfgs) == EXPECTED_NAMES
     for name, cfg in cfgs.items():
@@ -36,10 +47,10 @@ def test_all_seven_game_configs_present_and_load():
 
 def test_each_config_resolves_to_a_working_spec():
     cfgs = load_all_game_configs()
-    for _name, cfg in cfgs.items():
+    for name, cfg in cfgs.items():
         spec = resolve_to_spec(cfg)
         assert spec.num_actions > 0
-        assert spec.num_players == 2
+        assert spec.num_players == EXPECTED_PLAYERS[name]
         assert spec.is_zero_sum
 
 

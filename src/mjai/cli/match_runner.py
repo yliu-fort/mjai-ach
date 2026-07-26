@@ -3,8 +3,13 @@
 Owns the env-stepping loop and dispatches to the per-game renderer + parser.
 Three modes:
   - interactive:   at least one seat is human; render + prompt each human turn.
-  - auto_fast:     both seats are policies; print only the final result.
-  - auto_step:     both seats are policies; render every step, pause for Enter.
+  - auto_fast:     every seat is a policy; print only the final result.
+  - auto_step:     every seat is a policy; render every step, pause for Enter.
+
+**Seat count is the game's, not 2** (AGENTS.md D13). The runner originally
+hard-rejected anything but two seats; 3p Kuhn is the Phase-B decision gate of
+the pACH programme, so the count now comes from ``spec.num_players`` and the
+terminal/announce paths report every seat rather than a winner/loser pair.
 """
 
 from __future__ import annotations
@@ -30,12 +35,14 @@ class MatchResult:
 
 
 class MatchRunner:
-    """Runs one match between two seats on ``spec``.
+    """Runs one match between ``spec.num_players`` seats on ``spec``.
 
     Args:
         spec: the loaded game.
         renderer, parser: per-game renderer/parser instances.
-        seats: length-2 list of Seat (Policy or "human"). Seat 0 = "X"/first.
+        seats: one Seat (Policy or "human") per player, in seat order. Seat 0 =
+            "X"/first. The length must equal ``spec.num_players``; a mismatch
+            raises rather than truncating or padding (AGENTS.md §11).
         input_fn: callable that reads a line of stdin (default: input). Tests
             inject a fake.
         output_fn: callable that writes a string to "stdout" (default: print).
@@ -54,8 +61,10 @@ class MatchRunner:
         output_fn: Callable[[str], None] = print,
         rng: random.Random | None = None,
     ) -> None:
-        if len(seats) != 2:
-            raise ValueError(f"Need exactly 2 seats, got {len(seats)}")
+        if len(seats) != spec.num_players:
+            raise ValueError(
+                f"{spec.name} needs exactly {spec.num_players} seats, got {len(seats)}"
+            )
         self.spec = spec
         self.renderer = renderer
         self.parser = parser
