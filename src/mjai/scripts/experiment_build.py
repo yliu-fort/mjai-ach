@@ -164,6 +164,20 @@ class ExperimentConfig:
     # summation order follows a hash map). Use "python" when eval curves must
     # be bit-identical run to run.
     eval_exact_backend: str = "auto"
+    # ---- Average-strategy anchor (AGENTS.md D16) ----
+    # ACH's O(T^-1/2) bound is about the AVERAGE strategy; the curves this repo
+    # plots are the current policy (docs/reproduce_report.md), which is the right
+    # object for a last-iterate study but not the one the theorem covers. Setting
+    # this additionally tracks the running-average strategy in sequence-form
+    # coordinates and emits eval/avg_nash_conv (+ eval/avg_exploitability at 2
+    # players). Off by default: it costs exact NashConv(s) per eval point and
+    # only makes sense on exactly-enumerable games.
+    track_average_policy: bool = False
+    # Weighting for that average: "uniform" is the one the theorem is stated
+    # for; "linear" (weight = eval index) is CFR+'s and converges faster; "both"
+    # emits uniform under eval/avg_* and linear under eval/avg_*_lin from a
+    # single run. They are different curves — say which one a figure shows.
+    average_policy_weighting: str = "uniform"
 
     def __post_init__(self) -> None:
         # League knob validation (AGENTS.md §9: invalid config fails loudly).
@@ -198,6 +212,11 @@ class ExperimentConfig:
         if self.eval_exact_backend not in ("auto", "python", "cpp"):
             raise ValueError(
                 f"bad eval_exact_backend {self.eval_exact_backend!r}; want auto|python|cpp"
+            )
+        if self.average_policy_weighting not in ("uniform", "linear", "both"):
+            raise ValueError(
+                f"bad average_policy_weighting {self.average_policy_weighting!r}; "
+                f"want uniform|linear|both"
             )
         if self.eval_mc_samples < 16:
             raise ValueError(

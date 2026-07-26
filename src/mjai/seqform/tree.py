@@ -77,6 +77,12 @@ class SequenceForm:
         infoset_level: depth in the owner's own sequence tree, int64 ``[I]``;
             level 0 means the parent is the empty sequence.
         legal_mask: bool ``[I, max_actions]``.
+        infoset_observation: float64 ``[I, obs_size]`` — the observation vector a
+            :class:`mjai.agents.base.Policy` would be queried with at this
+            information set, using the same encoding the loader selected. This is
+            the bridge from "a trained policy" to sequence-form coordinates: it is
+            what lets an MLP actor be measured in the geometry the research plan
+            reports in, without re-walking the tree.
         parent_sequence: int64 ``[I]``, index into the OWNER's sequence vector.
         sequence_of: int64 ``[I, max_actions]``, index into the owner's sequence
             vector, or :data:`NO_SEQUENCE` where the action is illegal.
@@ -96,6 +102,7 @@ class SequenceForm:
     infoset_player: torch.Tensor
     infoset_level: torch.Tensor
     legal_mask: torch.Tensor
+    infoset_observation: torch.Tensor
     parent_sequence: torch.Tensor
     sequence_of: torch.Tensor
     num_sequences: tuple[int, ...]
@@ -150,6 +157,7 @@ class _Scratch:
         self.level: list[int] = []
         self.parent: list[int] = []
         self.legal: list[list[int]] = []
+        self.obs: list[list[float]] = []
         self.seq_of: list[dict[int, int]] = []
         # Per player, the level of each sequence; index 0 is the empty sequence.
         self.sequence_level: list[list[int]] = [[0] for _ in range(self.n)]
@@ -184,6 +192,7 @@ class _Scratch:
         self.owner.append(player)
         self.parent.append(parent_seq)
         self.legal.append(legal)
+        self.obs.append(self.spec.obs_tensor(state, player))
         self.level.append(level)
         assigned: dict[int, int] = {}
         for action in legal:
@@ -272,6 +281,7 @@ def build_sequence_form(spec: GameSpec) -> SequenceForm:
         infoset_player=torch.tensor(scratch.owner, dtype=torch.int64),
         infoset_level=level,
         legal_mask=legal_mask,
+        infoset_observation=torch.tensor(scratch.obs, dtype=torch.float64),
         parent_sequence=torch.tensor(scratch.parent, dtype=torch.int64),
         sequence_of=sequence_of,
         num_sequences=tuple(len(levels) for levels in scratch.sequence_level),

@@ -19,6 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from mjai.agents.base import Policy
 from mjai.algos.transition import UpdateStats
+from mjai.eval.average_policy import AveragePolicyTracker
 from mjai.games.loader import GameSpec
 
 
@@ -33,6 +34,7 @@ def build_eval_row(
     eval_mc_samples: int = 400,
     seed: int = 0,
     eval_exact_backend: str = "auto",
+    average_trackers: list[tuple[str, AveragePolicyTracker]] | None = None,
 ) -> dict[str, object]:
     """Compute equilibrium metrics + per-action BRPS probe for the curve row.
 
@@ -42,6 +44,12 @@ def build_eval_row(
     silently swallowed (AGENTS.md: no silent fallback): they emit a
     ``warnings.warn`` and leave an ``eval/error`` field in the row, so a
     missing column in the curve is always traceable.
+
+    ``average_trackers``, when present, folds this eval point's policy into the
+    running average strategy and adds its metrics under ``eval/avg_*`` (D16).
+    Each entry is ``(suffix, tracker)``; the suffix ("" or "_lin") lands uniform
+    vs linear weighting under distinct keys. The trackers are stateful and owned
+    by the caller, because the average is a property of the whole run.
     """
     row: dict[str, object] = {"step": step, "env_steps": env_steps}
     if stats is not None:
@@ -77,6 +85,14 @@ def build_eval_row(
     except Exception as e:
         warnings.warn(f"equilibrium eval failed at step {step}: {e}", stacklevel=2)
         row["eval/error"] = str(e)
+    # Average-strategy anchor (D16). NOT wrapped in try/except: the tracker is
+    # stateful, so a swallowed failure would leave the average silently missing
+    # one iterate and every later point on the curve subtly wrong — better to
+    # stop the run than to plot a quietly corrupted average.
+    if average_trackers:
+        for suffix, tracker in average_trackers:
+            for key, value in tracker.observe(policy).items():
+                row[f"eval/{key}{suffix}"] = float(value)
     # BRPS-specific probe: P(R), P(P), P(S) at the trivial observation, so the
     # notebook can plot the policy trajectory (AGENTS.md Fig 1).
     if spec.name == "brps":
