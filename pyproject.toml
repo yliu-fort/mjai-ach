@@ -42,6 +42,10 @@ dev = [
     "pytest>=8.3,<9",
     "pytest-cov>=5,<7",
     "pre-commit>=4.0,<5",
+    # Step-0 symbolic derivations for the equilibrium atlas (D18): the Kuhn
+    # alpha-family, the -1/18 game value, and the 3p indifference system whose
+    # Jacobian null space gives m*. Dev-only — no runtime path imports sympy.
+    "sympy>=1.13,<2",
     # Notebook execution (used to validate the one-click notebook from CLI).
     "jupyter>=1.1,<2",
     "ipykernel>=6.29,<7",
@@ -189,11 +193,14 @@ type = "layers"
 layers = [
     "mjai.cli",
     "mjai.pipeline",
+    "mjai.certs",
     "mjai.eval",
+    "mjai.atlas",
     "mjai.league",
-    "mjai.algos",
+    "mjai.algos | mjai.pach",
     "mjai.config",
-    "mjai.games | mjai.agents",
+    "mjai.seqform",
+    "mjai.games | mjai.agents | mjai.mother",
     "mjai.utils",
 ]
 
@@ -211,8 +218,29 @@ forbidden_modules = [
 [[tool.importlinter.contracts]]
 name = "CLI is a leaf — nothing imports it"
 type = "forbidden"
-source_modules = ["mjai.pipeline", "mjai.eval", "mjai.league", "mjai.algos", "mjai.games", "mjai.agents", "mjai.config", "mjai.utils"]
+source_modules = ["mjai.pipeline", "mjai.certs", "mjai.eval", "mjai.atlas", "mjai.league", "mjai.algos", "mjai.pach", "mjai.games", "mjai.agents", "mjai.mother", "mjai.config", "mjai.seqform", "mjai.utils"]
 forbidden_modules = ["mjai.cli"]
+
+# The research plan's central hard constraint, machine-checked (AGENTS.md §2, D12):
+# the pACH training loop may only ever see fresh samples of the current population
+# and its own terminal payoffs. No ground truth, no certificate, no exploitability
+# oracle, no opponent pool. The layers contract above already implies this; this
+# contract is deliberately redundant so the *intent* survives a future re-ordering
+# of the layers rather than silently evaporating.
+[[tool.importlinter.contracts]]
+name = "pACH training loop is sealed off from the evaluation side"
+type = "forbidden"
+source_modules = ["mjai.pach", "mjai.mother"]
+forbidden_modules = ["mjai.atlas", "mjai.eval", "mjai.certs", "mjai.league", "mjai.pipeline"]
+
+# D14: atlas (Step-0 ground truth) and eval (the base stack's evaluators) are two
+# independent legs of the three-way parity check. If atlas imported eval, the
+# check would compare an implementation against itself.
+[[tool.importlinter.contracts]]
+name = "Atlas is an independent parity leg — it must not import eval"
+type = "forbidden"
+source_modules = ["mjai.atlas"]
+forbidden_modules = ["mjai.eval"]
 
 # -----------------------------------------------------------------------------
 

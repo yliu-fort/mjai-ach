@@ -7,8 +7,20 @@ through review — never silently break a rule.
 
 The project is an IMPALA-style PPO/ACH + league-play research pipeline for
 imperfect-information games. Phase 1 (this repo, now) targets tabular + small-MLP
-on a home CPU+GPU across 7 small games. All code is written in Phase 1; Phases 2
-(4-player Mahjong) and 3 (128-core + multi-GPU on SLURM) are config + tuning only.
+on a home CPU+GPU across 8 small games. Phases 2 (4-player Mahjong) and 3
+(128-core + multi-GPU on SLURM) are config + tuning only *for the base stack*.
+
+**A second research programme now shares this repo**: pACH — a generative mother
+network whose push-forward distribution is the population, trained by population
+self-play with no historical opponents. Its pre-registration and single source of
+truth is `Generative-ach.md` (research plan v3); the base ACH stack is its
+engineering basis and its evaluation-side toolkit. That programme adds code, so
+"all code is written in Phase 1" no longer holds; D12 below governs where it goes.
+
+> **Two D# namespaces.** The `D#` rows in this file are *repository governance*.
+> `Generative-ach.md` carries its own `D1–D18` table of *research design*
+> decisions. They do not share a namespace — always cite the document:
+> `AGENTS.md D12` vs `研究计划 D5`.
 
 ---
 
@@ -28,6 +40,21 @@ on a home CPU+GPU across 7 small games. All code is written in Phase 1; Phases 2
 | D10 | Play CLI | `mjai-play` console-script; menu-driven; loads any saved policy vs human or auto |
 | D11 | NN policy-improvement interface | **One** update rule, `NNActorCriticUpdate`, parameterized by `theta`: policy loss = `(1-theta)*L_ppo_clip + theta*L_ach`. `algo: ppo`/`ach` are pinned aliases for `theta=0`/`1`; `algo: theta` sweeps it. Everything outside the policy term (optimizer, advantage treatment, epochs per batch, grad clipping) is ONE shared knob-driven scaffold whose defaults follow the ACH protocol **at every theta**, so PPO-vs-ACH varies only `theta` unless a knob is set deliberately. Knobs the paper contradicts emit `ACHFidelityWarning` when `theta > 0`. Amends audit B10 (which had removed the interpolation); the merge is licensed by `tests/unit/data/nn_updates_golden.json`, a pre-merge fixture the unified rule must still reproduce exactly. |
 
+### 1.1 pACH-phase decisions (added 2026-07-26)
+
+Each row below was ratified against `Generative-ach.md` before any code was written.
+
+| # | Decision | Value |
+|---|---|---|
+| D12 | pACH lives here | The generative-mother programme shares this repo. Five new subpackages slot into the §2 layering: `mjai.seqform`, `mjai.atlas`, `mjai.mother`, `mjai.pach`, `mjai.certs`. The research plan's flat `games/ atlas/ mother/ pach/ certs/ analysis/` map onto them. There is **no `basis/` package** — the "basis" *is* `mjai.algos` + `mjai.eval`; the hand-off artifact is `docs/basis_audit.md`. |
+| D13 | Games | D8's seven **plus `kuhn3`** (`kuhn_poker(players=3)`) = 8. `kuhn3` is registered in full per §4 (config + renderer + input parser + CLI smoke test), which required generalizing `MatchRunner` from a hard-coded 2 seats to n. Rationale: 3p Kuhn is the Phase-B decision gate; carving out a "research-only game" exemption would have split the game registry in two. **`kuhn3` is deliberately NOT in the Phase-1 experiment matrix** — there are no `configs/exp/kuhn3_*.yaml`, and the one-click notebook stays at 7 games / 28 cells, because the base-stack study is a 2p study and ACH's guarantee does not extend to n ≥ 3. Do not "fix" the missing configs. |
+| D14 | Exact-eval parity | The research plan asks for "bit-for-bit" three-way agreement; that is **unattainable and the claim is amended here**. Parity compares **evaluators on one fixed policy**, never solvers against each other. For n ≥ 3, CFR is *not* a Nash reference (multiplayer CFR has no such guarantee) — it is only a convenient non-trivial test policy. Tolerances, measured 2026-07-26 over random / uniform / near-equilibrium policies on Kuhn, 3p Kuhn and Leduc (`tests/unit/test_seqform_parity.py`): **`mjai.seqform` vs OpenSpiel — 0 or 1 ulp**, held at ≤1e-12 absolute; **either vs the base stack — 6e-10 to 1.8e-8 relative**, held at ≤1e-6. The second gap is *not* backend noise: the base stack's two best-response backends agree with each other exactly. It is `Policy.action_logits_batch` returning **float32** (`agents/base.py`), which caps the base stack's exact evaluator at float32 no matter which solver runs under it. Harmless for training curves (seed spread is far larger), and the reason Step-0 ground truth is computed in `mjai.seqform` at float64 rather than read off the base stack. Our own route is additionally required to be **bit-reproducible across processes**, which the C++ backend is not. |
+| D15 | Simplex validation | Every evaluator we write validates that each policy row is a probability distribution and raises otherwise. Measured 2026-07-26: OpenSpiel's `nash_conv` silently accepts p > 1 and returns a **negative** NashConv (the Kuhn α-family at α = 0.4 makes 3α = 1.2 and yields −6.7e-2). Silent acceptance of an invalid policy is exactly the failure mode §11 forbids. |
+| D16 | Average-policy anchor | ACH's `O(T^-1/2)` guarantee is about the **average** strategy, but `docs/reproduce_report.md` records only the current policy π = softmax(y). The pipeline sanity anchor the research plan §5.0(7) asks for therefore needs a running-average-policy exploitability tracker. Enabled on Kuhn only; off elsewhere. |
+| D17 | KL trust-region anchor is compliant | pACH's proximal term `KL(ρ_φ ‖ ρ_φt)` holds a copy of the previous mother φ_t. Ratified reading: φ_t is PPO's `π_old` — frozen only across one meta-iteration's inner loop, and **never used as an opponent**. It therefore does not breach the research plan's no-history hard constraint (which binds opponents: no snapshots, no EMA mother, no opponent pool). |
+| D18 | pACH device & dependencies | Phase A/B is 12–48 dimensional; GPU is a net loss. pACH configs carry an **explicit `device` field** (default `cpu` for Phase A/B) rather than routing around D6's assert — the device is a property of the config, knowable before the run, never a silent degradation. The mother's RealNVP coupling flow is written in-house (≈100 lines, exact logdet) instead of taking `nflows`, which mypy-strict cannot type. `sympy` is added to the dev extra for the Step-0 symbolic derivations. |
+| D19 | Numeric precision | Oracle track and all certificates are float64; the MC track runs float32 and casts to float64 before any certificate. Tolerances must separate *algorithmic* error from *platform ulp* — `tests/unit/test_algos_nn_theta.py` is a standing reminder that float noise differs across macOS/CPU torch builds. |
+
 ---
 
 ## 2. Layering rule (enforced by import-linter)
@@ -36,13 +63,18 @@ Layers, high → low. A layer may import only the layers **below** it:
 
 ```
 mjai.cli        ← leaf; nothing in the repo imports it
-mjai.pipeline
+mjai.pipeline   ← the ONLY place training meets evaluation (see below)
+mjai.certs
 mjai.eval
+mjai.atlas
 mjai.league
-mjai.algos
-mjai.games      ↤ siblings (no import direction between them)
-mjai.agents     ↤
+mjai.algos      ↤ siblings (no import direction between them)
+mjai.pach       ↤
 mjai.config
+mjai.seqform
+mjai.games      ↤ siblings
+mjai.agents     ↤
+mjai.mother     ↤
 mjai.utils      ← floor; imports nothing internal
 ```
 
@@ -54,6 +86,22 @@ Additional constraints enforced separately:
   Rationale: league provides the self-play *controller*; it must not depend on a
   specific update rule or on the Trainer class that consumes controllers
   (otherwise a cycle forms).
+- **The pACH training loop is sealed off from the evaluation side.** `mjai.pach`
+  and `mjai.mother` sit *below* `mjai.atlas`, `mjai.eval`, `mjai.certs` and
+  `mjai.league`, so the layering alone makes it impossible for the training loop
+  to consult ground truth, a certificate, an exploitability oracle, or an
+  opponent pool. This is not a style preference: it is the research plan's核心
+  central hard constraint (training may only ever see fresh samples of the current
+  population and its own terminal payoffs), turned into a machine-checked
+  contract. A second, redundant `forbidden` contract states the same thing
+  explicitly so the intent survives a future re-ordering of the layers.
+  **Consequence:** the assembly point where a training run periodically emits
+  NashConv/BR-gap curves is `mjai.pipeline`, which sits above both. If you find
+  yourself wanting to import `certs` from `pach`, the wiring belongs in the
+  runner instead.
+- **`mjai.atlas` must not import `mjai.eval`.** The Step-0 ground truth and the
+  base stack's evaluators are two of the three legs of the D14 parity check; a
+  parity check between an implementation and itself proves nothing.
 - **`mjai.cli` is a leaf.** No module under `mjai.*` may import `mjai.cli`.
   (The console-script entry point imports it from outside the package — that's fine.)
 - **Tests may import anything**, but must not be imported by anything.
