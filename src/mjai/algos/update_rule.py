@@ -88,6 +88,14 @@ class AlgoConfig:
     eta: float = 1.0
     l_th: float = 2.0
     ratio_eps: float = 0.5
+    # Cap on the ACH importance weight 1/pi_old. Algorithm 2 / Eq. 29 carries it
+    # unbounded; under synchronous self-play pi==pi_old so it is 1, but once the
+    # policy sharpens, pi_old on rare sampled actions -> 0 and the y/pi_old term
+    # blows up the logits -> illegal-action crash (docs/liars_floor_ablation.md
+    # root cause). None = unbounded (paper-faithful); a float F caps 1/pi_old at
+    # F (equivalently floors pi_old at 1/F). A paper DEVIATION: warns
+    # ACHFidelityWarning when theta>0 (see nn_updates._warn_if_ach_incompatible).
+    iw_clip: float | None = None
     # ACH loss body uses the mean-centered logit (paper text, p24) when True;
     # False (default) = raw logit, the literal Algorithm 2 form. Raw logits are
     # the default because they are paired with the MLP's trunk LayerNorm, which
@@ -136,6 +144,11 @@ class AlgoConfig:
             raise ValueError(f"theta must lie in [0, 1], got {self.theta}")
         if self.n_epochs < 1:
             raise ValueError(f"n_epochs must be >= 1, got {self.n_epochs}")
+        if self.iw_clip is not None and self.iw_clip < 1.0:
+            raise ValueError(
+                f"iw_clip caps 1/pi_old (always >= 1 since pi_old <= 1); "
+                f"got {self.iw_clip} < 1.0"
+            )
 
 
 class UpdateRule(ABC):

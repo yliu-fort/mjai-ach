@@ -1,17 +1,24 @@
-# Liar's Dice 0.18-floor 消融：根因 = 无界 1/π_old
+# Liar's Dice 0.18-floor 消融：根因 = 无界 1/π_old；B1 截断部分修复
 
 > 问题：ACH 在 Liar's Dice 上的 exploitability 贴在 ~0.18–0.20 下不去（论文 0.171）。
 >
-> **根因（两阶段消融定位）：无界的 1/π_old 重要性权重。** 它逼着 ACH 门控（l_th）保持
+> **根因（三阶段消融定位）：无界的 1/π_old 重要性权重。** 它逼着 ACH 门控（l_th）保持
 > 紧——一放松（l_th≥8）策略锐化到 π_old→0、1/π_old 爆炸、logit 失稳崩溃；而紧门控把
 > 策略锐化封顶在熵 ~1.0，这个封顶就是 ~0.20 地板。门控是直接封顶，1/π_old 是深层根因。
 > 直接印证 `docs/reproduce_report.md` §6.7 的首要开放假设。
+>
+> **修复（Phase C，部分成立）**：截断 1/π_old（`iw_clip`，B1）单独就把 avg floor
+> 0.184→**0.159（破论文 0.171）**、current 0.205→0.182——确认 1/π_old 是地板的一个贡献
+> 因子。但抬高门控（B4）+ 截断只让策略**访问**更优点（best 0.148）却**抓不住**（current
+> 振荡）→ 1/π_old 不是全部根因，梯度方向也受污染（评论家噪声/非法漂移），那是下一步。
 
-两阶段：
+三阶段：
 - **Phase A（β-sweep）**：地板 β-不变 → 排除熵正则。
 - **Phase B4（l_th sweep）**：门控确实是锐化封顶（熵随 l_th 单调降），但放松门控要么
   无益（地板鲁棒）、要么崩溃（l_th≥8 → 1/π_old 爆炸）→ 1/π_old 才是逼出门控紧、进而
   逼出地板的深层因素。
+- **Phase C（B1+B4 修复）**：`iw_clip` 截断 1/π_old 解耦了门控与稳定性（l_th=8 不再崩）；
+  B1 单独把 avg floor 降到 0.159（破论文）；B4 抬高门控让 current 振荡（但 avg/best 更优）。
 
 ---
 
@@ -80,17 +87,42 @@ Phase A 的"熵-不变性"最直接预测：**门控 l_th 封顶了锐化**（ce
 `reproduce_report.md` §6.7 列为"最贴合失败特征"的 1/π_old 假设，从推测升级为定位结论：
 唯一能让熵突破 ~1.0 的设置（l_th≥8）恰恰触发 1/π_old 崩溃。
 
-## 4. 修复方向（未跑，下一实验）
+## 4. Phase C — 修复实验（B1 截断 1/π_old + B4 抬高 l_th）：部分成立
 
-根因是 1/π_old，所以修复是**解耦门控与 1/π_old 稳定性**：
+加 `iw_clip` 旋钮（`AlgoConfig.iw_clip`；`None`=论文忠实/无界，float F 把 1/π_old 封顶
+在 F，等价 floor π_old 在 1/F）。默认 `None` 时损失与改动前**逐位相同**（golden 20 处
+mismatch 不变，全是预先存在的平台 FP 噪声，D19）。论文偏离：theta>0 时发
+`ACHFidelityWarning`。4 臂（seed 0，1e7）vs baseline（l_th=2 无截断，floor 0.205）：
 
-- **B1 + B4 组合臂**：先给 1/π_old 加下界（floor π_old∈{0.01,0.05}，即 importance
-  weight 截断），再抬高 l_th（{4,8}）。预测：截断 1/π_old 后可以安全锐化（熵降到 ~0.3–0.5
-  而不崩），exploitability 掉到 ~0.1 以下。这才是"破地板"的正面实验。
-- 注意 B1 单独（floor 1/π_old 但仍 l_th=2）可能不够——门控本身还在 ~1.0 封顶；需 B1+B4
-  联用。B2（legalmean，§6.2 非法漂移）可与 B1+B4 叠加看是否进一步改善。
+| 臂 | current | avg(unif) | best-iter | 熵 |
+|---|---|---|---|---|
+| baseline l_th=2 (no clip) | 0.205 | 0.184 | 0.181 | 1.04 |
+| **B1 alone: l_th=2, iw20** | **0.182** | **0.159** | 0.163 | 0.94 |
+| l_th=4, iw20 | 0.255 | 0.168 | **0.148** | 0.51 |
+| l_th=8, iw20 | 0.315 | 0.205 | 0.199 | 0.30 |
+| l_th=8, iw100 | 0.321 | 0.197 | 0.196 | 0.45 |
 
-> 这是"测修复"，超出"研究根因"本身——故未自动启动，留作下一步决策。
+（iw20 = `iw_clip=20`，floor π_old=0.05。l_th=8 无截断会在 1.2e6 崩溃；这里两臂 iw20/iw100
+都跑满 1e7 —— 截断确实**解耦了门控与 1/π_old 稳定性**，正如根因预测。）
+
+判定：修复**部分成立**，且 B1 比 B4 更有效——
+
+1. **B1 单独（截断 1/π_old，门控不动）就是干净修复**：current 0.205→0.182、
+   **avg 0.184→0.159（已低于论文 0.171）**、best 0.181→0.163。熵仍 ~0.94（门控照常封顶），
+   无失稳。**确认 1/π_old 梯度噪声是地板的一个贡献因子**；截断它是一个可直接落地的改进
+   （三项指标全线下降）。
+2. **抬高门控（B4）+ 截断：锐化发生（熵 0.94→0.51→0.30）但 current 反而变差**
+   （0.182→0.255→0.315）——策略锐化进了**更可被利用**的形状（锐化方向不对）。但 **avg/best
+   改善**：l_th=4 avg 0.168、best **0.148**（全场最佳单点）。即高 l_th 能**访问**更好策略，
+   只是 current **抓不住**（振荡）。
+3. **所以 1/π_old 不是全部根因**：即便放开锐化（截断 + 高 l_th），current 也到不了 Nash。
+   剩余贡献因子是**梯度方向被污染**——锐化走错路。指向评论家噪声（explained_variance
+   ~0.15，§6）和/或非法 logit 漂移对门控的污染（§6.2）。
+
+→ **B1（`iw_clip`）是已验证、可落地的改进**：avg floor 0.184→0.159（破论文 0.171），
+current 0.205→0.182，作为候选默认（论文偏离，需治理决策）。要继续逼近 0，下一步是修
+**梯度方向**——B2（legalmean，去非法漂移污染）+ B3（seqform BR 当 oracle 优势教师，去
+评论家噪声），让 current 能"抓住"高 l_th 访问到的更优策略（best 0.148），而非振荡丢弃。
 
 ## 5. 方法论与限制
 
@@ -103,6 +135,9 @@ Phase A 的"熵-不变性"最直接预测：**门控 l_th 封顶了锐化**（ce
 
 - Phase A 配置：`configs/exp/liars_dice1_ach_mlp_beta_{3e-3,1e-3,1e-4,0}.yaml`。
 - Phase B 配置：`configs/exp/liars_dice1_ach_mlp_lth_{1,4,8,1e6}.yaml`（l_th=2 = anchor）。
-- 分析：`tools/beta_floor_sweep.py`、`tools/lth_floor_sweep.py` →
+- Phase C 配置：`configs/exp/liars_dice1_ach_mlp_fix_{lth2_iw20,lth4_iw20,lth8_iw20,lth8_iw100}.yaml`。
+- Phase C 旋钮：`AlgoConfig.iw_clip`（`update_rule.py` / `nn_losses.py` /
+  `nn_updates.py` / `experiment_build.py`；默认 `None`=论文忠实，损失逐位不变）。
+- 分析：`tools/beta_floor_sweep.py`、`tools/lth_floor_sweep.py`、`tools/fix_floor.py` →
   `docs/figs/liars_beta_floor.png`、`docs/figs/liars_lth_floor.png`。
-- run 数据：`runs/ab_beta/`、`runs/ab_lth/`（gitignored）。
+- run 数据：`runs/ab_beta/`、`runs/ab_lth/`、`runs/ab_fix/`（gitignored）。

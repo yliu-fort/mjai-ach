@@ -85,6 +85,12 @@ def _warn_if_ach_incompatible(config: AlgoConfig) -> None:
             f"n_epochs={config.n_epochs} (p24: 'we update theta and omega once "
             "using a single mini-batch at each iteration')"
         )
+    if config.iw_clip is not None:
+        issues.append(
+            f"iw_clip={config.iw_clip} (Algorithm 2 / Eq. 29 carries the raw "
+            "1/pi_old importance weight; capping it is a stabilizer the paper "
+            "does not have)"
+        )
     if issues:
         warnings.warn(
             f"ACH policy term is active (theta={config.theta}) alongside "

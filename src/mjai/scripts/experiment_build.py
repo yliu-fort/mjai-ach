@@ -123,6 +123,7 @@ class ExperimentConfig:
     eta: float = 1.0  # hedge coefficient eta(s) (p27 Table 7)
     l_th: float = 2.0  # one-sided logit gate threshold (p28 Table 8)
     ratio_eps: float = 0.5  # ratio gate; vacuous when synchronous (p28)
+    iw_clip: float | None = None  # cap 1/pi_old (AlgoConfig.iw_clip); None = paper-faithful
     # Default ACH shape since docs/reproduce_report.md §6.5: trunk LayerNorm
     # supplies logit-scale stability, so gate and loss body both use the raw
     # logit. Set all three to the old values for the pre-LayerNorm behavior.
@@ -300,6 +301,7 @@ def build_update_rule(policy: Policy, cfg: ExperimentConfig, spec: GameSpec) -> 
         eta=cfg.eta,
         l_th=cfg.l_th,
         ratio_eps=cfg.ratio_eps,
+        iw_clip=cfg.iw_clip,
         loss_centered_logits=cfg.loss_centered_logits,
         centered_mean_legal_only=cfg.centered_mean_legal_only,
         gate_centered_logits=cfg.gate_centered_logits,

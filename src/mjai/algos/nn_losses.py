@@ -177,11 +177,16 @@ def ach_policy_loss(
     gate_pos = (y_gate < config.l_th) & (ratio < 1.0 + config.ratio_eps)
     gate_neg = (y_gate > -config.l_th) & (ratio > 1.0 - config.ratio_eps)
     c = torch.where(advantages >= 0, gate_pos, gate_neg).float()
-    loss = -(config.eta * y_loss * c * advantages / (old_probs + 1e-8)).mean()
+    denom = old_probs + 1e-8
+    if config.iw_clip is not None:
+        # Cap 1/pi_old at iw_clip (floor pi_old at 1/iw_clip). Bounds the
+        # importance weight that otherwise blows up once the policy sharpens.
+        denom = denom.clamp(min=1.0 / config.iw_clip)
+    loss = -(config.eta * y_loss * c * advantages / denom).mean()
 
     with torch.no_grad():
-        iw = 1.0 / (old_probs + 1e-8)
-        pterm = (config.eta * y_loss * c * advantages / (old_probs + 1e-8)).abs()
+        iw = 1.0 / denom
+        pterm = (config.eta * y_loss * c * advantages / denom).abs()
         telemetry = {
             "gate_off_frac": 1.0 - c.mean(),
             "iw_max": iw.max(),
