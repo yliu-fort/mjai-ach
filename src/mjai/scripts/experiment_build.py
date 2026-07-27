@@ -247,7 +247,7 @@ def build_policy(spec: GameSpec, cfg: ExperimentConfig, *, seed: int) -> Policy:
             raise ValueError(
                 f"Unknown activation {cfg.activation!r}; expected one of {sorted(ACTIVATIONS)}"
             )
-        return MLPSharedActorCritic(
+        policy = MLPSharedActorCritic(
             obs_size=spec.obs_size,
             num_actions=spec.num_actions,
             hidden_sizes=tuple(cfg.hidden_sizes),
@@ -256,6 +256,23 @@ def build_policy(spec: GameSpec, cfg: ExperimentConfig, *, seed: int) -> Policy:
             device=cfg.device,
             seed=seed,
         )
+        if cfg.separate_critic:
+            # Independent critic net (own trunk+value head). The rollout reads its
+            # V via the wrapper's act_with_value, so GAE uses the well-trained
+            # critic; the update rule trains it on the value loss (no policy drift).
+            from mjai.agents.critic_wrapper import PolicyWithCritic
+
+            critic = MLPSharedActorCritic(
+                obs_size=spec.obs_size,
+                num_actions=spec.num_actions,
+                hidden_sizes=tuple(cfg.critic_hidden_sizes),
+                activation=ACTIVATIONS[cfg.activation],
+                trunk_layernorm=cfg.trunk_layernorm,
+                device=cfg.device,
+                seed=seed + 1,
+            )
+            return PolicyWithCritic(policy, critic)
+        return policy
     raise ValueError(f"Unknown policy_kind: {cfg.policy_kind}")
 
 

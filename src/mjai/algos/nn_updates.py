@@ -33,6 +33,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from mjai.agents.critic_wrapper import PolicyWithCritic
 from mjai.agents.mlp import MLPSharedActorCritic
 from mjai.algos.nn_losses import (
     ach_policy_loss,
@@ -141,9 +142,10 @@ class NNActorCriticUpdate(UpdateRule):
     """
 
     def __init__(self, policy: MLPSharedActorCritic, config: AlgoConfig | None = None) -> None:
-        if not isinstance(policy, MLPSharedActorCritic):
+        if not isinstance(policy, (MLPSharedActorCritic, PolicyWithCritic)):
             raise TypeError(
-                f"{type(self).__name__} requires MLPSharedActorCritic, got {type(policy)}"
+                f"{type(self).__name__} requires MLPSharedActorCritic (or PolicyWithCritic "
+                f"for separate_critic), got {type(policy)}"
             )
         super().__init__(policy)
         self.config = config or AlgoConfig()
@@ -156,12 +158,17 @@ class NNActorCriticUpdate(UpdateRule):
         self.critic: MLPSharedActorCritic | None = None
         self.critic_opt: torch.optim.Optimizer | None = None
         if self.config.separate_critic:
-            self.critic = MLPSharedActorCritic(
-                policy.obs_size,
-                policy.num_actions,
-                hidden_sizes=self.config.critic_hidden_sizes,
-                device=str(policy.device),
-            )
+            # Prefer the wrapper's critic (built by build_policy so the rollout's
+            # GAE reads it); fall back to a fresh net only if handed a bare MLP.
+            if isinstance(policy, PolicyWithCritic):
+                self.critic = policy.critic_net
+            else:
+                self.critic = MLPSharedActorCritic(
+                    policy.obs_size,
+                    policy.num_actions,
+                    hidden_sizes=self.config.critic_hidden_sizes,
+                    device=str(policy.device),
+                )
             self.critic_opt = torch.optim.SGD(
                 self.critic.parameters(), lr=self.config.learning_rate
             )
@@ -279,18 +286,15 @@ class NNActorCriticUpdate(UpdateRule):
         adv_raw = torch.as_tensor(batch.advantages, dtype=torch.float32, device=device)
         if self.critic is not None and self.critic_opt is not None:
             # Independent critic (AlgoConfig.separate_critic): train it hard on the
-            # value loss (own params -- no policy drift), then set the advantage to
-            # the MC baseline G - V_critic(s). Bypasses the rollout's GAE (the
-            # flattened batch has lost the trajectory structure GAE needs); for
-            # Liar's Dice terminal-only rewards this is a minor change.
+            # value loss (own params -- no policy drift). The advantage stays the
+            # rollout's GAE -- which, via the PolicyWithCritic wrapper, was computed
+            # with THIS critic's V, so it is GAE(lambda) on the well-trained critic.
             for _ in range(max(1, self.config.n_critic_updates)):
                 v_c = self.critic(obs)[1]
                 cvloss = self.config.value_coef * ((v_c - returns) ** 2).mean()
                 self.critic_opt.zero_grad()
                 cvloss.backward()
                 self.critic_opt.step()
-            with torch.no_grad():
-                adv_raw = returns - self.critic(obs)[1]
         adv_ppo = adv_raw
         if self.config.theta < 1.0 and self.config.normalize_advantages:
             adv_ppo = normalize_advantages(adv_raw)
@@ -301,15 +305,17 @@ class NNActorCriticUpdate(UpdateRule):
 
         stats = UpdateStats(policy_loss=0.0, value_loss=0.0, entropy=0.0)
         # Optional extra value-only updates to fit V harder before the policy step
-        # (AlgoConfig.n_critic_updates). The advantage for THIS batch was already
-        # computed in the rollout; these updates improve V for FUTURE batches' GAE.
-        for _ in range(self.config.n_critic_updates):
-            logits_c, values_c = self.policy(obs)
-            vloss, _ = value_loss_and_entropy(logits_c, values_c, returns, mask)
-            vstep = self.config.value_coef * vloss
-            self.optimizer.zero_grad()
-            vstep.backward()  # type: ignore[no-untyped-call]  # torch's Tensor.backward is untyped
-            self.optimizer.step()
+        # (AlgoConfig.n_critic_updates, SHARED-trunk mode only). In separate_critic
+        # mode the independent critic is trained below instead -- these would train
+        # the shared policy net and drift the policy.
+        if self.config.n_critic_updates > 0 and not self.config.separate_critic:
+            for _ in range(self.config.n_critic_updates):
+                logits_c, values_c = self.policy(obs)
+                vloss, _ = value_loss_and_entropy(logits_c, values_c, returns, mask)
+                vstep = self.config.value_coef * vloss
+                self.optimizer.zero_grad()
+                vstep.backward()  # type: ignore[no-untyped-call]
+                self.optimizer.step()
         first_off_policy: float | None = None
         for _ in range(self.config.n_epochs):
             stats = self._gradient_step(
