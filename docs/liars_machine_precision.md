@@ -242,9 +242,23 @@ lr→大 batch 欠学；固定更新+lr 缩放→大 batch 到**同一** ~0.16 �
 不降地板**——地板是 sample-bound + 算法性的（小 batch / 多更新是最 sample-efficient 的抵达方式）。
 真正的杠杆回到 **Q1（critic 质量）**。
 
-### Q1 实测（n_critic_updates=8，固定 10M 样本）：待填
+### Q1 实测：critic 不是杠杆（四种改法都没破 0.146）
 
-（crit8 在跑；若 EV 升、expl 降破 0.16 → critic 是杠杆；若不动 → critic 也不是，地板是 ACH 的
-策略梯度间接性 + 门控本身。）
+| 改进 critic 的方式 | best expl |
+|---|---|
+| baseline（共享 critic，欠训练，GAE）| **0.146** |
+| crit32 共享躯干 n=32（drift 策略）| 0.182（更差）|
+| sepcrit32 独立 critic + MC advantage（混淆）| 0.157 |
+| **sepcrit32_gae 独立 critic + GAE(λ)（干净）** | **0.157** |
+
+**结论：~0.146 的 RL 地板不是 critic 决定的。** 共享躯干 n=32 把 critic EV 从 0.17 升到 0.38，
+但 expl 反升（drift）；独立的、训练充分的、无 drift 的 critic（n=32，proper GAE）也只到 0.157
+——**不破 0.146，甚至略差**。四种 critic 改进（共享/独立、MC/GAE）无一破地板。
+
+→ critic 质量不是瓶颈。结合 Q3（batch 也不是），**0.146 地板是 ACH 策略梯度算法本身**（从采样
+回报做间接策略梯度的方差/偏置 + 门控 + 自对弈 cycling）。蒸馏 0.003（低 45×）正是因为**完全
+绕过这个算法**（直接监督拟合 Nash）——证明 0.146 的差距是算法性的，且已定位**不是 critic、
+不是 batch**。要破 0.146 只剩"绕过策略梯度"（蒸馏/oracle），或在 ACH 内改算法本身（如换
+策略参数化、改门控）——但那不再是论文 ACH。
 
 
