@@ -97,6 +97,11 @@ def _warn_if_ach_incompatible(config: AlgoConfig) -> None:
             "update; extra value-only updates are a critic-quality boost it does "
             "not have)"
         )
+    if config.separate_critic:
+        issues.append(
+            "separate_critic=True (paper shares params between policy and value, "
+            "App. E; an independent critic net is an architecture deviation)"
+        )
     if issues:
         warnings.warn(
             f"ACH policy term is active (theta={config.theta}) alongside "
@@ -145,6 +150,21 @@ class NNActorCriticUpdate(UpdateRule):
         _warn_if_ach_incompatible(self.config)
         self.policy: MLPSharedActorCritic = policy
         self.optimizer = self._make_optimizer()
+        # Optional INDEPENDENT critic (AlgoConfig.separate_critic): own params and
+        # optimizer, so training it hard never drifts the policy (the shared-trunk
+        # n_critic_updates does). Its V(s) supplies the advantage baseline.
+        self.critic: MLPSharedActorCritic | None = None
+        self.critic_opt: torch.optim.Optimizer | None = None
+        if self.config.separate_critic:
+            self.critic = MLPSharedActorCritic(
+                policy.obs_size,
+                policy.num_actions,
+                hidden_sizes=self.config.critic_hidden_sizes,
+                device=str(policy.device),
+            )
+            self.critic_opt = torch.optim.SGD(
+                self.critic.parameters(), lr=self.config.learning_rate
+            )
 
     # ---- scaffolding ----
 
@@ -257,6 +277,20 @@ class NNActorCriticUpdate(UpdateRule):
         # Raw GAE advantages feed the ACH term unconditionally (paper p24); the
         # PPO term optionally sees the normalized copy.
         adv_raw = torch.as_tensor(batch.advantages, dtype=torch.float32, device=device)
+        if self.critic is not None and self.critic_opt is not None:
+            # Independent critic (AlgoConfig.separate_critic): train it hard on the
+            # value loss (own params -- no policy drift), then set the advantage to
+            # the MC baseline G - V_critic(s). Bypasses the rollout's GAE (the
+            # flattened batch has lost the trajectory structure GAE needs); for
+            # Liar's Dice terminal-only rewards this is a minor change.
+            for _ in range(max(1, self.config.n_critic_updates)):
+                v_c = self.critic(obs)[1]
+                cvloss = self.config.value_coef * ((v_c - returns) ** 2).mean()
+                self.critic_opt.zero_grad()
+                cvloss.backward()
+                self.critic_opt.step()
+            with torch.no_grad():
+                adv_raw = returns - self.critic(obs)[1]
         adv_ppo = adv_raw
         if self.config.theta < 1.0 and self.config.normalize_advantages:
             adv_ppo = normalize_advantages(adv_raw)

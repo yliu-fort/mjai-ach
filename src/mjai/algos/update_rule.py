@@ -135,6 +135,17 @@ class AlgoConfig:
     # do ~32 critic updates. This knob fits V harder to narrow that gap. Paper
     # deviation -> ACHFidelityWarning at theta>0.
     n_critic_updates: int = 0
+    # INDEPENDENT critic network (own trunk+value head, own optimizer -- not shared
+    # with the policy). When True, the update rule builds a separate critic, trains
+    # it on the value loss (n_critic_updates/step, no policy drift), and uses its
+    # V(s) for the advantage baseline A = G - V_critic(s). This is the clean test
+    # of whether a well-trained, non-drifting critic breaks the expl floor (the
+    # shared-trunk n_critic_updates drifts the policy + overfits the training batch).
+    # CAVEAT: advantage becomes MC (G - V) not GAE(lambda) -- the rollout's GAE is
+    # bypassed (recompute needs the trajectory, lost in the flattened batch); for
+    # Liar's Dice terminal-only rewards this is a minor change. Paper deviation.
+    separate_critic: bool = False
+    critic_hidden_sizes: tuple[int, ...] = (128,)
     # Debug probe: measure the PPO and ACH policy terms' gradient norms
     # SEPARATELY (plus their cosine), so a mixed-theta run says out loud which
     # term is actually driving the update. Two extra backward passes per
