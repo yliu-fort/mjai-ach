@@ -21,7 +21,8 @@ snapshot/restore contract. The update rule trains both: the policy via
 
 from __future__ import annotations
 
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 import torch
 
