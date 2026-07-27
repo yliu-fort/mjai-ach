@@ -52,8 +52,26 @@ def solve_nash(spec, sf, iters: int):
     return behavior
 
 
-def distill(spec, sf, nash_behavior, width, epochs, lr, seed=0, float64=False, eta_min=0.0):
-    """Supervised-fit an MLP of given width to the Nash behavior; return (mlp, final_loss)."""
+def distill(
+    spec,
+    sf,
+    nash_behavior,
+    width,
+    epochs,
+    lr,
+    seed=0,
+    float64=False,
+    eta_min=0.0,
+    optimizer="adam",
+    lbfgs_iters=300,
+):
+    """Supervised-fit an MLP of given width to the Nash behavior; return (mlp, final_loss).
+
+    optimizer="adam": epochs of Adam (cosine lr). "lbfgs": a short Adam warmup (min(epochs,
+    5000)) into the basin, then lbfgs_iters quasi-Newton polish steps -- L-BFGS breaks the
+    Adam plateau on this smooth supervised loss and reaches ~2x lower KL (docs/
+    liars_machine_precision.md sec 5.4). Each L-BFGS step does up to 25 line-search iters.
+    """
     dtype = torch.float64 if float64 else torch.float32
     obs = sf.infoset_observation.to(dtype)  # [I, obs]
     legal = sf.legal_mask  # [I, A] bool
@@ -63,20 +81,36 @@ def distill(spec, sf, nash_behavior, width, epochs, lr, seed=0, float64=False, e
     )
     if float64:
         mlp = mlp.double()  # train in float64 to escape the ~1e-7 float32 precision cap
+
+    def nll():
+        masked = mlp(obs)[0].masked_fill(~legal, -1e9)
+        return -(target * torch.log_softmax(masked, dim=-1)).sum(dim=-1).mean()
+
+    warmup = min(epochs, 5000) if optimizer == "lbfgs" else epochs
     opt = torch.optim.Adam(mlp.parameters(), lr=lr)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=eta_min)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(warmup, 1), eta_min=eta_min)
     last_loss = float("nan")
-    for _ in range(epochs):
-        logits = mlp(obs)[0]  # [I, A]
-        masked = logits.masked_fill(~legal, -1e9)
-        logp = torch.log_softmax(masked, dim=-1)
-        # NLL of the Nash target = sum_a target_a * (-logp_a); illegal a have target 0.
-        loss = -(target * logp).sum(dim=-1).mean()
+    for _ in range(warmup):
+        loss = nll()
         opt.zero_grad()
         loss.backward()
         opt.step()
         sched.step()
         last_loss = float(loss)
+    if optimizer == "lbfgs":
+        opt = torch.optim.LBFGS(
+            mlp.parameters(), lr=1.0, max_iter=25, line_search_fn="strong_wolfe"
+        )
+        for _ in range(lbfgs_iters):
+
+            def closure():
+                opt.zero_grad()
+                loss = nll()
+                loss.backward()
+                return loss
+
+            opt.step(closure)
+        last_loss = float(nll())
     return mlp, last_loss
 
 
@@ -96,6 +130,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--eta-min", type=float, default=0.0, help="Cosine lr floor (use ~1e-6 to hold a small lr)."
     )
+    p.add_argument(
+        "--optimizer",
+        choices=["adam", "lbfgs"],
+        default="adam",
+        help="lbfgs = Adam warmup + quasi-Newton polish (breaks the Adam KL plateau).",
+    )
+    p.add_argument("--lbfgs-iters", type=int, default=300, help="L-BFGS polish iterations.")
     p.add_argument(
         "--nash-cache",
         default="runs/nash_{game}_behavior.pt",
@@ -132,7 +173,17 @@ def main(argv: list[str] | None = None) -> int:
     results = []
     for w in args.widths:
         mlp, loss = distill(
-            spec, sf, nash_beh, w, args.epochs, args.lr, args.seed, args.float64, args.eta_min
+            spec,
+            sf,
+            nash_beh,
+            w,
+            args.epochs,
+            args.lr,
+            args.seed,
+            args.float64,
+            args.eta_min,
+            args.optimizer,
+            args.lbfgs_iters,
         )
         expl = float(nash_conv(sf, behavior_of(sf, mlp))) / 2
         nparams = sum(par.numel() for par in mlp.parameters())
