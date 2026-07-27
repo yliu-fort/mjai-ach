@@ -52,16 +52,19 @@ def solve_nash(spec, sf, iters: int):
     return behavior
 
 
-def distill(spec, sf, nash_behavior, width: int, epochs: int, lr: float, seed: int = 0):
+def distill(spec, sf, nash_behavior, width, epochs, lr, seed=0, float64=False, eta_min=0.0):
     """Supervised-fit an MLP of given width to the Nash behavior; return (mlp, final_loss)."""
-    obs = sf.infoset_observation.to(torch.float32)  # [I, obs]
+    dtype = torch.float64 if float64 else torch.float32
+    obs = sf.infoset_observation.to(dtype)  # [I, obs]
     legal = sf.legal_mask  # [I, A] bool
-    target = nash_behavior.to(torch.float32)  # [I, A] probs over legal, 0 elsewhere
+    target = nash_behavior.to(dtype)  # [I, A] probs over legal, 0 elsewhere
     mlp = MLPSharedActorCritic(
         spec.obs_size, spec.num_actions, hidden_sizes=(width,), seed=seed, device="cpu"
     )
+    if float64:
+        mlp = mlp.double()  # train in float64 to escape the ~1e-7 float32 precision cap
     opt = torch.optim.Adam(mlp.parameters(), lr=lr)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=eta_min)
     last_loss = float("nan")
     for _ in range(epochs):
         logits = mlp(obs)[0]  # [I, A]
@@ -85,6 +88,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--epochs", type=int, default=3000)
     p.add_argument("--lr", type=float, default=2e-2)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--float64",
+        action="store_true",
+        help="Train MLP in float64 (escapes the ~1e-7 float32 cap).",
+    )
+    p.add_argument(
+        "--eta-min", type=float, default=0.0, help="Cosine lr floor (use ~1e-6 to hold a small lr)."
+    )
     p.add_argument(
         "--nash-cache",
         default="runs/nash_{game}_behavior.pt",
@@ -120,7 +131,9 @@ def main(argv: list[str] | None = None) -> int:
     print("-" * 60)
     results = []
     for w in args.widths:
-        mlp, loss = distill(spec, sf, nash_beh, w, args.epochs, args.lr, args.seed)
+        mlp, loss = distill(
+            spec, sf, nash_beh, w, args.epochs, args.lr, args.seed, args.float64, args.eta_min
+        )
         expl = float(nash_conv(sf, behavior_of(sf, mlp))) / 2
         nparams = sum(par.numel() for par in mlp.parameters())
         print(f"{w:>6}{nparams:>9}{loss:>12.4f}{expl:>18.4e}")
