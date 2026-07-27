@@ -91,6 +91,12 @@ def _warn_if_ach_incompatible(config: AlgoConfig) -> None:
             "1/pi_old importance weight; capping it is a stabilizer the paper "
             "does not have)"
         )
+    if config.n_critic_updates > 0:
+        issues.append(
+            f"n_critic_updates={config.n_critic_updates} (paper does 1 combined "
+            "update; extra value-only updates are a critic-quality boost it does "
+            "not have)"
+        )
     if issues:
         warnings.warn(
             f"ACH policy term is active (theta={config.theta}) alongside "
@@ -260,6 +266,16 @@ class NNActorCriticUpdate(UpdateRule):
         old_probs = torch.exp(old_logp)
 
         stats = UpdateStats(policy_loss=0.0, value_loss=0.0, entropy=0.0)
+        # Optional extra value-only updates to fit V harder before the policy step
+        # (AlgoConfig.n_critic_updates). The advantage for THIS batch was already
+        # computed in the rollout; these updates improve V for FUTURE batches' GAE.
+        for _ in range(self.config.n_critic_updates):
+            logits_c, values_c = self.policy(obs)
+            vloss, _ = value_loss_and_entropy(logits_c, values_c, returns, mask)
+            vstep = self.config.value_coef * vloss
+            self.optimizer.zero_grad()
+            vstep.backward()  # type: ignore[no-untyped-call]  # torch's Tensor.backward is untyped
+            self.optimizer.step()
         first_off_policy: float | None = None
         for _ in range(self.config.n_epochs):
             stats = self._gradient_step(

@@ -128,6 +128,13 @@ class AlgoConfig:
     normalize_advantages: bool = False
     n_epochs: int = 1
     adam_eps: float = 1e-5
+    # Extra value-only updates per policy step (0 = paper-faithful, 1 combined update).
+    # The ACH critic is UNDER-TRAINED: its explained_variance on Liar's Dice is ~0.15
+    # vs an irreducible Nash ceiling of ~0.65 (docs/liars_machine_precision.md Q1) --
+    # mostly because the paper does 1 combined update where OpenSpiel's A2C/RPG/NeuRD
+    # do ~32 critic updates. This knob fits V harder to narrow that gap. Paper
+    # deviation -> ACHFidelityWarning at theta>0.
+    n_critic_updates: int = 0
     # Debug probe: measure the PPO and ACH policy terms' gradient norms
     # SEPARATELY (plus their cosine), so a mixed-theta run says out loud which
     # term is actually driving the update. Two extra backward passes per
