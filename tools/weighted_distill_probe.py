@@ -72,20 +72,34 @@ def counterfactual_reach(sf, behavior: torch.Tensor) -> torch.Tensor:
 def infoset_weights(sf, behavior: torch.Tensor, kind: str) -> torch.Tensor:
     """Per-information-set loss weight, normalized to mean 1.
 
-    ``cf`` is the weight exploitability actually responds to (a best response
-    collects an error at ``I`` in proportion to how often chance and the
-    opponent take the game there). ``reach`` is what an on-policy sampler
-    delivers, ``rho = own_reach * cf``: it discounts every information set by
-    the learner's *own* probability of going there. The ratio between the two is
-    therefore exactly ``1 / own_reach(I)`` -- the mismatch, in one expression.
+    Two independent axes, which the ``cf`` result forced apart:
+
+    - **Which information sets get the weight (the ordering).** ``rho`` is the
+      on-policy visitation ``own_reach * cf``, and it is also -- to first order
+      -- the sensitivity of exploitability to a perturbation at ``I``: behaviour
+      at an information set the player's own strategy never reaches cannot be
+      exploited (``docs/kuhn_free_parameter.md`` §1.3 measures exactly that).
+      ``cf`` drops the ``own_reach`` factor, so it re-orders.
+    - **How sharply the weight is concentrated (the exponent).** ``rho`` spans
+      18 orders of magnitude on Liar's Dice; raising it to a power ``kappa < 1``
+      keeps the ordering and compresses the range.
+
+    Accepted names: ``uniform`` (= rho^0), ``reach`` (= rho^1), ``sqrt``
+    (= rho^0.5), ``cf``, and the parametric forms ``rho:K`` / ``cf:K`` for any
+    exponent K, which is what separates the two axes.
     """
-    if kind == "uniform":
-        w = torch.ones(sf.num_infosets, dtype=torch.float64)
-    elif kind == "cf":
+    base, _, exponent = kind.partition(":")
+    kappa = float(exponent) if exponent else None
+    if base == "uniform":
+        return torch.ones(sf.num_infosets, dtype=torch.float64)
+    if base == "cf":
         w = counterfactual_reach(sf, behavior)
-    else:
-        _adv, rho = ExactAdvantage(sf).compute(behavior)
-        w = rho if kind == "reach" else rho.clamp(min=0.0).sqrt()
+        kappa = 1.0 if kappa is None else kappa
+    else:  # rho and its aliases
+        _adv, w = ExactAdvantage(sf).compute(behavior)
+        if kappa is None:
+            kappa = {"reach": 1.0, "rho": 1.0, "sqrt": 0.5}[base]
+    w = w.clamp(min=0.0).pow(kappa)
     return w / w.mean().clamp(min=1e-300)
 
 
@@ -189,15 +203,30 @@ def main() -> None:
             .sum(dim=1)
             .mean()
         )
+        # Distribution shift: a weight computed from the TARGET is only the right
+        # sensitivity weight while the learner still plays like the target. Ask
+        # how much of the learned policy's own visitation lands in the rows this
+        # arm barely trained -- errors there are what move the weight itself.
+        engine = ExactAdvantage(sf)
+        _adv, rho_learned = engine.compute(beh)
+        _adv, rho_target = engine.compute(target)
+        starved = w < 1e-3
+        leak_learned = float(rho_learned[starved].sum() / rho_learned.sum().clamp(min=1e-300))
+        leak_target = float(rho_target[starved].sum() / rho_target.sum().clamp(min=1e-300))
         results[kind] = {
             "exploitability": expl,
             "unweighted_KL": kl,
             "weighted_train_loss": final_loss,
             "frac_infosets_with_weight_above_1e-6": covered,
+            "effective_infosets": float(w.sum() ** 2 / (w * w).sum()),
+            "starved_rows": int(starved.sum()),
+            "visits_into_starved_rows_learned": leak_learned,
+            "visits_into_starved_rows_target": leak_target,
         }
         print(
-            f"{kind:>8}: expl {expl:.5f}  KL(Nash||MLP) {kl:.5f}  "
-            f"covered {covered * 100:.1f}% of infosets",
+            f"{kind:>10}: expl {expl:.5f}  KL {kl:.5f}  covered {covered * 100:5.1f}%  "
+            f"effN {results[kind]['effective_infosets']:8.0f}  "
+            f"leak {leak_learned:.2e} (target {leak_target:.2e})",
             flush=True,
         )
         args.out.parent.mkdir(parents=True, exist_ok=True)
