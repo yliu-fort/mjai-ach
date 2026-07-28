@@ -70,8 +70,11 @@ class PolicyWithCritic(Policy):
         *,
         eval: bool = False,
         rng_key: Any = None,
+        behavior_epsilon: float = 0.0,
     ) -> tuple[int, float]:
-        return self.policy_net.act(obs, legal_actions, eval=eval, rng_key=rng_key)
+        return self.policy_net.act(
+            obs, legal_actions, eval=eval, rng_key=rng_key, behavior_epsilon=behavior_epsilon
+        )
 
     def action_logits(self, obs: list[float], legal_actions: list[int]) -> list[float]:
         return self.policy_net.action_logits(obs, legal_actions)
@@ -90,10 +93,13 @@ class PolicyWithCritic(Policy):
         *,
         eval: bool = False,
         rng_key: Any = None,
+        behavior_epsilon: float = 0.0,
     ) -> tuple[int, float, float]:
         # Two forwards (policy for action+logprob, critic for value) -- the cost
         # of decoupling the value from the policy trunk.
-        action, logprob = self.policy_net.act(obs, legal_actions, eval=eval, rng_key=rng_key)
+        action, logprob = self.policy_net.act(
+            obs, legal_actions, eval=eval, rng_key=rng_key, behavior_epsilon=behavior_epsilon
+        )
         value = self.critic_net.value(obs)
         return action, logprob, value
 

@@ -180,6 +180,7 @@ class MLPSharedActorCritic(nn.Module, Policy):
         *,
         eval: bool = False,
         rng_key: Any = None,
+        behavior_epsilon: float = 0.0,
     ) -> tuple[int, float]:
         if not legal_actions:
             raise ValueError("legal_actions must be non-empty")
@@ -195,8 +196,25 @@ class MLPSharedActorCritic(nn.Module, Policy):
                 best = int(legal_idx[torch.argmax(legal_lp)].item())
                 return best, 0.0
             # Stochastic sample from the full-space categorical (illegal have ~0 prob).
+            if behavior_epsilon > 0.0:
+                return self._sample_exploring(probs, legal_actions, behavior_epsilon)
             action = int(torch.multinomial(probs, num_samples=1).item())
             return action, float(log_probs[action].item())
+
+    def _sample_exploring(
+        self, probs: torch.Tensor, legal_actions: list[int], epsilon: float
+    ) -> tuple[int, float]:
+        """Sample from ``mu = (1-eps)*pi + eps*Uniform(legal)``; return log mu(a).
+
+        Consumes exactly one ``torch.multinomial`` draw, matching the on-policy
+        branch so the rollout's RNG stream keeps the same shape.
+        """
+        mix = torch.zeros_like(probs)
+        idx = torch.tensor(legal_actions, dtype=torch.long, device=probs.device)
+        mix[idx] = 1.0 / len(legal_actions)
+        mu = (1.0 - epsilon) * probs + epsilon * mix
+        action = int(torch.multinomial(mu, num_samples=1).item())
+        return action, float(torch.log(mu[action]).item())
 
     def value(self, obs: list[float]) -> float:
         with torch.no_grad():
@@ -211,6 +229,7 @@ class MLPSharedActorCritic(nn.Module, Policy):
         *,
         eval: bool = False,
         rng_key: Any = None,
+        behavior_epsilon: float = 0.0,
     ) -> tuple[int, float, float]:
         """Fused single-forward ``act`` + ``value`` (AGENTS.md §8).
 
@@ -234,6 +253,9 @@ class MLPSharedActorCritic(nn.Module, Policy):
                 legal_lp = log_probs[legal_idx]
                 best = int(legal_idx[torch.argmax(legal_lp)].item())
                 return best, 0.0, v
+            if behavior_epsilon > 0.0:
+                action, logprob = self._sample_exploring(probs, legal_actions, behavior_epsilon)
+                return action, logprob, v
             action = int(torch.multinomial(probs, num_samples=1).item())
             return action, float(log_probs[action].item()), v
 

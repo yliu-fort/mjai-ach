@@ -23,7 +23,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from mjai.agents.base import Policy, masked_softmax
+from mjai.agents.base import Policy, behavior_prob, masked_softmax
 
 
 def _obs_to_key(obs: list[float]) -> bytes:
@@ -112,6 +112,7 @@ class TabularPolicy(Policy):
         *,
         eval: bool = False,
         rng_key: Any = None,
+        behavior_epsilon: float = 0.0,
     ) -> tuple[int, float]:
         if not legal_actions:
             raise ValueError("legal_actions must be non-empty")
@@ -125,10 +126,13 @@ class TabularPolicy(Policy):
                 if abs(probs[a] - best_p) < 1e-12 and a < best_a:
                     best_a = a
             return best_a, 0.0
-        # Stochastic: sample from the legal-action categorical.
-        legal_probs = [probs[a] for a in legal_actions]
+        # Stochastic: sample from the legal-action categorical (mixed with the
+        # uniform when an exploring behavior policy is asked for).
+        legal_probs = [
+            behavior_prob(probs[a], len(legal_actions), behavior_epsilon) for a in legal_actions
+        ]
         chosen = self._sample_categorical(legal_actions, legal_probs)
-        lp = math.log(probs[chosen] + 1e-30)
+        lp = math.log(legal_probs[legal_actions.index(chosen)] + 1e-30)
         return chosen, lp
 
     def value(self, obs: list[float]) -> float:
@@ -141,6 +145,7 @@ class TabularPolicy(Policy):
         *,
         eval: bool = False,
         rng_key: Any = None,
+        behavior_epsilon: float = 0.0,
     ) -> tuple[int, float, float]:
         """Fused ``act`` + ``value`` for the rollout hot path (AGENTS.md §8).
 
@@ -161,9 +166,11 @@ class TabularPolicy(Policy):
                 if abs(probs[a] - best_p) < 1e-12 and a < best_a:
                     best_a = a
             return best_a, 0.0, v
-        legal_probs = [probs[a] for a in legal_actions]
+        legal_probs = [
+            behavior_prob(probs[a], len(legal_actions), behavior_epsilon) for a in legal_actions
+        ]
         chosen = self._sample_categorical(legal_actions, legal_probs)
-        lp = math.log(probs[chosen] + 1e-30)
+        lp = math.log(legal_probs[legal_actions.index(chosen)] + 1e-30)
         return chosen, lp, v
 
     def _sample_categorical(self, actions: list[int], probs: list[float]) -> int:
