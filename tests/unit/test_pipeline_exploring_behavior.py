@@ -90,7 +90,7 @@ def test_recorded_logprob_is_the_behavior_probability(make):
     """log mu(a), not log pi(a) — the bug that would silently bias the gradient."""
     obs, legal, eps = [0.1, -0.2, 0.3, 0.4], [0, 2], 0.4
     policy = make()
-    pi = {a: p for a, p in zip(legal, _legal_probs(policy, obs, legal), strict=True)}
+    pi = dict(zip(legal, _legal_probs(policy, obs, legal), strict=True))
     action, logprob, _v = policy.act_with_value(obs, legal, eval=False, behavior_epsilon=eps)
     assert action in legal
     expected = behavior_prob(pi[action], len(legal), eps)
