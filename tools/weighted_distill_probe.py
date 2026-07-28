@@ -41,6 +41,7 @@ from mjai.seqform.plan import nash_conv, realization_plans
 from mjai.seqform.tree import build_sequence_form
 
 WEIGHTINGS = ("uniform", "reach", "sqrt", "cf")
+# plus the parametric forms "rho:K", "cf:K" and "own:K" (= own_reach^K * cf).
 
 
 def counterfactual_reach(sf, behavior: torch.Tensor) -> torch.Tensor:
@@ -69,6 +70,22 @@ def counterfactual_reach(sf, behavior: torch.Tensor) -> torch.Tensor:
     return cf
 
 
+def own_reach(sf, behavior: torch.Tensor) -> torch.Tensor:
+    """The acting player's OWN realization probability of reaching each row.
+
+    Online-computable during a rollout at any game scale: it is the running
+    product of that player's own recorded action probabilities so far in the
+    episode. That is what makes the ``own:K`` family below implementable
+    outside a toy game, unlike anything that needs visit counts.
+    """
+    plans = realization_plans(sf, behavior)
+    own = torch.zeros(sf.num_infosets, dtype=torch.float64)
+    for player in range(sf.num_players):
+        rows = sf.rows_of(player)
+        own[rows] = plans[player].index_select(0, sf.parent_sequence[rows])
+    return own
+
+
 def infoset_weights(sf, behavior: torch.Tensor, kind: str) -> torch.Tensor:
     """Per-information-set loss weight, normalized to mean 1.
 
@@ -92,6 +109,13 @@ def infoset_weights(sf, behavior: torch.Tensor, kind: str) -> torch.Tensor:
     kappa = float(exponent) if exponent else None
     if base == "uniform":
         return torch.ones(sf.num_infosets, dtype=torch.float64)
+    if base == "own":
+        # w = own_reach^K * cf. K=1 is rho (what sampling delivers), K=0 is cf
+        # (measured worse than uniform, §7) -- the interior is the part that is
+        # both untested AND computable online without visit counts.
+        assert kappa is not None, "the 'own' family needs an exponent, e.g. own:0.5"
+        w = own_reach(sf, behavior).clamp(min=0.0).pow(kappa) * counterfactual_reach(sf, behavior)
+        return w / w.mean().clamp(min=1e-300)
     if base == "cf":
         w = counterfactual_reach(sf, behavior)
         kappa = 1.0 if kappa is None else kappa
