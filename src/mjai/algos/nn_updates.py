@@ -142,7 +142,7 @@ class NNActorCriticUpdate(UpdateRule):
     """
 
     def __init__(self, policy: MLPSharedActorCritic, config: AlgoConfig | None = None) -> None:
-        if not isinstance(policy, (MLPSharedActorCritic, PolicyWithCritic)):
+        if not isinstance(policy, MLPSharedActorCritic | PolicyWithCritic):
             raise TypeError(
                 f"{type(self).__name__} requires MLPSharedActorCritic (or PolicyWithCritic "
                 f"for separate_critic), got {type(policy)}"
