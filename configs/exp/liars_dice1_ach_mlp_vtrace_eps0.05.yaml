@@ -1,0 +1,63 @@
+# Liar's Dice residual-floor FIX probe: exploring behavior policy + V-trace.
+#
+# Baseline for this family is configs/exp/liars_dice1_ach_mlp_fix_lth2_iw20_cap256.yaml
+# (l_th=2, iw_clip=20, hidden=256) which floors at exploitability 0.146.
+# docs/liars_residual_floor.md locates that floor in the DYNAMIC RANGE of the
+# on-policy visitation rho: effN(rho) = 40 of 24576 information sets, and 80.8%
+# of them are never visited once in the whole 1e7-step run. This family tests
+# the one intervention that changes rho rather than the estimators feeding it.
+#
+# mu = (1-eps)*pi + eps*Uniform(legal); the rollout records log mu(a|s), so
+# ACH's 1/pi_old still cancels the sampling probability exactly and the expected
+# per-visit update is unchanged (paper Eq. 29 p24). V-trace then corrects the
+# value target and the advantage for mu != pi -- without it the critic fits V^mu
+# and GAE estimates A^mu while the ACH update wants A^pi.
+#
+# BOTH knobs are deviations from the paper (p24: mu = pi, advantages are GAE)
+# and emit ACHFidelityWarning. Read against the eps=0 arm, NOT against the GAE
+# baseline: V-trace changes the critic's target even at eps=0, so the eps=0 arm
+# is the control that isolates the exploration.
+
+game: liars_dice1
+algo: ach
+self_play_mode: mirror
+policy_kind: mlp
+hidden_sizes: [256]
+activation: relu
+optimizer: sgd
+learning_rate: 0.001
+value_coef: 1.0
+entropy_coef: 0.01
+gae_lambda: 0.95
+max_grad_norm: 0.0
+eta: 1.0
+l_th: 2.0
+ratio_eps: 0.5
+iw_clip: 20              # cap 1/pi_old (root-cause fix; None=paper)
+behavior_epsilon: 0.05   # mu = (1-eps)*pi + eps*Uniform(legal); 0 = paper
+advantage_estimator: vtrace   # off-policy correction for mu != pi
+vtrace_rho_bar: 1.0
+vtrace_c_bar: 1.0
+target_samples: 64
+episodes_per_round: 200
+total_env_steps: 10000000
+eval_every_env_steps: 100000
+n_steps: 1000000
+save_every_steps: 1000
+eval_every_steps: 1000
+eval_during_training: true
+verbose: false
+seed: 0
+out_dir: runs/ab_explore/liars_vtrace_eps0.05_seed0
+hedge_eta: null
+clip_eps: 0.2
+league_capacity: 16
+device: null
+trunk_layernorm: true
+gate_centered_logits: false
+loss_centered_logits: false
+# ---- D16 average-strategy anchor (AGENTS.md D16) ----
+# "both" emits the uniform (theorem-stated) average under eval/avg_* and the
+# linear/CFR+ average under eval/avg_*_lin from this one run.
+track_average_policy: true
+average_policy_weighting: both
