@@ -1,27 +1,39 @@
 """Where does a trained policy's remaining exploitability live, and does ACH look there?
 
-The hypothesis (H3): the residual RL floor is a **reach-weight mismatch**. ACH
-learns from sampled rollouts, so the gradient an information set receives is
+ACH learns from sampled rollouts, so the gradient an information set receives is
 proportional to ``rho(I)`` -- the probability that a self-play episode visits it,
-which multiplies **both** players' reach. A best response is under no such
-obligation: it can steer the game into information sets the current policy
-almost never enters, and its gain there is weighted by ``cfreach(I)`` -- chance
-and the *opponent* only. Those two weightings differ by the learner's own reach,
-which is exactly the quantity ACH's own guarantee has to pay for in the second,
-``T``-independent term of Theorem 1 (``docs/paper_spec_ach.md`` §1.1).
+which multiplies **both** players' reach. This module measures how concentrated
+that weighting is, and how much of the available improvement it starves.
 
-So the measurement is: sort the information sets by how often training visits
-them, then ask how much of the *available improvement* sits in the rarely
-visited tail. Two weightings of the same per-information-set regret::
+.. warning::
+   **Corrected 2026-07-28.** An earlier version of this docstring claimed the
+   right weight was ``cfreach`` (chance and opponent only) and that ``rho``'s
+   extra ``own_reach`` factor was the defect. That is wrong. In a two-player
+   zero-sum game ``NashConv(pi) = BR_0(pi_1) + BR_1(pi_0)``, so the first-order
+   sensitivity of exploitability to player p's behaviour at ``I`` is
+   ``own_reach_p(I) * cf^{BR}(I)`` -- ``own_reach`` is a factor whatever the
+   opponent plays, because behaviour at an information set your own strategy
+   never reaches cannot be exploited (``docs/kuhn_free_parameter.md`` §1.3
+   measures exactly that on Kuhn's alpha=1/3 face). ``rho`` therefore has the
+   **right ranking**; ``tools/starve_probe.py`` confirms it directly, and shows
+   a ``cfreach`` ranking is barely better than random. What is wrong with
+   ``rho`` is its **dynamic range** -- see below.
+
+Two weightings of the same per-information-set regret are still worth comparing,
+but as a descriptive statistic rather than a right-versus-wrong one::
 
     regret(I)  = max_a A(I, a)                 exact, on-policy advantage
-    R_sampled  = sum_I rho(I)     * regret(I)  what ACH's gradient sees
-    R_counter  = sum_I cfreach(I) * regret(I)  what a best response can collect
+    R_sampled  = sum_I rho(I)     * regret(I)
+    R_counter  = sum_I cfreach(I) * regret(I)
 
-If ``R_counter`` is dominated by information sets with negligible ``rho``, the
-learner is structurally blind to its own worst weaknesses and no amount of
-critic accuracy, batch size or capacity can fix it -- which is precisely the
-pattern the previous ablations left unexplained.
+Their ratio is a regret-weighted mean of ``1 / own_reach(I)``, i.e. a measure of
+how far ``own_reach`` stretches the weighting -- one of the two factors (the
+other being ``cfreach`` itself) whose product gives ``rho`` its 20.8 decades of
+spread on Liar's Dice. The sharper statistic is the participation ratio
+``(sum w)^2 / sum w^2``: the *effective* number of information sets the
+weighting trains. On Liar's Dice that is **40 out of 24576**, and it is 9 on
+Kuhn and 59 on Leduc -- a few dozen regardless of game size, which is why the
+same algorithm is fine on Kuhn (78% of the game) and not on Liar's Dice (0.16%).
 
 Reads a checkpoint, writes a JSON summary. Analysis tool, not on the import path.
 """
