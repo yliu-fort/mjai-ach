@@ -13,12 +13,13 @@ This module changes for exactly one reason: a new configurable knob.
 from __future__ import annotations
 
 import random
+import warnings
 from dataclasses import dataclass, field
 
 from mjai.agents.base import Policy
 from mjai.algos.controller import MirrorSelfPlay, SelfPlayController
 from mjai.algos.tabular_updates import TabularACHUpdate, TabularPPOUpdate
-from mjai.algos.update_rule import AlgoConfig, UpdateRule
+from mjai.algos.update_rule import ACHFidelityWarning, AlgoConfig, UpdateRule
 from mjai.games.loader import GameSpec
 from mjai.league.checkpoint_store import Role
 from mjai.league.league_controller import LeagueSelfPlay
@@ -124,6 +125,14 @@ class ExperimentConfig:
     l_th: float = 2.0  # one-sided logit gate threshold (p28 Table 8)
     ratio_eps: float = 0.5  # ratio gate; vacuous when synchronous (p28)
     iw_clip: float | None = None  # cap 1/pi_old (AlgoConfig.iw_clip); None = paper-faithful
+    # ---- exploring behavior policy + off-policy correction (deviation) ----
+    # Both default to the paper's on-policy setup (p24: mu_{p,t} = pi_{p,t});
+    # setting either emits ACHFidelityWarning when the ACH term has weight.
+    # Rationale and the measurement they target: docs/liars_residual_floor.md.
+    behavior_epsilon: float = 0.0  # mu = (1-eps)*pi + eps*Uniform(legal)
+    advantage_estimator: str = "gae"  # "gae" (paper) | "vtrace" (off-policy correction)
+    vtrace_rho_bar: float = 1.0
+    vtrace_c_bar: float = 1.0
     n_critic_updates: int = 0  # extra value-only updates/step (AlgoConfig); 0 = paper-faithful
     separate_critic: bool = False  # independent critic net (AlgoConfig) -- clean critic test
     critic_hidden_sizes: list[int] = field(default_factory=lambda: [128])
@@ -354,10 +363,45 @@ def build_update_rule(policy: Policy, cfg: ExperimentConfig, spec: GameSpec) -> 
     raise ValueError(f"Unknown policy_kind: {cfg.policy_kind}")
 
 
+def warn_if_rollout_ach_incompatible(cfg: ExperimentConfig) -> None:
+    """Warn when a ROLLOUT-side knob the ACH paper contradicts is on.
+
+    The mirror of ``nn_updates._warn_if_ach_incompatible`` (AGENTS.md D11) for
+    the knobs that live on :class:`~mjai.pipeline.rollout.RolloutConfig` rather
+    than on ``AlgoConfig``: the behavior policy and the advantage estimator are
+    properties of data COLLECTION, so they belong there, but they are exactly as
+    much a deviation from the paper as an optimizer swap is.
+
+    Silent at ``theta=0`` and on the shipped defaults, so a reproduction run
+    never warns and an A/B arm always says so out loud.
+    """
+    if resolve_theta(cfg) <= 0.0:
+        return
+    issues: list[str] = []
+    if cfg.behavior_epsilon > 0.0:
+        issues.append(
+            f"behavior_epsilon={cfg.behavior_epsilon} (p24: the behavior policy is "
+            "mu_{p,t} = pi_{p,t}; sampling off-policy also makes the ratio gate "
+            "non-vacuous, which p28 states it is not in this experiment)"
+        )
+    if cfg.advantage_estimator != "gae":
+        issues.append(
+            f"advantage_estimator={cfg.advantage_estimator!r} (p24: advantages are "
+            "GAE(lambda) and G is the sampled return)"
+        )
+    if issues:
+        warnings.warn(
+            "ACH fidelity: " + "; ".join(issues),
+            ACHFidelityWarning,
+            stacklevel=2,
+        )
+
+
 def build_controller(
     spec: GameSpec, policy: Policy, cfg: ExperimentConfig, *, rng: random.Random
 ) -> SelfPlayController:
     """Build the mirror or league controller + return it."""
+    warn_if_rollout_ach_incompatible(cfg)
     runner = RolloutWorkerCore(
         spec,
         learner_player=0,
@@ -366,6 +410,10 @@ def build_controller(
             gae_lambda=cfg.gae_lambda,
             seed=cfg.seed,
             target_samples=cfg.target_samples,
+            behavior_epsilon=cfg.behavior_epsilon,
+            advantage_estimator=cfg.advantage_estimator,
+            vtrace_rho_bar=cfg.vtrace_rho_bar,
+            vtrace_c_bar=cfg.vtrace_c_bar,
             # League rounds shuffle the collector's seat per episode so every
             # opponent is faced from both perspectives; routing by producer
             # identity keeps each learner's dose exact regardless of seat.

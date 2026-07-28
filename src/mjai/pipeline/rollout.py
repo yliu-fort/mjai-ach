@@ -15,12 +15,13 @@ Chance nodes are auto-sampled (we never expose them to the policies).
 
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass, field
 
 import pyspiel
 
-from mjai.agents.base import Policy
+from mjai.agents.base import Policy, target_ratio
 from mjai.algos.transition import Batch, Transition, make_batch
 from mjai.games.loader import GameSpec
 
@@ -44,6 +45,21 @@ class RolloutConfig:
             argument — not by physical seat, so the dose stays exact under seat
             shuffle (AGENTS.md §9: batch size is a config value, not a mode
             side effect).
+        behavior_epsilon: sample actions from ``mu = (1-eps)*pi + eps*Uniform(legal)``
+            instead of from ``pi``. 0.0 (default) is the paper's on-policy
+            behavior (p24, ``mu_{p,t} = pi_{p,t}``); anything else is a
+            deliberate deviation whose purpose is to flatten the information-set
+            visitation ``rho`` (docs/liars_residual_floor.md). The recorded
+            logprob is ``log mu(a|s)``, which is what makes ACH's ``1/pi_old``
+            cancel the sampling probability exactly.
+        advantage_estimator: "gae" (default, paper-faithful) or "vtrace". V-trace
+            (Espeholt et al. 2018) corrects the value target and the advantage
+            for the mismatch between ``mu`` and ``pi``; without it a run with
+            ``behavior_epsilon > 0`` fits ``V^mu`` and estimates ``A^mu`` while
+            the ACH update wants ``A^pi``.
+        vtrace_rho_bar / vtrace_c_bar: the two V-trace truncations (IMPALA
+            defaults 1.0). ``rho_bar`` caps the fixed point the value function
+            converges to; ``c_bar`` caps how far a correction propagates back.
         shuffle_seats: when True, each episode independently flips a fair coin
             (seeded) to decide which physical seat the ``learner`` occupies, so
             a learner sees BOTH perspectives against every opponent across
@@ -57,6 +73,10 @@ class RolloutConfig:
     seed: int | None = None
     target_samples: int | None = 64
     shuffle_seats: bool = False
+    behavior_epsilon: float = 0.0
+    advantage_estimator: str = "gae"
+    vtrace_rho_bar: float = 1.0
+    vtrace_c_bar: float = 1.0
 
 
 @dataclass
@@ -200,7 +220,9 @@ class RolloutWorkerCore:
                 obs = self.game_spec.obs_tensor(state, p)
                 legal = list(state.legal_actions())
                 policy = self._policy_for(p, learner, opponent, learner_seat)
-                a, lp, v = policy.act_with_value(obs, legal, eval=False)
+                a, lp, v = policy.act_with_value(
+                    obs, legal, eval=False, behavior_epsilon=self.config.behavior_epsilon
+                )
                 steps.append((p, policy, obs, legal, a, lp, v))
                 state.apply_action(a)
 
@@ -225,40 +247,108 @@ class RolloutWorkerCore:
         return transitions, returns
 
     def _assign_returns(self, transitions: list[Transition], returns: list[float]) -> None:
-        """Fill in return_ and advantage per transition using GAE(lambda), gamma=1.
+        """Fill in return_ and advantage per transition, gamma=1.
 
         For 2p0-sum games the transitions alternate between players. Each
-        player's experience is a sub-trajectory; GAE is computed per-player
+        player's experience is a sub-trajectory; the estimator runs per-player
         using that player's value estimates and the terminal return as the
-        episode's payoff. lambda comes from ``self.config.gae_lambda``. gamma
-        is fixed at 1 (undiscounted): all Phase-1 games are short with
-        terminal-only rewards, and the paper's H.3 leaves gamma unspecified
-        (spec assumption A1).
+        episode's payoff. gamma is fixed at 1 (undiscounted): all Phase-1 games
+        are short with terminal-only rewards, and the paper's H.3 leaves gamma
+        unspecified (spec assumption A1).
+
+        Two estimators, selected by ``RolloutConfig.advantage_estimator``:
+        ``"gae"`` (default, paper-faithful) and ``"vtrace"``.
         """
-        lam = self.config.gae_lambda
+        estimator = self.config.advantage_estimator
+        if estimator not in ("gae", "vtrace"):
+            raise ValueError(
+                f"unknown advantage_estimator {estimator!r}; want 'gae' | 'vtrace' "
+                "(AGENTS.md §11: no silent fallback)"
+            )
         # Group transitions by player; within each group the order matches the
         # temporal order of that player's decisions in the episode.
         by_player: dict[int, list[Transition]] = {}
         for t in transitions:
             by_player.setdefault(t.player, []).append(t)
         for player, ts in by_player.items():
-            r = returns[player]
-            n = len(ts)
-            gae = 0.0
-            # Walk backward through the player's transitions.
-            for i in range(n - 1, -1, -1):
-                t = ts[i]
-                t.return_ = float(r)
-                # TD residual: reward + gamma*V(next) - V(current).
-                # For these games reward is 0 mid-episode and the terminal
-                # payoff at the end; gamma=1 (undiscounted, short episodes).
-                next_value = ts[i + 1].value if i + 1 < n else 0.0
-                delta = 0.0 + next_value - t.value
-                # On the last transition, attach the actual terminal return.
-                if i == n - 1:
-                    delta = r - t.value
-                gae = delta + lam * gae
-                t.advantage = gae
+            if estimator == "gae":
+                self._assign_gae(ts, returns[player])
+            else:
+                self._assign_vtrace(ts, returns[player])
+
+    def _assign_gae(self, ts: list[Transition], r: float) -> None:
+        """GAE(lambda) advantages with the Monte-Carlo return as the value target.
+
+        The paper's combination (p24): ``G`` is the sampled return and the
+        advantage is GAE(lambda). Unchanged from the original implementation --
+        this is the bit-identical default path.
+        """
+        lam = self.config.gae_lambda
+        n = len(ts)
+        gae = 0.0
+        # Walk backward through the player's transitions.
+        for i in range(n - 1, -1, -1):
+            t = ts[i]
+            t.return_ = float(r)
+            # TD residual: reward + gamma*V(next) - V(current).
+            # For these games reward is 0 mid-episode and the terminal
+            # payoff at the end; gamma=1 (undiscounted, short episodes).
+            next_value = ts[i + 1].value if i + 1 < n else 0.0
+            delta = 0.0 + next_value - t.value
+            # On the last transition, attach the actual terminal return.
+            if i == n - 1:
+                delta = r - t.value
+            gae = delta + lam * gae
+            t.advantage = gae
+
+    def _assign_vtrace(self, ts: list[Transition], r: float) -> None:
+        """V-trace(lambda) targets and advantages (Espeholt et al. 2018), gamma=1.
+
+        Needed once the behavior policy stops being the target policy: with
+        ``behavior_epsilon > 0`` the returns are collected under ``mu``, so an
+        uncorrected critic fits ``V^mu`` and GAE estimates ``A^mu`` while the
+        ACH update wants ``A^pi``. V-trace reweights both by the per-step
+        ratio ``pi(a|s)/mu(a|s)``.
+
+        The ratio is recovered from the recorded ``log mu(a|s)`` by
+        :func:`mjai.agents.base.target_ratio` -- exactly, and without a second
+        network pass, because collection and update are synchronous here so the
+        ``pi`` that acted IS the ``pi`` being trained.
+
+        Two deliberate choices, both stated because they are not the only ones:
+
+        - ``c_i = lambda * min(c_bar, ratio_i)`` folds the existing
+          ``gae_lambda`` into the trace, so the estimator is a strict
+          generalization: at ``epsilon = 0`` every ratio is 1 and the advantage
+          below reduces **exactly** to GAE(lambda).
+        - the advantage is the value residual ``v_i - V_i`` rather than
+          IMPALA's ``rho_i * (r_i + gamma * v_{i+1} - V_i)``. The residual form
+          is what makes the reduction above exact; IMPALA's form is one line
+          away if a future arm wants it.
+
+        Note the value TARGET does change at ``epsilon = 0``: GAE mode regresses
+        V on the Monte-Carlo return, V-trace regresses it on ``v_i``. So an
+        ablation isolating the effect of exploration should compare
+        ``vtrace(eps>0)`` against ``vtrace(eps=0)``, not against the GAE default.
+        """
+        lam = self.config.gae_lambda
+        rho_bar = self.config.vtrace_rho_bar
+        c_bar = self.config.vtrace_c_bar
+        eps = self.config.behavior_epsilon
+        n = len(ts)
+        v_next = 0.0  # bootstrap past the terminal
+        value_next = 0.0  # V(s_{n}) = 0 at the terminal
+        for i in range(n - 1, -1, -1):
+            t = ts[i]
+            reward = r if i == n - 1 else 0.0
+            ratio = target_ratio(math.exp(t.logprob), len(t.legal_actions), eps)
+            rho = min(rho_bar, ratio)
+            c = lam * min(c_bar, ratio)
+            delta = rho * (reward + value_next - t.value)
+            v = t.value + delta + c * (v_next - value_next)
+            t.return_ = float(v)
+            t.advantage = float(v - t.value)
+            v_next, value_next = v, t.value
 
     def _policy_for(
         self, player: int, learner: Policy, opponent: Policy, learner_seat: int
@@ -293,7 +383,9 @@ class RolloutWorkerCore:
             # by pyspiel's pybind for matrix games).
             legal = list(state.legal_actions(p))
             policy = self._policy_for(p, learner, opponent, learner_seat)
-            a, lp, v = policy.act_with_value(obs, legal, eval=False)
+            a, lp, v = policy.act_with_value(
+                obs, legal, eval=False, behavior_epsilon=self.config.behavior_epsilon
+            )
             actions.append(a)
             logprobs.append(lp)
             values.append(v)
