@@ -40,6 +40,18 @@ ARMS: dict[str, AchParams] = {
     # arm has exact advantages, no critic and every row present, so it isolates
     # whether the MOVING TARGET alone is what breaks the tempering.
     **{f"rho{k}": AchParams(weighting=f"rho:{k}") for k in (0.0, 0.25, 0.5, 0.75, 1.0)},
+    # Who owns the ~0.099 the best-conditioned exact dynamics stops at? The
+    # entropy regularizer biases the fixed point away from Nash and the l_th
+    # gate truncates logit growth, so they are the two suspects -- but
+    # docs/liars_residual_floor.md §3 concluded both were "inert on Liar's
+    # Dice" from arms run under the RAW reach weighting, a regime where the
+    # policy never sharpened enough to reach the gate at all (gate_off_frac
+    # 0.000, entropy 0.508). Under rho:0.5 the gate is live (gate_off_frac
+    # 0.43, entropy 0.199), so that conclusion does not carry over and the 2x2
+    # has to be re-run here.
+    "rho0.5_beta0": AchParams(beta=0.0, weighting="rho:0.5"),
+    "rho0.5_nogate": AchParams(gate=False, weighting="rho:0.5"),
+    "rho0.5_beta0_nogate": AchParams(beta=0.0, gate=False, weighting="rho:0.5"),
 }
 
 
