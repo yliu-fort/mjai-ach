@@ -139,6 +139,12 @@ class ExperimentConfig:
     # weighting. docs/liars_residual_floor.md §8.4-8.5 for the offline check.
     sample_weight_kappa: float = 0.0
     sample_weight_clip: float | None = None  # cap on the per-sample weight
+    # Replace the critic's V in the advantage baseline with the exact conditional
+    # expectation from the sequence form (mjai.eval.exact_value). An INSTRUMENT:
+    # it reads the whole game tree and the opponent's strategy, so it exists to
+    # attribute the reach-tempering failure (docs/liars_residual_floor.md §8.9),
+    # not to be an algorithm. Mirror self-play only; small games only.
+    oracle_value: bool = False
     n_critic_updates: int = 0  # extra value-only updates/step (AlgoConfig); 0 = paper-faithful
     separate_critic: bool = False  # independent critic net (AlgoConfig) -- clean critic test
     critic_hidden_sizes: list[int] = field(default_factory=lambda: [128])
@@ -401,6 +407,12 @@ def warn_if_rollout_ach_incompatible(cfg: ExperimentConfig) -> None:
             "mini-batch uniformly, so a sample's influence is exactly the probability "
             "its history was sampled; re-weighting optimizes a tempered objective)"
         )
+    if cfg.oracle_value:
+        issues.append(
+            "oracle_value=True (the advantage baseline is the exact V(s) from the "
+            "game tree, not the critic's; this is ground truth entering the "
+            "training loop and is an attribution instrument, not an algorithm)"
+        )
     if issues:
         warnings.warn(
             "ACH fidelity: " + "; ".join(issues),
@@ -414,9 +426,20 @@ def build_controller(
 ) -> SelfPlayController:
     """Build the mirror or league controller + return it."""
     warn_if_rollout_ach_incompatible(cfg)
+    oracle = None
+    if cfg.oracle_value:
+        if cfg.self_play_mode != "mirror":
+            raise ValueError(
+                "oracle_value needs one policy in both seats to define V; "
+                f"self_play_mode={cfg.self_play_mode!r} (see mjai.eval.exact_value)"
+            )
+        from mjai.eval.exact_value import ExactValueOracle
+
+        oracle = ExactValueOracle(spec)
     runner = RolloutWorkerCore(
         spec,
         learner_player=0,
+        value_oracle=oracle,
         config=RolloutConfig(
             n_episodes=cfg.episodes_per_round,
             gae_lambda=cfg.gae_lambda,

@@ -187,6 +187,74 @@ def best_response_value(sf: SequenceForm, plans: list[torch.Tensor], player: int
     return values[EMPTY_SEQUENCE]
 
 
+def infoset_values(
+    sf: SequenceForm, behavior: torch.Tensor, plans: list[torch.Tensor] | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact ``(V(I), cf(I))`` per information set under ``behavior``.
+
+    ``V(I)`` is what a critic's ``V(s)`` estimates and never quite reaches: the
+    owner's expected return **conditional on the play having arrived at I**. It
+    is the same backward induction as :func:`best_response_value` with the
+    ``max`` replaced by the owner's own expectation, run twice -- once with the
+    terminal utilities and once with those utilities replaced by 1:
+
+        V(sigma)  = w(sigma)  + sum_{I: parent(I)=sigma} cfv(I)
+        cfv(I)    = sum_a P(a|I) * V(sigma_{I,a})
+
+    The second run returns ``cf(I)``, the counterfactual mass reaching I (chance
+    times every OTHER player's realization probability). Their ratio is the
+    conditional expectation, because the owner's own reach is by definition
+    constant across the histories of one of its information sets and so cancels:
+
+        V(I) = cfv_utility(I) / cf(I)
+
+    Exact, non-iterative and float64. ``cf(I) == 0`` -- an information set the
+    opponents' strategy shuts out entirely -- returns ``V(I) = 0``; there is no
+    conditional expectation to report there, and no sampler would ever ask.
+
+    Returns ``(values, cf)``, both ``[num_infosets]``, indexed by sequence-form
+    row. ``plans`` may be passed in when the caller already has them.
+    """
+    behavior = behavior.to(torch.float64)
+    if plans is None:
+        plans = realization_plans(sf, behavior)
+    values = torch.zeros(sf.num_infosets, dtype=torch.float64)
+    cf = torch.zeros(sf.num_infosets, dtype=torch.float64)
+    for player in range(sf.num_players):
+        util = sequence_payoff_coefficients(sf, plans, player)
+        # Same coefficients with utility == 1: the counterfactual probability
+        # mass, which is the normalizer the conditional expectation needs.
+        mass = _sequence_mass_coefficients(sf, plans, player)
+        for rows in reversed(sf.level_rows):
+            player_rows = rows[sf.infoset_player[rows] == player]
+            if player_rows.numel() == 0:
+                continue
+            probs = behavior[player_rows]
+            children = sf.sequence_of[player_rows]
+            legal = children != NO_SEQUENCE
+            safe = children.clamp(min=0)
+            for source, target in ((util, values), (mass, cf)):
+                child = source.index_select(0, safe.reshape(-1)).reshape(children.shape)
+                target[player_rows] = (probs * child).masked_fill(~legal, 0.0).sum(dim=1)
+            parents = sf.parent_sequence[player_rows]
+            util = util.index_add(0, parents, values[player_rows])
+            mass = mass.index_add(0, parents, cf[player_rows])
+    return values / cf.clamp(min=1e-300), cf
+
+
+def _sequence_mass_coefficients(
+    sf: SequenceForm, plans: list[torch.Tensor], player: int
+) -> torch.Tensor:
+    """:func:`sequence_payoff_coefficients` with every terminal utility set to 1."""
+    weight = sf.terminal_chance.clone()
+    for other in range(sf.num_players):
+        if other == player:
+            continue
+        weight = weight * plans[other].index_select(0, sf.terminal_sequence[:, other])
+    coefficients = torch.zeros(sf.num_sequences[player], dtype=torch.float64)
+    return coefficients.index_add(0, sf.terminal_sequence[:, player], weight)
+
+
 def nash_conv(sf: SequenceForm, behavior: torch.Tensor, *, validate: bool = True) -> torch.Tensor:
     """Sum over players of (best-response value - value under ``behavior``).
 

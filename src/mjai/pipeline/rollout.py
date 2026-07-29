@@ -18,12 +18,28 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
+from typing import Protocol
 
 import pyspiel
 
 from mjai.agents.base import Policy, target_ratio
 from mjai.algos.transition import Batch, Transition, make_batch
 from mjai.games.loader import GameSpec
+
+
+class ValueOracle(Protocol):
+    """An exact ``V(s)`` that replaces the critic's baseline in the advantage.
+
+    Declared here as a structural type so the rollout stays independent of the
+    thing that implements it (``mjai.eval.exact_value.ExactValueOracle`` needs
+    the whole game tree, which no part of the pipeline should be pulled toward).
+    ``refresh`` is called once per collection round -- collection is synchronous,
+    so the profile is fixed for the whole round.
+    """
+
+    def refresh(self, learner: Policy, opponent: Policy) -> None: ...
+
+    def value(self, obs: list[float]) -> float: ...
 
 
 @dataclass
@@ -129,10 +145,14 @@ class RolloutWorkerCore:
         *,
         learner_player: int = 0,
         config: RolloutConfig | None = None,
+        value_oracle: ValueOracle | None = None,
     ) -> None:
         self.game_spec = game_spec
         self.learner_player = learner_player
         self.config = config or RolloutConfig()
+        # Exact baseline for the advantage, in place of the critic's V. None
+        # (default) is the paper's setup: the value comes from the network.
+        self.value_oracle = value_oracle
         if self.config.shuffle_seats and game_spec.num_players != 2:
             raise ValueError(
                 f"shuffle_seats is defined for 2-player games; "
@@ -167,6 +187,10 @@ class RolloutWorkerCore:
         if keep is not None and len(keep) == 0:
             raise ValueError("keep must be None (count all) or a non-empty tuple")
         keep_ids = {id(p) for p in keep} if keep else set()
+        if self.value_oracle is not None:
+            # Once per round, not per episode: collection is synchronous, so the
+            # profile that generates every episode below is this one.
+            self.value_oracle.refresh(learner, opponent)
         all_transitions: list[Transition] = []
         counted = 0
         per_producer: dict[int, int] = {}
@@ -245,7 +269,7 @@ class RolloutWorkerCore:
                             legal,
                             joint[p],
                             lps[p],
-                            per_player_values[p],
+                            self._baseline(obs, per_player_values[p]),
                             log_reach,
                         )
                     )
@@ -259,7 +283,7 @@ class RolloutWorkerCore:
                 a, lp, v = policy.act_with_value(
                     obs, legal, eval=False, behavior_epsilon=self.config.behavior_epsilon
                 )
-                steps.append((p, policy, obs, legal, a, lp, v, log_reach))
+                steps.append((p, policy, obs, legal, a, lp, self._baseline(obs, v), log_reach))
                 state.apply_action(a)
                 log_reach += lp
 
@@ -283,6 +307,18 @@ class RolloutWorkerCore:
                 )
             )
         return transitions, returns
+
+    def _baseline(self, obs: list[float], network_value: float) -> float:
+        """The value that feeds the advantage: the network's, or the oracle's.
+
+        Only the ADVANTAGE baseline is swapped. The value head is still trained
+        on the returns by the update rule, so a shared-trunk run keeps whatever
+        the value loss does to its features -- identical in the paired kappa=0
+        control, which is the only thing this arm is read against.
+        """
+        if self.value_oracle is None:
+            return network_value
+        return self.value_oracle.value(obs)
 
     def _sample_weight(self, log_reach: float) -> float:
         """``min(reach(h)^-kappa, clip)`` — how many times this sample counts.
