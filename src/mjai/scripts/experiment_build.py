@@ -133,6 +133,12 @@ class ExperimentConfig:
     advantage_estimator: str = "gae"  # "gae" (paper) | "vtrace" (off-policy correction)
     vtrace_rho_bar: float = 1.0
     vtrace_c_bar: float = 1.0
+    # Temper the training distribution from rho to rho^(1-kappa) by weighting
+    # each sample with reach(h)^-kappa (NN path only; the tabular rules reject a
+    # weighted batch rather than ignore it). 0.0 = the paper's on-policy
+    # weighting. docs/liars_residual_floor.md §8.4-8.5 for the offline check.
+    sample_weight_kappa: float = 0.0
+    sample_weight_clip: float | None = None  # cap on the per-sample weight
     n_critic_updates: int = 0  # extra value-only updates/step (AlgoConfig); 0 = paper-faithful
     separate_critic: bool = False  # independent critic net (AlgoConfig) -- clean critic test
     critic_hidden_sizes: list[int] = field(default_factory=lambda: [128])
@@ -389,6 +395,12 @@ def warn_if_rollout_ach_incompatible(cfg: ExperimentConfig) -> None:
             f"advantage_estimator={cfg.advantage_estimator!r} (p24: advantages are "
             "GAE(lambda) and G is the sampled return)"
         )
+    if cfg.sample_weight_kappa != 0.0:
+        issues.append(
+            f"sample_weight_kappa={cfg.sample_weight_kappa} (Eq. 29 p24 averages the "
+            "mini-batch uniformly, so a sample's influence is exactly the probability "
+            "its history was sampled; re-weighting optimizes a tempered objective)"
+        )
     if issues:
         warnings.warn(
             "ACH fidelity: " + "; ".join(issues),
@@ -414,6 +426,8 @@ def build_controller(
             advantage_estimator=cfg.advantage_estimator,
             vtrace_rho_bar=cfg.vtrace_rho_bar,
             vtrace_c_bar=cfg.vtrace_c_bar,
+            sample_weight_kappa=cfg.sample_weight_kappa,
+            sample_weight_clip=cfg.sample_weight_clip,
             # League rounds shuffle the collector's seat per episode so every
             # opponent is faced from both perspectives; routing by producer
             # identity keeps each learner's dose exact regardless of seat.

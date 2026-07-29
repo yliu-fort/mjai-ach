@@ -46,6 +46,23 @@ def _clamp_row(logits: list[float], legal_mask: np.ndarray) -> None:
             logits[a] = max(-LOGIT_CLAMP, min(LOGIT_CLAMP, logits[a]))
 
 
+def _reject_weighted(batch: Batch, rule_name: str) -> None:
+    """Refuse a reach-tempered batch rather than quietly dropping the weights.
+
+    Neither tabular rule has a place to put them: the PPO/Hedge rule applies one
+    fixed-size step per row instead of reducing a loss (scaling that step by up
+    to ``sample_weight_clip`` would be a different, untested algorithm), and the
+    ACH rule is a CFR+ wrapper that never reads the samples at all. Ignoring a
+    knob the config asked for is exactly the silent fallback AGENTS.md §11
+    forbids.
+    """
+    if batch.weights is not None:
+        raise NotImplementedError(
+            f"{rule_name} received a weighted batch; RolloutConfig.sample_weight_kappa "
+            "is wired for the NN path only (AGENTS.md §11: no silent fallback)"
+        )
+
+
 def _explained_variance(y_true: Iterable[float], y_pred: Iterable[float]) -> float:
     """1 - Var(y_true - y_pred) / Var(y_true); 1.0 is a perfect value fit."""
     yt = np.asarray(list(y_true), dtype=np.float64)
@@ -73,6 +90,7 @@ class TabularUpdateRule(UpdateRule):
     def step(self, batch: Batch) -> UpdateStats:
         if batch.size == 0:
             return UpdateStats(policy_loss=0.0, value_loss=0.0, entropy=0.0)
+        _reject_weighted(batch, type(self).__name__)
         # Normalize advantages per-batch (matches NN rules). Critical for games
         # with large unscaled returns (BRPS payoffs are +-50/+-25/+-5); without
         # this, one Hedge step of eta*50 saturates the logits and the policy
@@ -232,6 +250,7 @@ class TabularACHUpdate(TabularUpdateRule):
 
     def step(self, batch: Batch) -> UpdateStats:
         """Run ``iters_per_step`` CFR+ iterations and sync the average policy."""
+        _reject_weighted(batch, type(self).__name__)
         for _ in range(self.iters_per_step):
             self._solver.evaluate_and_update_policy()
             self._total_iters += 1

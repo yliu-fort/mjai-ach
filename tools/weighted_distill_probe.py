@@ -138,6 +138,7 @@ def distill(
     lr: float,
     lbfgs_iters: int,
     seed: int,
+    sampled_target: bool = False,
 ) -> tuple[MLPSharedActorCritic, float]:
     obs = sf.infoset_observation.to(torch.float32)
     legal = sf.legal_mask
@@ -146,10 +147,19 @@ def distill(
     mlp = MLPSharedActorCritic(
         spec.obs_size, spec.num_actions, hidden_sizes=(width,), seed=seed, device="cpu"
     )
+    gen = torch.Generator().manual_seed(seed)
 
     def loss_fn() -> torch.Tensor:
         masked = mlp(obs)[0].masked_fill(~legal, -1e9)
-        per_row = -(tgt * torch.log_softmax(masked, dim=-1)).sum(dim=-1)
+        logp = torch.log_softmax(masked, dim=-1)
+        if sampled_target:
+            # ONE action drawn from the target per row, redrawn every step: the
+            # same expected gradient, plus the zero-mean per-row noise an RL
+            # sample carries and this probe otherwise does not. See `main`.
+            drawn = torch.multinomial(tgt, num_samples=1, generator=gen)
+            per_row = -logp.gather(1, drawn).squeeze(1)
+        else:
+            per_row = -(tgt * logp).sum(dim=-1)
         return (w * per_row).mean()
 
     opt = torch.optim.Adam(mlp.parameters(), lr=lr)
@@ -192,6 +202,19 @@ def main() -> None:
     ap.add_argument("--lbfgs-iters", type=int, default=300)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--weightings", nargs="*", default=list(WEIGHTINGS))
+    ap.add_argument(
+        "--sampled-target",
+        action="store_true",
+        help=(
+            "replace each row's exact target distribution with ONE action drawn "
+            "from it, redrawn every step. Same expected gradient, plus the "
+            "estimation noise an RL sample carries. This is the disanalogy "
+            "between this probe and the RL runs it was used to predict: with an "
+            "exact target, up-weighting a rare information set delivers pure "
+            "signal; with a sampled one it also multiplies that row's noise. "
+            "Forces Adam-only (L-BFGS's line search needs a stationary loss)."
+        ),
+    )
     ap.add_argument("--out", type=Path, default=Path("runs/exact_ach/weighted_distill.json"))
     args = ap.parse_args()
 
@@ -215,8 +238,9 @@ def main() -> None:
             width=args.width,
             epochs=args.epochs,
             lr=args.lr,
-            lbfgs_iters=args.lbfgs_iters,
+            lbfgs_iters=0 if args.sampled_target else args.lbfgs_iters,
             seed=args.seed,
+            sampled_target=args.sampled_target,
         )
         beh = behavior_of_mlp(sf, mlp)
         expl = float(nash_conv(sf, beh, validate=False)) / 2.0

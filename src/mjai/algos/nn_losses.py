@@ -45,6 +45,26 @@ def explained_variance(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
     return float(1.0 - (y_true - y_pred).var() / yt_var)
 
 
+def weighted_mean(x: torch.Tensor, weights: torch.Tensor | None) -> torch.Tensor:
+    """``x.mean()``, or the self-normalized weighted mean when weights are given.
+
+    ``weights=None`` takes the *same* call the unweighted path always took, so
+    the default trajectory stays bit-identical rather than merely
+    arithmetically equal (``tests/unit/data/nn_updates_golden.json`` pins it).
+
+    Self-normalized (divide by ``sum(w)``, not by ``len(x)``) on purpose: the
+    weight ``reach(h)^-kappa`` has an arbitrary scale that grows with kappa, and
+    dividing by the batch size would push that scale straight into the effective
+    learning rate — turning a re-weighting experiment into a learning-rate
+    experiment. The price is the usual self-normalized-importance-sampling
+    bias, which vanishes as the batch grows; the mechanism variable it trades
+    against (per-batch effective sample size) is logged as ``weight_effn``.
+    """
+    if weights is None:
+        return x.mean()
+    return (weights * x).sum() / weights.sum()
+
+
 def normalize_advantages(adv: torch.Tensor) -> torch.Tensor:
     """Per-batch zero-mean/unit-std normalization (a PPO best practice).
 
@@ -72,6 +92,7 @@ def value_loss_and_entropy(
     values: torch.Tensor,
     returns: torch.Tensor,
     mask: torch.Tensor,
+    weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return (value_mse, mean_entropy) for the combined loss.
 
@@ -80,11 +101,17 @@ def value_loss_and_entropy(
     alpha=2.0 (p27 Table 7) corresponds to ``value_coef=1.0``. The entropy term
     enters the total loss as ``-entropy_coef * entropy`` (= ``+beta * sum_a pi
     log pi``), with beta=1e-2 (p28 Table 8).
+
+    ``weights`` re-weights the critic and the entropy term alongside the policy
+    term. That is the whole point of the knob rather than an afterthought: the
+    critic is fit on the same concentrated visitation the policy is, so
+    tempering only the policy would aim it at information sets whose advantages
+    come from a critic that never saw them.
     """
-    value_loss = ((values - returns) ** 2).mean()
+    value_loss = weighted_mean((values - returns) ** 2, weights)
     logp_all = masked_log_probs(logits, mask)
     legal_probs = torch.exp(logp_all)
-    entropy = -(legal_probs * logp_all).sum(dim=-1).mean()
+    entropy = -weighted_mean((legal_probs * logp_all).sum(dim=-1), weights)
     return value_loss, entropy
 
 
@@ -93,6 +120,7 @@ def ppo_policy_loss(
     ratio: torch.Tensor,
     advantages: torch.Tensor,
     clip_eps: float,
+    weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """PPO clipped surrogate — the ``theta = 0`` endpoint.
 
@@ -102,10 +130,11 @@ def ppo_policy_loss(
             ``AlgoConfig.normalize_advantages`` is set; the ACH term always
             keeps the raw ones).
         clip_eps: surrogate clip range (37-details default 0.2).
+        weights: per-sample loss weights, or None for the plain mean.
     """
     surr1 = ratio * advantages
     surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * advantages
-    loss = -torch.min(surr1, surr2).mean()
+    loss = -weighted_mean(torch.min(surr1, surr2), weights)
     with torch.no_grad():
         clip_frac = ((ratio - 1.0).abs() > clip_eps).float().mean()
     return loss, {"clip_frac": clip_frac}
@@ -120,6 +149,7 @@ def ach_policy_loss(
     advantages: torch.Tensor,
     old_probs: torch.Tensor,
     config: AlgoConfig,
+    weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Paper-faithful ACH policy loss — the ``theta = 1`` endpoint.
 
@@ -182,7 +212,7 @@ def ach_policy_loss(
         # Cap 1/pi_old at iw_clip (floor pi_old at 1/iw_clip). Bounds the
         # importance weight that otherwise blows up once the policy sharpens.
         denom = denom.clamp(min=1.0 / config.iw_clip)
-    loss = -(config.eta * y_loss * c * advantages / denom).mean()
+    loss = -weighted_mean(config.eta * y_loss * c * advantages / denom, weights)
 
     with torch.no_grad():
         iw = 1.0 / denom
@@ -196,6 +226,26 @@ def ach_policy_loss(
     return loss, telemetry
 
 
+def weight_telemetry(weights: torch.Tensor | None) -> dict[str, torch.Tensor]:
+    """Dispersion of the per-sample weights — the cost side of the tempering.
+
+    ``weight_effn`` is Kish's effective sample size ``(sum w)^2 / sum w^2``: how
+    many samples this batch is really worth once the weights are applied. It is
+    the counterweight to the coverage the weighting buys, and the number to read
+    when a weighted arm underperforms — a batch of 64 with effN 3 has not been
+    re-weighted so much as thrown away. Empty when unweighted, so the metric
+    only appears on runs where it means something.
+    """
+    if weights is None:
+        return {}
+    with torch.no_grad():
+        total = weights.sum()
+        return {
+            "weight_effn": total * total / (weights * weights).sum(),
+            "weight_max_ratio": weights.max() / weights.min().clamp(min=1e-30),
+        }
+
+
 __all__ = [
     "ach_policy_loss",
     "explained_variance",
@@ -203,4 +253,6 @@ __all__ = [
     "normalize_advantages",
     "ppo_policy_loss",
     "value_loss_and_entropy",
+    "weight_telemetry",
+    "weighted_mean",
 ]

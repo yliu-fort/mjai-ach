@@ -34,6 +34,12 @@ class Transition:
     return_: float  # Monte-Carlo (or bootstrapped) return-to-go
     advantage: float = 0.0  # GAE/return - value; filled in by the UpdateRule
     player: int = 0  # which player this transition belongs to
+    # How many times this sample COUNTS in the loss. 1.0 = on-policy (the paper:
+    # a sample's influence is exactly the probability its history was reached).
+    # The rollout sets it to reach(h)^-kappa when RolloutConfig.sample_weight_kappa
+    # is on, which tempers the training distribution from rho to rho^(1-kappa)
+    # (docs/liars_residual_floor.md §8.4-8.5).
+    weight: float = 1.0
     # WHICH POLICY produced this transition (the behavior policy that acted at
     # the decision point). Tagged by the rollout runner; routes the sample to
     # the right UpdateRule regardless of the physical seat it came from —
@@ -64,6 +70,12 @@ class Batch:
     # batches that predate tagging; the rollout runner always populates both.
     producers: tuple[Policy, ...] = ()
     producer_idx: np.ndarray | None = None  # (B,) int8
+    # (B,) float32 per-sample loss weights, or None for the unweighted batch.
+    # None is not "all ones": it selects the plain ``.mean()`` reduction the
+    # update rules have always taken, so the default trajectory stays
+    # bit-identical (tests/unit/data/nn_updates_golden.json). ``make_batch``
+    # only populates it when some transition actually carries a weight != 1.
+    weights: np.ndarray | None = None
 
     @property
     def size(self) -> int:
@@ -123,6 +135,7 @@ class Batch:
             num_actions=self.num_actions,
             producers=self.producers,
             producer_idx=None if self.producer_idx is None else self.producer_idx[idx],
+            weights=None if self.weights is None else self.weights[idx],
         )
 
 
@@ -136,6 +149,10 @@ def make_batch(transitions: Sequence[Transition], num_actions: int) -> Batch:
     Producer tags are deduplicated BY IDENTITY into ``Batch.producers`` +
     ``producer_idx``. Tags are all-or-nothing: a batch mixing tagged and
     untagged transitions is a caller bug and fails loudly (§11).
+
+    ``Batch.weights`` stays ``None`` while every transition carries the default
+    weight 1.0, which is what keeps the unweighted path on its original
+    reduction rather than on an arithmetically-equal weighted one.
     """
     n = len(transitions)
     if n == 0:
@@ -173,6 +190,7 @@ def make_batch(transitions: Sequence[Transition], num_actions: int) -> Batch:
     for i, t in enumerate(transitions):
         for a in t.legal_actions:
             legal_mask[i, a] = True
+    weights = np.asarray([t.weight for t in transitions], dtype=np.float32)
     return Batch(
         obs=np.asarray([t.obs for t in transitions], dtype=np.float32),
         legal_actions=[list(t.legal_actions) for t in transitions],
@@ -186,6 +204,7 @@ def make_batch(transitions: Sequence[Transition], num_actions: int) -> Batch:
         num_actions=num_actions,
         producers=tuple(producers),
         producer_idx=producer_idx if n_tagged == n else None,
+        weights=None if bool((weights == 1.0).all()) else weights,
     )
 
 

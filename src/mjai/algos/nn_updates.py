@@ -42,6 +42,8 @@ from mjai.algos.nn_losses import (
     normalize_advantages,
     ppo_policy_loss,
     value_loss_and_entropy,
+    weight_telemetry,
+    weighted_mean,
 )
 from mjai.algos.transition import Batch, UpdateStats
 from mjai.algos.update_rule import ACHFidelityWarning, AlgoConfig, UpdateRule
@@ -284,6 +286,13 @@ class NNActorCriticUpdate(UpdateRule):
         # Raw GAE advantages feed the ACH term unconditionally (paper p24); the
         # PPO term optionally sees the normalized copy.
         adv_raw = torch.as_tensor(batch.advantages, dtype=torch.float32, device=device)
+        # Per-sample loss weights (RolloutConfig.sample_weight_kappa). None here
+        # is the on-policy default and keeps every reduction below on .mean().
+        weights = (
+            None
+            if batch.weights is None
+            else torch.as_tensor(batch.weights, dtype=torch.float32, device=device)
+        )
         if self.critic is not None and self.critic_opt is not None:
             # Independent critic (AlgoConfig.separate_critic): train it hard on the
             # value loss (own params -- no policy drift). The advantage stays the
@@ -291,9 +300,9 @@ class NNActorCriticUpdate(UpdateRule):
             # with THIS critic's V, so it is GAE(lambda) on the well-trained critic.
             for _ in range(max(1, self.config.n_critic_updates)):
                 v_c = self.critic(obs)[1]
-                cvloss = self.config.value_coef * ((v_c - returns) ** 2).mean()
+                cvloss = self.config.value_coef * weighted_mean((v_c - returns) ** 2, weights)
                 self.critic_opt.zero_grad()
-                cvloss.backward()
+                cvloss.backward()  # type: ignore[no-untyped-call]
                 self.critic_opt.step()
         adv_ppo = adv_raw
         if self.config.theta < 1.0 and self.config.normalize_advantages:
@@ -311,7 +320,7 @@ class NNActorCriticUpdate(UpdateRule):
         if self.config.n_critic_updates > 0 and not self.config.separate_critic:
             for _ in range(self.config.n_critic_updates):
                 logits_c, values_c = self.policy(obs)
-                vloss, _ = value_loss_and_entropy(logits_c, values_c, returns, mask)
+                vloss, _ = value_loss_and_entropy(logits_c, values_c, returns, mask, weights)
                 vstep = self.config.value_coef * vloss
                 self.optimizer.zero_grad()
                 vstep.backward()  # type: ignore[no-untyped-call]
@@ -327,6 +336,7 @@ class NNActorCriticUpdate(UpdateRule):
                 returns=returns,
                 adv_raw=adv_raw,
                 adv_ppo=adv_ppo,
+                weights=weights,
             )
             if first_off_policy is None:
                 first_off_policy = stats.extra.get("off_policy_frac", 0.0)
@@ -336,6 +346,7 @@ class NNActorCriticUpdate(UpdateRule):
         # batch?". At the ACH protocol's n_epochs=1 (paper p24) they coincide.
         if first_off_policy is not None:
             stats.extra["off_policy_frac"] = first_off_policy
+        stats.extra.update({k: float(v) for k, v in weight_telemetry(weights).items()})
         return stats
 
     def _gradient_step(
@@ -349,6 +360,7 @@ class NNActorCriticUpdate(UpdateRule):
         returns: torch.Tensor,
         adv_raw: torch.Tensor,
         adv_ppo: torch.Tensor,
+        weights: torch.Tensor | None = None,
     ) -> UpdateStats:
         """One forward/backward/optimizer step over the whole batch."""
         theta = self.config.theta
@@ -371,7 +383,7 @@ class NNActorCriticUpdate(UpdateRule):
         policy_loss: torch.Tensor | None = None
         if theta < 1.0:
             ppo_loss, ppo_stats = ppo_policy_loss(
-                ratio=ratio, advantages=adv_ppo, clip_eps=self.config.clip_eps
+                ratio=ratio, advantages=adv_ppo, clip_eps=self.config.clip_eps, weights=weights
             )
             telemetry.update(ppo_stats)
             terms["ppo"] = ppo_loss
@@ -385,6 +397,7 @@ class NNActorCriticUpdate(UpdateRule):
                 advantages=adv_raw,
                 old_probs=old_probs,
                 config=self.config,
+                weights=weights,
             )
             telemetry.update(ach_stats)
             terms["ach"] = ach_loss
@@ -394,7 +407,7 @@ class NNActorCriticUpdate(UpdateRule):
         if self.config.probe_term_grad_norms:
             telemetry.update(self._term_grad_probe(terms, theta))
 
-        value_loss, entropy = value_loss_and_entropy(logits, values, returns, mask)
+        value_loss, entropy = value_loss_and_entropy(logits, values, returns, mask, weights)
         loss = (
             policy_loss + self.config.value_coef * value_loss - self.config.entropy_coef * entropy
         )

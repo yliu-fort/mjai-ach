@@ -60,6 +60,22 @@ class RolloutConfig:
         vtrace_rho_bar / vtrace_c_bar: the two V-trace truncations (IMPALA
             defaults 1.0). ``rho_bar`` caps the fixed point the value function
             converges to; ``c_bar`` caps how far a correction propagates back.
+        sample_weight_kappa: temper the training distribution by weighting each
+            sample with ``reach(h)^-kappa``, where ``reach(h)`` is the exact
+            probability the sampler had of producing that history (chance x both
+            players' behavior probabilities, all of them recorded here). A
+            sample arrives with probability ``reach(h)``, so the weighted mass
+            an information set receives is ``rho(I)^(1-kappa)`` up to the
+            within-information-set correction measured in
+            ``tools/history_weighting.py``. 0.0 (default) = the paper's
+            on-policy weighting, and no ``Batch.weights`` is emitted at all.
+            Rationale and the offline verification: docs/liars_residual_floor.md
+            §8.4-8.5.
+        sample_weight_clip: cap on the per-sample weight (``None`` = uncapped).
+            ``reach(h)^-kappa`` is unbounded above; the cap is what bounds the
+            per-batch variance the tempering buys coverage with. Measured
+            offline: kappa=0.75 with clip 1e3 keeps effN 229 of the 1308
+            an uncapped ideal weight reaches, at a weight range of 1e3.
         shuffle_seats: when True, each episode independently flips a fair coin
             (seeded) to decide which physical seat the ``learner`` occupies, so
             a learner sees BOTH perspectives against every opponent across
@@ -77,6 +93,8 @@ class RolloutConfig:
     advantage_estimator: str = "gae"
     vtrace_rho_bar: float = 1.0
     vtrace_c_bar: float = 1.0
+    sample_weight_kappa: float = 0.0
+    sample_weight_clip: float | None = None
 
 
 @dataclass
@@ -195,13 +213,19 @@ class RolloutWorkerCore:
         batch can be routed by producer identity afterwards.
         """
         state = self.game_spec.new_state()
-        # Record (player, producer, obs, legal, action, logprob, value) at each
-        # decision point in a single pass — no post-episode recompute loop.
-        steps: list[tuple[int, Policy, list[float], list[int], int, float, float]] = []
+        # Record (player, producer, obs, legal, action, logprob, value, log_reach)
+        # at each decision point in a single pass — no post-episode recompute loop.
+        steps: list[tuple[int, Policy, list[float], list[int], int, float, float, float]] = []
+        # log P(the sampler produces this history): chance outcomes times EVERY
+        # player's behavior probabilities. Accumulated as the episode is played,
+        # because that is the only place each factor is still available -- the
+        # flattened batch has lost the trajectory, and `_sample_chance` is the
+        # only thing that ever sees the chance probabilities.
+        log_reach = 0.0
 
         while not state.is_terminal():
             if state.is_chance_node():
-                self._sample_chance(state)
+                log_reach += self._sample_chance(state)
                 continue
             if state.is_simultaneous_node():
                 joint, lps, per_player_values, actors = self._simultaneous_actions(
@@ -213,8 +237,20 @@ class RolloutWorkerCore:
                     obs = self.game_spec.obs_tensor(state, p)
                     # Per-player legal set (positional id; kw form rejected by pyspiel).
                     legal = list(state.legal_actions(p))
-                    steps.append((p, actors[p], obs, legal, joint[p], lps[p], per_player_values[p]))
+                    steps.append(
+                        (
+                            p,
+                            actors[p],
+                            obs,
+                            legal,
+                            joint[p],
+                            lps[p],
+                            per_player_values[p],
+                            log_reach,
+                        )
+                    )
                 state.apply_actions(joint)
+                log_reach += math.fsum(lps)  # both players moved out of this node
             else:
                 p = state.current_player()
                 obs = self.game_spec.obs_tensor(state, p)
@@ -223,12 +259,13 @@ class RolloutWorkerCore:
                 a, lp, v = policy.act_with_value(
                     obs, legal, eval=False, behavior_epsilon=self.config.behavior_epsilon
                 )
-                steps.append((p, policy, obs, legal, a, lp, v))
+                steps.append((p, policy, obs, legal, a, lp, v, log_reach))
                 state.apply_action(a)
+                log_reach += lp
 
         returns = list(state.returns())
         transitions: list[Transition] = []
-        for p, policy, obs, legal, a, lp, v in steps:
+        for p, policy, obs, legal, a, lp, v, step_log_reach in steps:
             reward = returns[p]  # terminal-only rewards for these games
             transitions.append(
                 Transition(
@@ -242,9 +279,31 @@ class RolloutWorkerCore:
                     advantage=0.0,
                     player=p,
                     producer=policy,
+                    weight=self._sample_weight(step_log_reach),
                 )
             )
         return transitions, returns
+
+    def _sample_weight(self, log_reach: float) -> float:
+        """``min(reach(h)^-kappa, clip)`` — how many times this sample counts.
+
+        Exactly 1.0 when the knob is off, so ``make_batch`` emits no weights and
+        every update rule keeps its original reduction.
+
+        Computed in log space: ``reach`` underflows float64 long before its
+        negative power overflows, so the naive ``reach ** -kappa`` would read
+        ``inf`` on histories the cap was meant to handle. An UNCAPPED weight can
+        still overflow (``math.exp`` raises); that is deliberate -- the honest
+        signal that this game needs ``sample_weight_clip`` set.
+        """
+        kappa = self.config.sample_weight_kappa
+        if kappa == 0.0:
+            return 1.0
+        log_w = -kappa * log_reach
+        cap = self.config.sample_weight_clip
+        if cap is not None:
+            log_w = min(log_w, math.log(cap))
+        return math.exp(log_w)
 
     def _assign_returns(self, transitions: list[Transition], returns: list[float]) -> None:
         """Fill in return_ and advantage per transition, gamma=1.
@@ -355,11 +414,18 @@ class RolloutWorkerCore:
     ) -> Policy:
         return learner if player == learner_seat else opponent
 
-    def _sample_chance(self, state: pyspiel.State) -> None:
+    def _sample_chance(self, state: pyspiel.State) -> float:
+        """Apply one sampled chance outcome; return its log probability.
+
+        The log-prob is returned rather than discarded because chance is a
+        factor of the history's sampling probability exactly like the players'
+        actions are, and this is the only point in the pipeline where it exists.
+        """
         outcomes = state.chance_outcomes()
         actions, probs = zip(*outcomes, strict=True)
         idx = self._rng.choices(range(len(actions)), weights=probs, k=1)[0]
         state.apply_action(actions[idx])
+        return math.log(probs[idx])
 
     def _simultaneous_actions(
         self, state: pyspiel.State, learner: Policy, opponent: Policy, learner_seat: int
