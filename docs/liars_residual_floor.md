@@ -708,6 +708,39 @@ critic）。可行性已测：`ExactAdvantage.compute` 12.1 ms、全表前向 10
 额外 **0.95 h**，一臂 2–3 h。**停止判据（事先约定）**：若 oracle 优势下回火仍不胜
 其配对对照，"展平权重"作为可落地杠杆即宣告死亡。
 
+### 8.10 L5a：精确 critic 也救不回来——停止判据触发，这条线关闭
+
+`oracle_value: true` 把 GAE 基线换成序列形式算的精确 `V(I)`（每个梯度步刷新一次，
+`mjai.eval.exact_value`）。回报仍是采样的，去掉的是估计误差里**系统性**的那部分。
+
+| 臂 | final | 末10均值 | min | 平均策略 |
+|---|---|---|---|---|
+| 学出来的 critic, κ=0 | 0.1464 | 0.1656 | 0.1464 | 0.1447 |
+| 学出来的 critic, κ=0.5 | 0.2636 | 0.2605 | 0.2138 | 0.2592 |
+| **oracle V, κ=0** | **0.1419** | **0.1642** | **0.1381** | **0.1387** |
+| **oracle V, κ=0.5** | 0.1955 | 0.2194 | 0.1636 | 0.1823 |
+
+**回火的伤害从 1.57× 缩到 1.34×（末10均值），但没有翻号——四项统计全部仍然输给
+配对对照。** 因子 A 真实存在、占了超出部分的约 **41%**（0.573 → 0.336），但**不足以
+解释符号**。
+
+**单 seed 够用**：同一配置 4 个 seed（`ab_fix/liars_fix_lth2_iw20_s{1,2,3}` + `seed0`）
+的离散度是 末10均值 sd **0.0056**、平均策略 sd 0.0051。本次的差是 +0.0552 / +0.0436，
+即 **约 10σ / 8.5σ**，远在 seed 噪声之外。
+
+**停止判据触发：`reach^(−κ)` 回火作为可落地杠杆，到此结束。**
+
+**附带一条同样重要的结果：完美的 critic 几乎买不到东西。** oracle κ=0 相对学出来的
+κ=0 只从 0.1464 → 0.1419（平均策略 0.1447 → 0.1387），**改善 3–4%**。§5 此前只测过
+"更好的 critic"，这次是**精确的 critic**——**0.146 这个地板不是 critic**，这一条现在
+被完美 critic 直接证伪，不再是间接推断。
+
+**最可能的收束读法**（综合，非单次测量）：§8.9 给出的真实形状收益在动力学里只有
+**1.37×**，而 §8.8 测到零均值噪声会吃掉回火收益的 **9/10**。蒸馏探针的收益有 28 倍，
+砍掉 9/10 还剩 3.2 倍，所以在那里回火依然为正；动力学里只有 1.37 倍，同样的侵蚀之后
+**基本不剩什么**，再叠上权重本身的方差代价，净效应就是负的。三处测量彼此一致，也
+解释了为什么每一个离线设置都说"该做"而 RL 一律说"别做"。
+
 ---
 
 ## 9. 局限与未做的事
@@ -779,8 +812,12 @@ ACH 看的是对的地方，但一次只看得见几十个信息态。**
 20 倍）。**监督蒸馏在这一整类问题上高估一个数量级以上**——§8.8 的噪声只解释其中一
 部分，另一部分是"拟合固定目标"和"自对弈动力学收敛到哪"根本是两个不同的问题。
 
-**归因结果（§8.9）：抽行粒度、动目标、ACH 的 `1/π_old` 三个嫌疑全部排除，只剩优势
-估计质量。** 决定性实验（RL + oracle 优势）已定义、可行性已测、停止判据已事先写死。
+**归因结果（§8.9–8.10）：抽行粒度、动目标、ACH 的 `1/π_old` 三个嫌疑全部排除；第四个
+（优势估计质量）用精确 `V(s)` 直接拿掉后，伤害从 1.57× 缩到 1.34×——真实但不足以翻号。
+事先写死的停止判据触发，这条杠杆到此关闭。**
+
+**而且 0.146 也不是 critic 的锅**：把 critic 换成**精确值**，κ=0 只从 0.1464 走到
+0.1419（3%）。§5 此前只证伪了"更好的 critic"，现在证伪的是"完美的 critic"。
 
 **治理**：本报告不动任何默认值。§8 与 §8.6 新增的 rollout 旋钮
 （`behavior_epsilon` / `advantage_estimator` / `sample_weight_kappa` /
@@ -814,6 +851,15 @@ ACH 看的是对的地方，但一次只看得见几十个信息态。**
   `configs/exp/liars_dice1_ppo_mlp_weight_{k0,k0.5_c1e3}.yaml`。
   数据：`runs/exact_ach/{minibatch_s0,minibatch_s1,liars_shape_rho*}.json`、
   `runs/ab_weight/liars_w_ppo_*`。
+- L5a oracle 基线（§8.10）：`mjai.seqform.plan.infoset_values` +
+  `mjai.eval.exact_value.ExactValueOracle` + `RolloutConfig` 侧的 `ValueOracle`
+  协议（`ExperimentConfig.oracle_value`，默认关闭、mirror 限定、league 直接报错）；
+  测试 `tests/unit/test_eval_exact_value.py`（11 例，含对 2 万局实际对局的蒙特卡洛
+  校验）；配置 `configs/exp/liars_dice1_ach_mlp_oracleV_{k0,k0.5_c1e3}.yaml`；
+  数据 `runs/ab_oracle/`。
+- **产物精简（2026-07-29）**：磁盘写满后删除了 `runs/` 下全部 `tb/` 事件文件（4.0 G）。
+  `train_curve.json` / `checkpoints/` / `config.json` 全部保留，本报告引用的每个标量
+  都在 `train_curve.json` 里；旧 run 不能再用 TensorBoard 交互查看，需从 JSON 重绘。
 - 数据：`runs/exact_ach/`（`kuhn_matrix.json`、`liars_{paper,uniform,paper_lr0.1}.json`、
   `reach_mismatch_{kuhn,leduc,liars_best}.json`、`weighted_distill*.json`）。
 - 依赖的既有 run（gitignored）：`runs/ab_fix/liars_fix_lth2_iw20_cap256_seed0`、
