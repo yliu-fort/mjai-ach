@@ -70,7 +70,19 @@ class AchParams:
     lr: float = 1e-3  # SGD, constant (p27)
     gate: bool = True
     gate_centered: bool = False  # repo default: raw logits (LayerNorm arm)
-    weighting: str = "reach"  # "reach" = on-policy visitation; "uniform" = flat
+    # "reach" = on-policy visitation rho (raw); "uniform" = flat 1.0 (raw);
+    # "rho:K" = rho^K RENORMALIZED to mean 1 over reachable rows.
+    #
+    # The renormalization is the point of the third form and it also fixes a
+    # confound in the first two. `reach` applies a raw rho whose mean is ~1e-4
+    # while `uniform` applies a raw 1.0, so those two arms differ by ~4 orders of
+    # magnitude in AVERAGE step size as well as in shape -- part of what looks
+    # like a weighting effect there is an effective-learning-rate effect (the
+    # lr x100 arm probed only 2 of those decades). The `rho:K` family holds the
+    # mean step size fixed at every K, so K moves the SHAPE and nothing else.
+    weighting: str = "reach"
+    # Cap on the renormalized weight, mirroring RolloutConfig.sample_weight_clip.
+    weight_clip: float | None = None
 
 
 class ExactAdvantage:
@@ -160,6 +172,31 @@ def masked_softmax(sf: SequenceForm, logits: torch.Tensor) -> torch.Tensor:
     return torch.softmax(logits.masked_fill(~sf.legal_mask, float("-inf")), dim=1)
 
 
+def step_weight(sf: SequenceForm, rho: torch.Tensor, params: AchParams) -> torch.Tensor:
+    """Per-information-set step weight for one exact ACH update.
+
+    ``reach`` and ``uniform`` are the raw historical arms, kept bit-identical.
+    ``rho:K`` is the tempered family: ``rho^K`` renormalized to mean 1 over the
+    rows a rollout can actually reach, so every K spends the same average step
+    size and only the distribution of it across information sets changes. That
+    is the isolation the RL runs could not do -- there the tempering also had a
+    critic, a moving target and a 64-row batch riding on it.
+    """
+    legal_rows = sf.legal_mask.any(dim=1).to(torch.float64)
+    if params.weighting == "reach":
+        return rho
+    if params.weighting == "uniform":
+        return legal_rows
+    base, _, exponent = params.weighting.partition(":")
+    if base != "rho" or not exponent:
+        raise ValueError(f"unknown weighting {params.weighting!r}; want reach | uniform | rho:K")
+    w = rho.clamp(min=0.0).pow(float(exponent))
+    if params.weight_clip is not None:
+        w = w.clamp(max=params.weight_clip * w[rho > 0].min())
+    reachable = rho > 0
+    return (w / w[reachable].mean().clamp(min=1e-300)) * legal_rows
+
+
 def ach_step(
     sf: SequenceForm,
     logits: torch.Tensor,
@@ -184,7 +221,7 @@ def ach_step(
     else:
         c = torch.ones_like(adv)
 
-    weight = rho if params.weighting == "reach" else sf.legal_mask.any(dim=1).to(torch.float64)
+    weight = step_weight(sf, rho, params)
     delta = weight.unsqueeze(1) * (params.eta * c * adv - ent_grad)
     new_logits = logits + params.lr * delta
     new_logits = new_logits.masked_fill(~sf.legal_mask, 0.0)

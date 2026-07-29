@@ -34,6 +34,12 @@ ARMS: dict[str, AchParams] = {
     "beta0_nogate": AchParams(beta=0.0, gate=False),
     "uniform": AchParams(weighting="uniform"),
     "uniform_beta0_nogate": AchParams(beta=0.0, gate=False, weighting="uniform"),
+    # Tempered family, mean-1 renormalized so K moves only the SHAPE of the
+    # weighting (see AchParams.weighting). K=1 is what sampling delivers, K=0 is
+    # flat; the interior is the reach^-kappa tempering that failed in RL. This
+    # arm has exact advantages, no critic and every row present, so it isolates
+    # whether the MOVING TARGET alone is what breaks the tempering.
+    **{f"rho{k}": AchParams(weighting=f"rho:{k}") for k in (0.0, 0.25, 0.5, 0.75, 1.0)},
 }
 
 

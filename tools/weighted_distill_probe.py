@@ -139,6 +139,8 @@ def distill(
     lbfgs_iters: int,
     seed: int,
     sampled_target: bool = False,
+    minibatch: int | None = None,
+    row_sampler: torch.Tensor | None = None,
 ) -> tuple[MLPSharedActorCritic, float]:
     obs = sf.infoset_observation.to(torch.float32)
     legal = sf.legal_mask
@@ -148,19 +150,33 @@ def distill(
         spec.obs_size, spec.num_actions, hidden_sizes=(width,), seed=seed, device="cpu"
     )
     gen = torch.Generator().manual_seed(seed)
+    sampler = None if row_sampler is None else row_sampler.to(torch.float32)
 
     def loss_fn() -> torch.Tensor:
-        masked = mlp(obs)[0].masked_fill(~legal, -1e9)
+        rows = (
+            None
+            if minibatch is None or sampler is None
+            else torch.multinomial(sampler, minibatch, replacement=True, generator=gen)
+        )
+        o, lg, tg, ww = (
+            (obs, legal, tgt, w) if rows is None else (obs[rows], legal[rows], tgt[rows], w[rows])
+        )
+        masked = mlp(o)[0].masked_fill(~lg, -1e9)
         logp = torch.log_softmax(masked, dim=-1)
         if sampled_target:
             # ONE action drawn from the target per row, redrawn every step: the
             # same expected gradient, plus the zero-mean per-row noise an RL
             # sample carries and this probe otherwise does not. See `main`.
-            drawn = torch.multinomial(tgt, num_samples=1, generator=gen)
+            drawn = torch.multinomial(tg, num_samples=1, generator=gen)
             per_row = -logp.gather(1, drawn).squeeze(1)
         else:
-            per_row = -(tgt * logp).sum(dim=-1)
-        return (w * per_row).mean()
+            per_row = -(tg * logp).sum(dim=-1)
+        if rows is None:
+            return (ww * per_row).mean()  # full batch: unchanged, w has mean 1
+        # Minibatch: the drawn subset's weights do not average to 1, so the
+        # reduction must self-normalize or the step size would vary with the
+        # draw. Same choice the RL path makes (nn_losses.weighted_mean).
+        return (ww * per_row).sum() / ww.sum()
 
     opt = torch.optim.Adam(mlp.parameters(), lr=lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1))
@@ -184,6 +200,31 @@ def distill(
 
             lopt.step(closure)
     return mlp, float(loss_fn().detach())
+
+
+def minibatch_arm(
+    sf, behavior: torch.Tensor, kind: str, rho: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(per_sample_weight, row_sampler)`` for one minibatch arm.
+
+    A full-batch arm applies ``w(I)`` with every row present. Drawing rows from
+    ``rho`` instead already applies ``rho(I)``, so reproducing the same expected
+    objective needs the per-sample weight ``w(I) / rho(I)``. That is what makes
+    the two modes comparable, and it is also what turns the two arms RL can
+    actually run into their familiar forms: ``reach`` (``w = rho``) becomes a
+    flat weight of 1, and ``sqrt`` (``w = rho^0.5``) becomes ``rho^-0.5``.
+
+    ``uniform_rows`` is the exception and the point of contrast: it draws rows
+    uniformly at a flat weight, which reproduces the full-batch ``uniform`` arm
+    WITHOUT paying a ``1/rho`` weight for it. No on-policy sampler can do that
+    -- it is the coverage ceiling, included to bound what the other two are
+    being compared against.
+    """
+    if kind == "uniform_rows":
+        ones = torch.ones_like(rho)
+        return ones, ones
+    w = infoset_weights(sf, behavior, kind) / rho.clamp(min=1e-300)
+    return w / w.mean().clamp(min=1e-300), rho
 
 
 def behavior_of_mlp(sf, mlp: MLPSharedActorCritic) -> torch.Tensor:
@@ -215,6 +256,24 @@ def main() -> None:
             "Forces Adam-only (L-BFGS's line search needs a stationary loss)."
         ),
     )
+    ap.add_argument(
+        "--minibatch",
+        type=int,
+        default=None,
+        help=(
+            "draw N rows per step instead of using all of them. This is the last "
+            "structural difference between the probe and RL: an on-policy batch "
+            "contains only rows the policy actually reached, so a weight can only "
+            "redistribute emphasis among THOSE -- it can never deliver a gradient "
+            "to a row that was not sampled. Rows are drawn from rho (what a "
+            "rollout delivers) and each arm's per-sample weight is w(I)/rho(I), "
+            "so the EXPECTED weighted objective is identical to the same arm at "
+            "full batch: 'reach' becomes weight 1 (what the paper does) and "
+            "'sqrt' becomes rho^-0.5 (what the RL arm does). The special arm "
+            "'uniform_rows' draws rows UNIFORMLY at weight 1 -- the coverage "
+            "ceiling, which no online sampler can implement."
+        ),
+    )
     ap.add_argument("--out", type=Path, default=Path("runs/exact_ach/weighted_distill.json"))
     args = ap.parse_args()
 
@@ -227,9 +286,21 @@ def main() -> None:
     if args.out.is_file():
         results = json.loads(args.out.read_text(encoding="utf-8"))
 
+    rho_rows = ExactAdvantage(sf).compute(target)[1].clamp(min=0.0) if args.minibatch else None
+
     for kind in args.weightings:
-        w = infoset_weights(sf, target, kind)
-        covered = float((w > 1e-6).to(torch.float64).mean())
+        sampler = None
+        if args.minibatch:
+            w, sampler = minibatch_arm(sf, target, kind, rho_rows)
+            # Diagnostics describe the EFFECTIVE weighting (sampler x per-sample
+            # weight), which is the quantity comparable across the two modes --
+            # not `w`, which in minibatch mode is flat for the paper's own arm.
+            w_eff = sampler * w
+            w_eff = w_eff / w_eff.mean().clamp(min=1e-300)
+        else:
+            w = infoset_weights(sf, target, kind)
+            w_eff = w
+        covered = float((w_eff > 1e-6).to(torch.float64).mean())
         mlp, final_loss = distill(
             spec,
             sf,
@@ -238,9 +309,11 @@ def main() -> None:
             width=args.width,
             epochs=args.epochs,
             lr=args.lr,
-            lbfgs_iters=0 if args.sampled_target else args.lbfgs_iters,
+            lbfgs_iters=0 if (args.sampled_target or args.minibatch) else args.lbfgs_iters,
             seed=args.seed,
             sampled_target=args.sampled_target,
+            minibatch=args.minibatch,
+            row_sampler=sampler,
         )
         beh = behavior_of_mlp(sf, mlp)
         expl = float(nash_conv(sf, beh, validate=False)) / 2.0
@@ -258,7 +331,7 @@ def main() -> None:
         engine = ExactAdvantage(sf)
         _adv, rho_learned = engine.compute(beh)
         _adv, rho_target = engine.compute(target)
-        starved = w < 1e-3
+        starved = w_eff < 1e-3
         leak_learned = float(rho_learned[starved].sum() / rho_learned.sum().clamp(min=1e-300))
         leak_target = float(rho_target[starved].sum() / rho_target.sum().clamp(min=1e-300))
         results[kind] = {
@@ -266,7 +339,7 @@ def main() -> None:
             "unweighted_KL": kl,
             "weighted_train_loss": final_loss,
             "frac_infosets_with_weight_above_1e-6": covered,
-            "effective_infosets": float(w.sum() ** 2 / (w * w).sum()),
+            "effective_infosets": float(w_eff.sum() ** 2 / (w_eff * w_eff).sum()),
             "starved_rows": int(starved.sum()),
             "visits_into_starved_rows_learned": leak_learned,
             "visits_into_starved_rows_target": leak_target,
