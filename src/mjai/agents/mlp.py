@@ -14,6 +14,7 @@ unit tests, call :func:`mjai.utils.gpu_assert.require_cpu` first.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -21,11 +22,13 @@ import torch
 from torch import nn
 
 from mjai.agents.base import Policy
+from mjai.agents.nonfinite import NonFiniteNetworkError, nonfinite_action_dist_error
 from mjai.utils.gpu_assert import resolve_device
 
 # Logits assigned to illegal actions before softmax. Large-negative (not -inf)
 # so gradients stay finite if an illegal action somehow leaks into a loss.
 MASK_VALUE = -1e9
+
 
 # Activation registry keyed by lowercase name (e.g. "relu"). Single source of
 # truth shared by the experiment runner (build by config string) and the
@@ -173,6 +176,45 @@ class MLPSharedActorCritic(nn.Module, Policy):
         masked = logits + mask
         return torch.log_softmax(masked, dim=-1)
 
+    def _divergence_error(
+        self, logits: torch.Tensor, probs: torch.Tensor, obs: list[float], legal: list[int]
+    ) -> NonFiniteNetworkError:
+        """The diagnosis for a non-finite decision point (built, not raised)."""
+        return nonfinite_action_dist_error(
+            self, logits=logits, probs=probs, obs=obs, legal_actions=legal
+        )
+
+    def _draw(
+        self, dist: torch.Tensor, logits: torch.Tensor, obs: list[float], legal: list[int]
+    ) -> int:
+        """One ``multinomial`` draw, with torch's own error translated.
+
+        The divergence guard costs nothing on the happy path (see
+        :func:`~mjai.agents.nonfinite.nonfinite_action_dist_error`): here it only
+        rewrites the exception CPU torch already raises on a nan/inf/negative
+        probability vector, and the caller's finiteness check on the log-prob it
+        was going to sync anyway covers CUDA, whose kernel skips that validation.
+        """
+        try:
+            return int(torch.multinomial(dist, num_samples=1).item())
+        except RuntimeError as exc:
+            raise self._divergence_error(logits, dist, obs, legal) from exc
+
+    def _greedy(
+        self, log_probs: torch.Tensor, logits: torch.Tensor, obs: list[float], legal: list[int]
+    ) -> int:
+        """Argmax over the legal set, rejecting a non-finite maximum.
+
+        ``torch.max`` returns the value alongside the index, so validating costs
+        no sync the previous ``argmax(...).item()`` did not already pay.
+        """
+        legal_idx = torch.tensor(legal, dtype=torch.long, device=self.device)
+        best_lp, best_pos = torch.max(log_probs[legal_idx], dim=0)
+        lp, pos = torch.stack([best_lp, best_pos.to(best_lp.dtype)]).tolist()
+        if not math.isfinite(lp):
+            raise self._divergence_error(logits, torch.exp(log_probs), obs, legal)
+        return legal[int(pos)]
+
     def act(
         self,
         obs: list[float],
@@ -191,18 +233,25 @@ class MLPSharedActorCritic(nn.Module, Policy):
             probs = torch.exp(log_probs)
             if eval:
                 # Greedy over the legal set only.
-                legal_idx = torch.tensor(legal_actions, device=self.device)
-                legal_lp = log_probs[legal_idx]
-                best = int(legal_idx[torch.argmax(legal_lp)].item())
-                return best, 0.0
+                return self._greedy(log_probs, logits[0], obs, legal_actions), 0.0
             # Stochastic sample from the full-space categorical (illegal have ~0 prob).
             if behavior_epsilon > 0.0:
-                return self._sample_exploring(probs, legal_actions, behavior_epsilon)
-            action = int(torch.multinomial(probs, num_samples=1).item())
-            return action, float(log_probs[action].item())
+                return self._sample_exploring(
+                    probs, logits[0], obs, legal_actions, behavior_epsilon
+                )
+            action = self._draw(probs, logits[0], obs, legal_actions)
+            logprob = float(log_probs[action].item())
+            if not math.isfinite(logprob):
+                raise self._divergence_error(logits[0], probs, obs, legal_actions)
+            return action, logprob
 
     def _sample_exploring(
-        self, probs: torch.Tensor, legal_actions: list[int], epsilon: float
+        self,
+        probs: torch.Tensor,
+        logits: torch.Tensor,
+        obs: list[float],
+        legal_actions: list[int],
+        epsilon: float,
     ) -> tuple[int, float]:
         """Sample from ``mu = (1-eps)*pi + eps*Uniform(legal)``; return log mu(a).
 
@@ -213,8 +262,11 @@ class MLPSharedActorCritic(nn.Module, Policy):
         idx = torch.tensor(legal_actions, dtype=torch.long, device=probs.device)
         mix[idx] = 1.0 / len(legal_actions)
         mu = (1.0 - epsilon) * probs + epsilon * mix
-        action = int(torch.multinomial(mu, num_samples=1).item())
-        return action, float(torch.log(mu[action]).item())
+        action = self._draw(mu, logits, obs, legal_actions)
+        logprob = float(torch.log(mu[action]).item())
+        if not math.isfinite(logprob):
+            raise self._divergence_error(logits, probs, obs, legal_actions)
+        return action, logprob
 
     def value(self, obs: list[float]) -> float:
         with torch.no_grad():
@@ -248,16 +300,20 @@ class MLPSharedActorCritic(nn.Module, Policy):
             log_probs = self._masked_log_probs(logits[0], legal_actions)
             probs = torch.exp(log_probs)
             v = float(value.item())
+            if not math.isfinite(v):
+                raise self._divergence_error(logits[0], probs, obs, legal_actions)
             if eval:
-                legal_idx = torch.tensor(legal_actions, device=self.device)
-                legal_lp = log_probs[legal_idx]
-                best = int(legal_idx[torch.argmax(legal_lp)].item())
-                return best, 0.0, v
+                return self._greedy(log_probs, logits[0], obs, legal_actions), 0.0, v
             if behavior_epsilon > 0.0:
-                action, logprob = self._sample_exploring(probs, legal_actions, behavior_epsilon)
+                action, logprob = self._sample_exploring(
+                    probs, logits[0], obs, legal_actions, behavior_epsilon
+                )
                 return action, logprob, v
-            action = int(torch.multinomial(probs, num_samples=1).item())
-            return action, float(log_probs[action].item()), v
+            action = self._draw(probs, logits[0], obs, legal_actions)
+            logprob = float(log_probs[action].item())
+            if not math.isfinite(logprob):
+                raise self._divergence_error(logits[0], probs, obs, legal_actions)
+            return action, logprob, v
 
     # ---- train/eval mode hooks ----
 

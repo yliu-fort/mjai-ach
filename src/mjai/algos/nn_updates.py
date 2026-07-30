@@ -35,6 +35,7 @@ from torch import nn
 
 from mjai.agents.critic_wrapper import PolicyWithCritic
 from mjai.agents.mlp import MLPSharedActorCritic
+from mjai.agents.nonfinite import assert_finite_update
 from mjai.algos.nn_losses import (
     ach_policy_loss,
     explained_variance,
@@ -417,7 +418,7 @@ class NNActorCriticUpdate(UpdateRule):
         self._clip_grads()
         self.optimizer.step()
 
-        return self._make_stats(
+        stats = self._make_stats(
             policy_loss=policy_loss,
             value_loss=value_loss,
             entropy=entropy,
@@ -426,6 +427,30 @@ class NNActorCriticUpdate(UpdateRule):
             returns=returns,
             values=values,
             telemetry=telemetry,
+        )
+        self._assert_finite_step(stats)
+        return stats
+
+    def _assert_finite_step(self, stats: UpdateStats) -> None:
+        """Hand this update's already-synced scalars to the divergence guard.
+
+        The four forward scalars come from the PRE-step weights and ``grad_norm``
+        from this step's backward, which is what lets
+        :func:`~mjai.agents.nonfinite.assert_finite_update` say whether the run
+        broke before this step, in its backward, or in its optimizer step.
+        """
+        assert_finite_update(
+            self.policy,
+            forward_scalars={
+                "policy_loss": stats.policy_loss,
+                "value_loss": stats.value_loss,
+                "entropy": stats.entropy,
+                "approx_kl": stats.approx_kl,
+            },
+            grad_norm=float(stats.extra.get("grad_norm", 0.0)),
+            probes={
+                k: stats.extra[k] for k in ("iw_max", "iw_mean", "pterm_max") if k in stats.extra
+            },
         )
 
     def _make_stats(

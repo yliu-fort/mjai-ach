@@ -151,6 +151,13 @@ RuntimeError: probability tensor contains either `inf`, `nan` or element < 0
 30 个 RL run 里 **4 个**这样崩掉（paper/seed0、beta0.1/seed0、lth1.15/seed0 等）。也就是说 BRPS
 上这个臂不仅不收敛，还**会带着 NaN 中途死掉**。
 
+> **2026-07-30 追加**：这个不可诊断的死法已经修掉了（`src/mjai/agents/nonfinite.py`）。现在同一个
+> run 在**更新处**抛 `NonFiniteNetworkError`，报出哪个标量非有限、`iw_max`/`pterm_max` 探针、
+> 以及事后的权重状态，并指向本节。修的是**报错**，不是算法：没有任何 clamp 或 sanitize
+> （AGENTS.md §11）。仍然有一层拿不到的东西 —— 真正开始发散的那次更新里所有量都还是**有限**的
+> （实测 torso bias 到 −5.8e14 时 loss/grad 都有限），要抓住它需要一个幅值阈值那样的启发式，本次
+> 没有引入。
+
 ---
 
 ## 5. 拿掉放大之后：paper 超参下的**精确算子**仍然不收敛
