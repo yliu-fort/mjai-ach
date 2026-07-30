@@ -1,0 +1,68 @@
+# Liar's Dice attribution D3: is the reach-tempering failure ACH-SPECIFIC?
+#
+# docs/liars_residual_floor.md §8.7 measured that weighting each sample by
+# reach(h)^-kappa makes ACH strictly worse on Liar's Dice, and §8.8 showed
+# estimation noise explains only part of it. One untested suspect is the ACH
+# operator itself: its loss is `-c * eta * y(a) / pi_old(a) * A`, and that
+# `1/pi_old` is ALREADY a reach-like factor. The sample weight and the
+# importance weight blow up on the SAME samples and multiply, so the effective
+# per-sample coefficient is w_i / pi_old_i -- a product of two heavy-tailed
+# quantities that ACH never had to carry before.
+#
+# theta=0 (PPO's clipped surrogate) has no such factor: the ratio is clipped to
+# [1-eps, 1+eps] and never diverges. So this PAIR asks whether the tempering
+# also fails without it. Both arms are otherwise identical to the ACH family
+# (same scaffolding: SGD, no advantage normalization, one epoch per batch --
+# AGENTS.md D11 keeps the scaffolding at ACH defaults at every theta), so the
+# only difference from configs/exp/liars_dice1_ach_mlp_weight_k0.5_c1e3.yaml is
+# `algo`.
+#
+# READ THE PAIR, NEVER AGAINST 0.1464. PPO on this scaffolding has its own floor;
+# the question is only whether kappa=0.5 helps or hurts RELATIVE TO kappa=0
+# within this pair (the B=512 lesson, §8.7).
+#
+# `eta`, `l_th`, `ratio_eps` and `iw_clip` below are INERT at theta=0 -- the ACH
+# term is never built. They stay in the file so the diff against the ACH arm is
+# exactly one line.
+# ARM: algo=ppo (theta=0), kappa=0. CONTROL: PPO with no tempering.
+game: liars_dice1
+algo: ppo
+self_play_mode: mirror
+policy_kind: mlp
+hidden_sizes: [256]
+activation: relu
+optimizer: sgd
+learning_rate: 0.001
+value_coef: 1.0
+entropy_coef: 0.01
+gae_lambda: 0.95
+max_grad_norm: 0.0
+eta: 1.0
+l_th: 2.0
+ratio_eps: 0.5
+iw_clip: 20              # cap 1/pi_old (root-cause fix; None=paper)
+sample_weight_kappa: 0    # weight = reach(h)^-kappa; 0 = paper
+sample_weight_clip: 1000      # cap on that weight (bounds per-batch variance)
+target_samples: 64
+episodes_per_round: 200
+total_env_steps: 10000000
+eval_every_env_steps: 100000
+n_steps: 1000000
+save_every_steps: 1000
+eval_every_steps: 1000
+eval_during_training: true
+verbose: false
+seed: 0
+out_dir: runs/ab_weight/liars_w_ppo_k0_seed0
+hedge_eta: null
+clip_eps: 0.2
+league_capacity: 16
+device: null
+trunk_layernorm: true
+gate_centered_logits: false
+loss_centered_logits: false
+# ---- D16 average-strategy anchor (AGENTS.md D16) ----
+# "both" emits the uniform (theorem-stated) average under eval/avg_* and the
+# linear/CFR+ average under eval/avg_*_lin from this one run.
+track_average_policy: true
+average_policy_weighting: both

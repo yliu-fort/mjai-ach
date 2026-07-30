@@ -33,7 +33,9 @@ from typing import Any
 import torch
 from torch import nn
 
+from mjai.agents.critic_wrapper import PolicyWithCritic
 from mjai.agents.mlp import MLPSharedActorCritic
+from mjai.agents.nonfinite import assert_finite_update
 from mjai.algos.nn_losses import (
     ach_policy_loss,
     explained_variance,
@@ -41,6 +43,8 @@ from mjai.algos.nn_losses import (
     normalize_advantages,
     ppo_policy_loss,
     value_loss_and_entropy,
+    weight_telemetry,
+    weighted_mean,
 )
 from mjai.algos.transition import Batch, UpdateStats
 from mjai.algos.update_rule import ACHFidelityWarning, AlgoConfig, UpdateRule
@@ -85,6 +89,23 @@ def _warn_if_ach_incompatible(config: AlgoConfig) -> None:
             f"n_epochs={config.n_epochs} (p24: 'we update theta and omega once "
             "using a single mini-batch at each iteration')"
         )
+    if config.iw_clip is not None:
+        issues.append(
+            f"iw_clip={config.iw_clip} (Algorithm 2 / Eq. 29 carries the raw "
+            "1/pi_old importance weight; capping it is a stabilizer the paper "
+            "does not have)"
+        )
+    if config.n_critic_updates > 0:
+        issues.append(
+            f"n_critic_updates={config.n_critic_updates} (paper does 1 combined "
+            "update; extra value-only updates are a critic-quality boost it does "
+            "not have)"
+        )
+    if config.separate_critic:
+        issues.append(
+            "separate_critic=True (paper shares params between policy and value, "
+            "App. E; an independent critic net is an architecture deviation)"
+        )
     if issues:
         warnings.warn(
             f"ACH policy term is active (theta={config.theta}) alongside "
@@ -124,15 +145,36 @@ class NNActorCriticUpdate(UpdateRule):
     """
 
     def __init__(self, policy: MLPSharedActorCritic, config: AlgoConfig | None = None) -> None:
-        if not isinstance(policy, MLPSharedActorCritic):
+        if not isinstance(policy, MLPSharedActorCritic | PolicyWithCritic):
             raise TypeError(
-                f"{type(self).__name__} requires MLPSharedActorCritic, got {type(policy)}"
+                f"{type(self).__name__} requires MLPSharedActorCritic (or PolicyWithCritic "
+                f"for separate_critic), got {type(policy)}"
             )
         super().__init__(policy)
         self.config = config or AlgoConfig()
         _warn_if_ach_incompatible(self.config)
         self.policy: MLPSharedActorCritic = policy
         self.optimizer = self._make_optimizer()
+        # Optional INDEPENDENT critic (AlgoConfig.separate_critic): own params and
+        # optimizer, so training it hard never drifts the policy (the shared-trunk
+        # n_critic_updates does). Its V(s) supplies the advantage baseline.
+        self.critic: MLPSharedActorCritic | None = None
+        self.critic_opt: torch.optim.Optimizer | None = None
+        if self.config.separate_critic:
+            # Prefer the wrapper's critic (built by build_policy so the rollout's
+            # GAE reads it); fall back to a fresh net only if handed a bare MLP.
+            if isinstance(policy, PolicyWithCritic):
+                self.critic = policy.critic_net
+            else:
+                self.critic = MLPSharedActorCritic(
+                    policy.obs_size,
+                    policy.num_actions,
+                    hidden_sizes=self.config.critic_hidden_sizes,
+                    device=str(policy.device),
+                )
+            self.critic_opt = torch.optim.SGD(
+                self.critic.parameters(), lr=self.config.learning_rate
+            )
 
     # ---- scaffolding ----
 
@@ -245,6 +287,24 @@ class NNActorCriticUpdate(UpdateRule):
         # Raw GAE advantages feed the ACH term unconditionally (paper p24); the
         # PPO term optionally sees the normalized copy.
         adv_raw = torch.as_tensor(batch.advantages, dtype=torch.float32, device=device)
+        # Per-sample loss weights (RolloutConfig.sample_weight_kappa). None here
+        # is the on-policy default and keeps every reduction below on .mean().
+        weights = (
+            None
+            if batch.weights is None
+            else torch.as_tensor(batch.weights, dtype=torch.float32, device=device)
+        )
+        if self.critic is not None and self.critic_opt is not None:
+            # Independent critic (AlgoConfig.separate_critic): train it hard on the
+            # value loss (own params -- no policy drift). The advantage stays the
+            # rollout's GAE -- which, via the PolicyWithCritic wrapper, was computed
+            # with THIS critic's V, so it is GAE(lambda) on the well-trained critic.
+            for _ in range(max(1, self.config.n_critic_updates)):
+                v_c = self.critic(obs)[1]
+                cvloss = self.config.value_coef * weighted_mean((v_c - returns) ** 2, weights)
+                self.critic_opt.zero_grad()
+                cvloss.backward()  # type: ignore[no-untyped-call]
+                self.critic_opt.step()
         adv_ppo = adv_raw
         if self.config.theta < 1.0 and self.config.normalize_advantages:
             adv_ppo = normalize_advantages(adv_raw)
@@ -254,6 +314,18 @@ class NNActorCriticUpdate(UpdateRule):
         old_probs = torch.exp(old_logp)
 
         stats = UpdateStats(policy_loss=0.0, value_loss=0.0, entropy=0.0)
+        # Optional extra value-only updates to fit V harder before the policy step
+        # (AlgoConfig.n_critic_updates, SHARED-trunk mode only). In separate_critic
+        # mode the independent critic is trained below instead -- these would train
+        # the shared policy net and drift the policy.
+        if self.config.n_critic_updates > 0 and not self.config.separate_critic:
+            for _ in range(self.config.n_critic_updates):
+                logits_c, values_c = self.policy(obs)
+                vloss, _ = value_loss_and_entropy(logits_c, values_c, returns, mask, weights)
+                vstep = self.config.value_coef * vloss
+                self.optimizer.zero_grad()
+                vstep.backward()  # type: ignore[no-untyped-call]
+                self.optimizer.step()
         first_off_policy: float | None = None
         for _ in range(self.config.n_epochs):
             stats = self._gradient_step(
@@ -265,6 +337,7 @@ class NNActorCriticUpdate(UpdateRule):
                 returns=returns,
                 adv_raw=adv_raw,
                 adv_ppo=adv_ppo,
+                weights=weights,
             )
             if first_off_policy is None:
                 first_off_policy = stats.extra.get("off_policy_frac", 0.0)
@@ -274,6 +347,7 @@ class NNActorCriticUpdate(UpdateRule):
         # batch?". At the ACH protocol's n_epochs=1 (paper p24) they coincide.
         if first_off_policy is not None:
             stats.extra["off_policy_frac"] = first_off_policy
+        stats.extra.update({k: float(v) for k, v in weight_telemetry(weights).items()})
         return stats
 
     def _gradient_step(
@@ -287,6 +361,7 @@ class NNActorCriticUpdate(UpdateRule):
         returns: torch.Tensor,
         adv_raw: torch.Tensor,
         adv_ppo: torch.Tensor,
+        weights: torch.Tensor | None = None,
     ) -> UpdateStats:
         """One forward/backward/optimizer step over the whole batch."""
         theta = self.config.theta
@@ -309,7 +384,7 @@ class NNActorCriticUpdate(UpdateRule):
         policy_loss: torch.Tensor | None = None
         if theta < 1.0:
             ppo_loss, ppo_stats = ppo_policy_loss(
-                ratio=ratio, advantages=adv_ppo, clip_eps=self.config.clip_eps
+                ratio=ratio, advantages=adv_ppo, clip_eps=self.config.clip_eps, weights=weights
             )
             telemetry.update(ppo_stats)
             terms["ppo"] = ppo_loss
@@ -323,6 +398,7 @@ class NNActorCriticUpdate(UpdateRule):
                 advantages=adv_raw,
                 old_probs=old_probs,
                 config=self.config,
+                weights=weights,
             )
             telemetry.update(ach_stats)
             terms["ach"] = ach_loss
@@ -332,7 +408,7 @@ class NNActorCriticUpdate(UpdateRule):
         if self.config.probe_term_grad_norms:
             telemetry.update(self._term_grad_probe(terms, theta))
 
-        value_loss, entropy = value_loss_and_entropy(logits, values, returns, mask)
+        value_loss, entropy = value_loss_and_entropy(logits, values, returns, mask, weights)
         loss = (
             policy_loss + self.config.value_coef * value_loss - self.config.entropy_coef * entropy
         )
@@ -342,7 +418,7 @@ class NNActorCriticUpdate(UpdateRule):
         self._clip_grads()
         self.optimizer.step()
 
-        return self._make_stats(
+        stats = self._make_stats(
             policy_loss=policy_loss,
             value_loss=value_loss,
             entropy=entropy,
@@ -351,6 +427,30 @@ class NNActorCriticUpdate(UpdateRule):
             returns=returns,
             values=values,
             telemetry=telemetry,
+        )
+        self._assert_finite_step(stats)
+        return stats
+
+    def _assert_finite_step(self, stats: UpdateStats) -> None:
+        """Hand this update's already-synced scalars to the divergence guard.
+
+        The four forward scalars come from the PRE-step weights and ``grad_norm``
+        from this step's backward, which is what lets
+        :func:`~mjai.agents.nonfinite.assert_finite_update` say whether the run
+        broke before this step, in its backward, or in its optimizer step.
+        """
+        assert_finite_update(
+            self.policy,
+            forward_scalars={
+                "policy_loss": stats.policy_loss,
+                "value_loss": stats.value_loss,
+                "entropy": stats.entropy,
+                "approx_kl": stats.approx_kl,
+            },
+            grad_norm=float(stats.extra.get("grad_norm", 0.0)),
+            probes={
+                k: stats.extra[k] for k in ("iw_max", "iw_mean", "pterm_max") if k in stats.extra
+            },
         )
 
     def _make_stats(

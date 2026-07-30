@@ -1,0 +1,85 @@
+# Liar's Dice residual-floor FIX probe: reach-tempered sample weights.
+#
+# Baseline for this family is configs/exp/liars_dice1_ach_mlp_fix_lth2_iw20_cap256.yaml
+# (l_th=2, iw_clip=20, hidden=256), which floors at exploitability 0.1464.
+# docs/liars_residual_floor.md locates that floor in the DYNAMIC RANGE of the
+# on-policy visitation rho: effN(rho) = 40 of 24576 information sets, and 80.8%
+# of them are never visited once in the whole 1e7-step run. §8.3 then measured a
+# hard ceiling on every BEHAVIOURAL intervention -- replacing BOTH players with
+# uniform reaches effN 61.9, so exploration cannot fix this.
+#
+# This family changes the WEIGHT instead of the behaviour. Each sample is
+# multiplied by reach(h)^-kappa, where reach(h) is the exact probability the
+# sampler had of producing that history (chance x both players' recorded
+# behavior probabilities). A sample arrives with probability reach(h), so the
+# weighted mass an information set receives is rho(I)^(1-kappa): the training
+# distribution is tempered without touching what is played.
+#
+# Verified offline before it was implemented (§8.5): rank correlation to the
+# ideal weight 0.9997/0.9971/0.9811 at kappa=0.25/0.5/0.75, and supervised
+# distillation under the ONLINE weight reaches 0.0098-0.0117 against the ideal
+# weight's 0.0092-0.0105 and the sampling weight's 0.187-0.243.
+#
+# THE COST, which these runs are what measures: the offline probe applied its
+# weights to all 24576 information sets in every step. Here they apply to a
+# 64-sample mini-batch, so the same dispersion shows up as per-batch variance.
+# Read `weight_effn` (Kish ESS within the batch) alongside exploitability --
+# an arm that gets worse with effN collapsed to single digits has been starved,
+# not refuted.
+#
+# A paper DEVIATION (Eq. 29 p24 averages the mini-batch uniformly), so it emits
+# ACHFidelityWarning. Read against the cap256 baseline above, which this is
+# otherwise bit-identical to -- same estimator (GAE), same behaviour policy,
+# same seed.
+#
+# BATCH-COMPENSATED PAIR. The smoke run measured the cost this family pays:
+# kappa=0.5 on a 64-sample mini-batch leaves `weight_effn` ~7, i.e. the batch is
+# worth ~7 effective samples instead of 64. The offline probe never paid that --
+# it applied its weights to all 24576 information sets in every step. These two
+# arms raise target_samples to 512 so the weighted batch is worth roughly what
+# the paper's unweighted 64 was, and they come in a PAIR so the batch change is
+# controlled: the kappa=0 arm is the same 512-sample run with no tempering.
+# Same total_env_steps, so the larger batch buys its effective sample size with
+# 8x fewer gradient steps -- which is exactly why it needs its own control.
+# ARM: kappa=0.5, clip=1000, batch=512. The tempered arm at a batch big enough to absorb the weight dispersion.
+game: liars_dice1
+algo: ach
+self_play_mode: mirror
+policy_kind: mlp
+hidden_sizes: [256]
+activation: relu
+optimizer: sgd
+learning_rate: 0.001
+value_coef: 1.0
+entropy_coef: 0.01
+gae_lambda: 0.95
+max_grad_norm: 0.0
+eta: 1.0
+l_th: 2.0
+ratio_eps: 0.5
+iw_clip: 20              # cap 1/pi_old (root-cause fix; None=paper)
+sample_weight_kappa: 0.5    # weight = reach(h)^-kappa; 0 = paper
+sample_weight_clip: 1000      # cap on that weight (bounds per-batch variance)
+target_samples: 512
+episodes_per_round: 200
+total_env_steps: 10000000
+eval_every_env_steps: 100000
+n_steps: 1000000
+save_every_steps: 1000
+eval_every_steps: 1000
+eval_during_training: true
+verbose: false
+seed: 0
+out_dir: runs/ab_weight/liars_w_k0.5_c1e3_b512_seed0
+hedge_eta: null
+clip_eps: 0.2
+league_capacity: 16
+device: null
+trunk_layernorm: true
+gate_centered_logits: false
+loss_centered_logits: false
+# ---- D16 average-strategy anchor (AGENTS.md D16) ----
+# "both" emits the uniform (theorem-stated) average under eval/avg_* and the
+# linear/CFR+ average under eval/avg_*_lin from this one run.
+track_average_policy: true
+average_policy_weighting: both

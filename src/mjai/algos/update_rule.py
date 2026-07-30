@@ -88,6 +88,14 @@ class AlgoConfig:
     eta: float = 1.0
     l_th: float = 2.0
     ratio_eps: float = 0.5
+    # Cap on the ACH importance weight 1/pi_old. Algorithm 2 / Eq. 29 carries it
+    # unbounded; under synchronous self-play pi==pi_old so it is 1, but once the
+    # policy sharpens, pi_old on rare sampled actions -> 0 and the y/pi_old term
+    # blows up the logits -> illegal-action crash (docs/liars_floor_ablation.md
+    # root cause). None = unbounded (paper-faithful); a float F caps 1/pi_old at
+    # F (equivalently floors pi_old at 1/F). A paper DEVIATION: warns
+    # ACHFidelityWarning when theta>0 (see nn_updates._warn_if_ach_incompatible).
+    iw_clip: float | None = None
     # ACH loss body uses the mean-centered logit (paper text, p24) when True;
     # False (default) = raw logit, the literal Algorithm 2 form. Raw logits are
     # the default because they are paired with the MLP's trunk LayerNorm, which
@@ -120,6 +128,24 @@ class AlgoConfig:
     normalize_advantages: bool = False
     n_epochs: int = 1
     adam_eps: float = 1e-5
+    # Extra value-only updates per policy step (0 = paper-faithful, 1 combined update).
+    # The ACH critic is UNDER-TRAINED: its explained_variance on Liar's Dice is ~0.15
+    # vs an irreducible Nash ceiling of ~0.65 (docs/liars_machine_precision.md Q1) --
+    # mostly because the paper does 1 combined update where OpenSpiel's A2C/RPG/NeuRD
+    # do ~32 critic updates. This knob fits V harder to narrow that gap. Paper
+    # deviation -> ACHFidelityWarning at theta>0.
+    n_critic_updates: int = 0
+    # INDEPENDENT critic network (own trunk+value head, own optimizer -- not shared
+    # with the policy). When True, the update rule builds a separate critic, trains
+    # it on the value loss (n_critic_updates/step, no policy drift), and uses its
+    # V(s) for the advantage baseline A = G - V_critic(s). This is the clean test
+    # of whether a well-trained, non-drifting critic breaks the expl floor (the
+    # shared-trunk n_critic_updates drifts the policy + overfits the training batch).
+    # CAVEAT: advantage becomes MC (G - V) not GAE(lambda) -- the rollout's GAE is
+    # bypassed (recompute needs the trajectory, lost in the flattened batch); for
+    # Liar's Dice terminal-only rewards this is a minor change. Paper deviation.
+    separate_critic: bool = False
+    critic_hidden_sizes: tuple[int, ...] = (128,)
     # Debug probe: measure the PPO and ACH policy terms' gradient norms
     # SEPARATELY (plus their cosine), so a mixed-theta run says out loud which
     # term is actually driving the update. Two extra backward passes per
@@ -136,6 +162,11 @@ class AlgoConfig:
             raise ValueError(f"theta must lie in [0, 1], got {self.theta}")
         if self.n_epochs < 1:
             raise ValueError(f"n_epochs must be >= 1, got {self.n_epochs}")
+        if self.iw_clip is not None and self.iw_clip < 1.0:
+            raise ValueError(
+                f"iw_clip caps 1/pi_old (always >= 1 since pi_old <= 1); "
+                f"got {self.iw_clip} < 1.0"
+            )
 
 
 class UpdateRule(ABC):

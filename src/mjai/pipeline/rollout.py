@@ -15,14 +15,31 @@ Chance nodes are auto-sampled (we never expose them to the policies).
 
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass, field
+from typing import Protocol
 
 import pyspiel
 
-from mjai.agents.base import Policy
+from mjai.agents.base import Policy, target_ratio
 from mjai.algos.transition import Batch, Transition, make_batch
 from mjai.games.loader import GameSpec
+
+
+class ValueOracle(Protocol):
+    """An exact ``V(s)`` that replaces the critic's baseline in the advantage.
+
+    Declared here as a structural type so the rollout stays independent of the
+    thing that implements it (``mjai.eval.exact_value.ExactValueOracle`` needs
+    the whole game tree, which no part of the pipeline should be pulled toward).
+    ``refresh`` is called once per collection round -- collection is synchronous,
+    so the profile is fixed for the whole round.
+    """
+
+    def refresh(self, learner: Policy, opponent: Policy) -> None: ...
+
+    def value(self, obs: list[float]) -> float: ...
 
 
 @dataclass
@@ -44,6 +61,37 @@ class RolloutConfig:
             argument — not by physical seat, so the dose stays exact under seat
             shuffle (AGENTS.md §9: batch size is a config value, not a mode
             side effect).
+        behavior_epsilon: sample actions from ``mu = (1-eps)*pi + eps*Uniform(legal)``
+            instead of from ``pi``. 0.0 (default) is the paper's on-policy
+            behavior (p24, ``mu_{p,t} = pi_{p,t}``); anything else is a
+            deliberate deviation whose purpose is to flatten the information-set
+            visitation ``rho`` (docs/liars_residual_floor.md). The recorded
+            logprob is ``log mu(a|s)``, which is what makes ACH's ``1/pi_old``
+            cancel the sampling probability exactly.
+        advantage_estimator: "gae" (default, paper-faithful) or "vtrace". V-trace
+            (Espeholt et al. 2018) corrects the value target and the advantage
+            for the mismatch between ``mu`` and ``pi``; without it a run with
+            ``behavior_epsilon > 0`` fits ``V^mu`` and estimates ``A^mu`` while
+            the ACH update wants ``A^pi``.
+        vtrace_rho_bar / vtrace_c_bar: the two V-trace truncations (IMPALA
+            defaults 1.0). ``rho_bar`` caps the fixed point the value function
+            converges to; ``c_bar`` caps how far a correction propagates back.
+        sample_weight_kappa: temper the training distribution by weighting each
+            sample with ``reach(h)^-kappa``, where ``reach(h)`` is the exact
+            probability the sampler had of producing that history (chance x both
+            players' behavior probabilities, all of them recorded here). A
+            sample arrives with probability ``reach(h)``, so the weighted mass
+            an information set receives is ``rho(I)^(1-kappa)`` up to the
+            within-information-set correction measured in
+            ``tools/history_weighting.py``. 0.0 (default) = the paper's
+            on-policy weighting, and no ``Batch.weights`` is emitted at all.
+            Rationale and the offline verification: docs/liars_residual_floor.md
+            §8.4-8.5.
+        sample_weight_clip: cap on the per-sample weight (``None`` = uncapped).
+            ``reach(h)^-kappa`` is unbounded above; the cap is what bounds the
+            per-batch variance the tempering buys coverage with. Measured
+            offline: kappa=0.75 with clip 1e3 keeps effN 229 of the 1308
+            an uncapped ideal weight reaches, at a weight range of 1e3.
         shuffle_seats: when True, each episode independently flips a fair coin
             (seeded) to decide which physical seat the ``learner`` occupies, so
             a learner sees BOTH perspectives against every opponent across
@@ -57,6 +105,12 @@ class RolloutConfig:
     seed: int | None = None
     target_samples: int | None = 64
     shuffle_seats: bool = False
+    behavior_epsilon: float = 0.0
+    advantage_estimator: str = "gae"
+    vtrace_rho_bar: float = 1.0
+    vtrace_c_bar: float = 1.0
+    sample_weight_kappa: float = 0.0
+    sample_weight_clip: float | None = None
 
 
 @dataclass
@@ -91,10 +145,14 @@ class RolloutWorkerCore:
         *,
         learner_player: int = 0,
         config: RolloutConfig | None = None,
+        value_oracle: ValueOracle | None = None,
     ) -> None:
         self.game_spec = game_spec
         self.learner_player = learner_player
         self.config = config or RolloutConfig()
+        # Exact baseline for the advantage, in place of the critic's V. None
+        # (default) is the paper's setup: the value comes from the network.
+        self.value_oracle = value_oracle
         if self.config.shuffle_seats and game_spec.num_players != 2:
             raise ValueError(
                 f"shuffle_seats is defined for 2-player games; "
@@ -129,6 +187,10 @@ class RolloutWorkerCore:
         if keep is not None and len(keep) == 0:
             raise ValueError("keep must be None (count all) or a non-empty tuple")
         keep_ids = {id(p) for p in keep} if keep else set()
+        if self.value_oracle is not None:
+            # Once per round, not per episode: collection is synchronous, so the
+            # profile that generates every episode below is this one.
+            self.value_oracle.refresh(learner, opponent)
         all_transitions: list[Transition] = []
         counted = 0
         per_producer: dict[int, int] = {}
@@ -175,13 +237,19 @@ class RolloutWorkerCore:
         batch can be routed by producer identity afterwards.
         """
         state = self.game_spec.new_state()
-        # Record (player, producer, obs, legal, action, logprob, value) at each
-        # decision point in a single pass — no post-episode recompute loop.
-        steps: list[tuple[int, Policy, list[float], list[int], int, float, float]] = []
+        # Record (player, producer, obs, legal, action, logprob, value, log_reach)
+        # at each decision point in a single pass — no post-episode recompute loop.
+        steps: list[tuple[int, Policy, list[float], list[int], int, float, float, float]] = []
+        # log P(the sampler produces this history): chance outcomes times EVERY
+        # player's behavior probabilities. Accumulated as the episode is played,
+        # because that is the only place each factor is still available -- the
+        # flattened batch has lost the trajectory, and `_sample_chance` is the
+        # only thing that ever sees the chance probabilities.
+        log_reach = 0.0
 
         while not state.is_terminal():
             if state.is_chance_node():
-                self._sample_chance(state)
+                log_reach += self._sample_chance(state)
                 continue
             if state.is_simultaneous_node():
                 joint, lps, per_player_values, actors = self._simultaneous_actions(
@@ -193,20 +261,35 @@ class RolloutWorkerCore:
                     obs = self.game_spec.obs_tensor(state, p)
                     # Per-player legal set (positional id; kw form rejected by pyspiel).
                     legal = list(state.legal_actions(p))
-                    steps.append((p, actors[p], obs, legal, joint[p], lps[p], per_player_values[p]))
+                    steps.append(
+                        (
+                            p,
+                            actors[p],
+                            obs,
+                            legal,
+                            joint[p],
+                            lps[p],
+                            self._baseline(obs, per_player_values[p]),
+                            log_reach,
+                        )
+                    )
                 state.apply_actions(joint)
+                log_reach += math.fsum(lps)  # both players moved out of this node
             else:
                 p = state.current_player()
                 obs = self.game_spec.obs_tensor(state, p)
                 legal = list(state.legal_actions())
                 policy = self._policy_for(p, learner, opponent, learner_seat)
-                a, lp, v = policy.act_with_value(obs, legal, eval=False)
-                steps.append((p, policy, obs, legal, a, lp, v))
+                a, lp, v = policy.act_with_value(
+                    obs, legal, eval=False, behavior_epsilon=self.config.behavior_epsilon
+                )
+                steps.append((p, policy, obs, legal, a, lp, self._baseline(obs, v), log_reach))
                 state.apply_action(a)
+                log_reach += lp
 
         returns = list(state.returns())
         transitions: list[Transition] = []
-        for p, policy, obs, legal, a, lp, v in steps:
+        for p, policy, obs, legal, a, lp, v, step_log_reach in steps:
             reward = returns[p]  # terminal-only rewards for these games
             transitions.append(
                 Transition(
@@ -220,56 +303,165 @@ class RolloutWorkerCore:
                     advantage=0.0,
                     player=p,
                     producer=policy,
+                    weight=self._sample_weight(step_log_reach),
                 )
             )
         return transitions, returns
 
+    def _baseline(self, obs: list[float], network_value: float) -> float:
+        """The value that feeds the advantage: the network's, or the oracle's.
+
+        Only the ADVANTAGE baseline is swapped. The value head is still trained
+        on the returns by the update rule, so a shared-trunk run keeps whatever
+        the value loss does to its features -- identical in the paired kappa=0
+        control, which is the only thing this arm is read against.
+        """
+        if self.value_oracle is None:
+            return network_value
+        return self.value_oracle.value(obs)
+
+    def _sample_weight(self, log_reach: float) -> float:
+        """``min(reach(h)^-kappa, clip)`` — how many times this sample counts.
+
+        Exactly 1.0 when the knob is off, so ``make_batch`` emits no weights and
+        every update rule keeps its original reduction.
+
+        Computed in log space: ``reach`` underflows float64 long before its
+        negative power overflows, so the naive ``reach ** -kappa`` would read
+        ``inf`` on histories the cap was meant to handle. An UNCAPPED weight can
+        still overflow (``math.exp`` raises); that is deliberate -- the honest
+        signal that this game needs ``sample_weight_clip`` set.
+        """
+        kappa = self.config.sample_weight_kappa
+        if kappa == 0.0:
+            return 1.0
+        log_w = -kappa * log_reach
+        cap = self.config.sample_weight_clip
+        if cap is not None:
+            log_w = min(log_w, math.log(cap))
+        return math.exp(log_w)
+
     def _assign_returns(self, transitions: list[Transition], returns: list[float]) -> None:
-        """Fill in return_ and advantage per transition using GAE(lambda), gamma=1.
+        """Fill in return_ and advantage per transition, gamma=1.
 
         For 2p0-sum games the transitions alternate between players. Each
-        player's experience is a sub-trajectory; GAE is computed per-player
+        player's experience is a sub-trajectory; the estimator runs per-player
         using that player's value estimates and the terminal return as the
-        episode's payoff. lambda comes from ``self.config.gae_lambda``. gamma
-        is fixed at 1 (undiscounted): all Phase-1 games are short with
-        terminal-only rewards, and the paper's H.3 leaves gamma unspecified
-        (spec assumption A1).
+        episode's payoff. gamma is fixed at 1 (undiscounted): all Phase-1 games
+        are short with terminal-only rewards, and the paper's H.3 leaves gamma
+        unspecified (spec assumption A1).
+
+        Two estimators, selected by ``RolloutConfig.advantage_estimator``:
+        ``"gae"`` (default, paper-faithful) and ``"vtrace"``.
         """
-        lam = self.config.gae_lambda
+        estimator = self.config.advantage_estimator
+        if estimator not in ("gae", "vtrace"):
+            raise ValueError(
+                f"unknown advantage_estimator {estimator!r}; want 'gae' | 'vtrace' "
+                "(AGENTS.md §11: no silent fallback)"
+            )
         # Group transitions by player; within each group the order matches the
         # temporal order of that player's decisions in the episode.
         by_player: dict[int, list[Transition]] = {}
         for t in transitions:
             by_player.setdefault(t.player, []).append(t)
         for player, ts in by_player.items():
-            r = returns[player]
-            n = len(ts)
-            gae = 0.0
-            # Walk backward through the player's transitions.
-            for i in range(n - 1, -1, -1):
-                t = ts[i]
-                t.return_ = float(r)
-                # TD residual: reward + gamma*V(next) - V(current).
-                # For these games reward is 0 mid-episode and the terminal
-                # payoff at the end; gamma=1 (undiscounted, short episodes).
-                next_value = ts[i + 1].value if i + 1 < n else 0.0
-                delta = 0.0 + next_value - t.value
-                # On the last transition, attach the actual terminal return.
-                if i == n - 1:
-                    delta = r - t.value
-                gae = delta + lam * gae
-                t.advantage = gae
+            if estimator == "gae":
+                self._assign_gae(ts, returns[player])
+            else:
+                self._assign_vtrace(ts, returns[player])
+
+    def _assign_gae(self, ts: list[Transition], r: float) -> None:
+        """GAE(lambda) advantages with the Monte-Carlo return as the value target.
+
+        The paper's combination (p24): ``G`` is the sampled return and the
+        advantage is GAE(lambda). Unchanged from the original implementation --
+        this is the bit-identical default path.
+        """
+        lam = self.config.gae_lambda
+        n = len(ts)
+        gae = 0.0
+        # Walk backward through the player's transitions.
+        for i in range(n - 1, -1, -1):
+            t = ts[i]
+            t.return_ = float(r)
+            # TD residual: reward + gamma*V(next) - V(current).
+            # For these games reward is 0 mid-episode and the terminal
+            # payoff at the end; gamma=1 (undiscounted, short episodes).
+            next_value = ts[i + 1].value if i + 1 < n else 0.0
+            delta = 0.0 + next_value - t.value
+            # On the last transition, attach the actual terminal return.
+            if i == n - 1:
+                delta = r - t.value
+            gae = delta + lam * gae
+            t.advantage = gae
+
+    def _assign_vtrace(self, ts: list[Transition], r: float) -> None:
+        """V-trace(lambda) targets and advantages (Espeholt et al. 2018), gamma=1.
+
+        Needed once the behavior policy stops being the target policy: with
+        ``behavior_epsilon > 0`` the returns are collected under ``mu``, so an
+        uncorrected critic fits ``V^mu`` and GAE estimates ``A^mu`` while the
+        ACH update wants ``A^pi``. V-trace reweights both by the per-step
+        ratio ``pi(a|s)/mu(a|s)``.
+
+        The ratio is recovered from the recorded ``log mu(a|s)`` by
+        :func:`mjai.agents.base.target_ratio` -- exactly, and without a second
+        network pass, because collection and update are synchronous here so the
+        ``pi`` that acted IS the ``pi`` being trained.
+
+        Two deliberate choices, both stated because they are not the only ones:
+
+        - ``c_i = lambda * min(c_bar, ratio_i)`` folds the existing
+          ``gae_lambda`` into the trace, so the estimator is a strict
+          generalization: at ``epsilon = 0`` every ratio is 1 and the advantage
+          below reduces **exactly** to GAE(lambda).
+        - the advantage is the value residual ``v_i - V_i`` rather than
+          IMPALA's ``rho_i * (r_i + gamma * v_{i+1} - V_i)``. The residual form
+          is what makes the reduction above exact; IMPALA's form is one line
+          away if a future arm wants it.
+
+        Note the value TARGET does change at ``epsilon = 0``: GAE mode regresses
+        V on the Monte-Carlo return, V-trace regresses it on ``v_i``. So an
+        ablation isolating the effect of exploration should compare
+        ``vtrace(eps>0)`` against ``vtrace(eps=0)``, not against the GAE default.
+        """
+        lam = self.config.gae_lambda
+        rho_bar = self.config.vtrace_rho_bar
+        c_bar = self.config.vtrace_c_bar
+        eps = self.config.behavior_epsilon
+        n = len(ts)
+        v_next = 0.0  # bootstrap past the terminal
+        value_next = 0.0  # V(s_{n}) = 0 at the terminal
+        for i in range(n - 1, -1, -1):
+            t = ts[i]
+            reward = r if i == n - 1 else 0.0
+            ratio = target_ratio(math.exp(t.logprob), len(t.legal_actions), eps)
+            rho = min(rho_bar, ratio)
+            c = lam * min(c_bar, ratio)
+            delta = rho * (reward + value_next - t.value)
+            v = t.value + delta + c * (v_next - value_next)
+            t.return_ = float(v)
+            t.advantage = float(v - t.value)
+            v_next, value_next = v, t.value
 
     def _policy_for(
         self, player: int, learner: Policy, opponent: Policy, learner_seat: int
     ) -> Policy:
         return learner if player == learner_seat else opponent
 
-    def _sample_chance(self, state: pyspiel.State) -> None:
+    def _sample_chance(self, state: pyspiel.State) -> float:
+        """Apply one sampled chance outcome; return its log probability.
+
+        The log-prob is returned rather than discarded because chance is a
+        factor of the history's sampling probability exactly like the players'
+        actions are, and this is the only point in the pipeline where it exists.
+        """
         outcomes = state.chance_outcomes()
         actions, probs = zip(*outcomes, strict=True)
         idx = self._rng.choices(range(len(actions)), weights=probs, k=1)[0]
         state.apply_action(actions[idx])
+        return math.log(probs[idx])
 
     def _simultaneous_actions(
         self, state: pyspiel.State, learner: Policy, opponent: Policy, learner_seat: int
@@ -293,7 +485,9 @@ class RolloutWorkerCore:
             # by pyspiel's pybind for matrix games).
             legal = list(state.legal_actions(p))
             policy = self._policy_for(p, learner, opponent, learner_seat)
-            a, lp, v = policy.act_with_value(obs, legal, eval=False)
+            a, lp, v = policy.act_with_value(
+                obs, legal, eval=False, behavior_epsilon=self.config.behavior_epsilon
+            )
             actions.append(a)
             logprobs.append(lp)
             values.append(v)

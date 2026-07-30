@@ -13,12 +13,13 @@ This module changes for exactly one reason: a new configurable knob.
 from __future__ import annotations
 
 import random
+import warnings
 from dataclasses import dataclass, field
 
 from mjai.agents.base import Policy
 from mjai.algos.controller import MirrorSelfPlay, SelfPlayController
 from mjai.algos.tabular_updates import TabularACHUpdate, TabularPPOUpdate
-from mjai.algos.update_rule import AlgoConfig, UpdateRule
+from mjai.algos.update_rule import ACHFidelityWarning, AlgoConfig, UpdateRule
 from mjai.games.loader import GameSpec
 from mjai.league.checkpoint_store import Role
 from mjai.league.league_controller import LeagueSelfPlay
@@ -123,6 +124,30 @@ class ExperimentConfig:
     eta: float = 1.0  # hedge coefficient eta(s) (p27 Table 7)
     l_th: float = 2.0  # one-sided logit gate threshold (p28 Table 8)
     ratio_eps: float = 0.5  # ratio gate; vacuous when synchronous (p28)
+    iw_clip: float | None = None  # cap 1/pi_old (AlgoConfig.iw_clip); None = paper-faithful
+    # ---- exploring behavior policy + off-policy correction (deviation) ----
+    # Both default to the paper's on-policy setup (p24: mu_{p,t} = pi_{p,t});
+    # setting either emits ACHFidelityWarning when the ACH term has weight.
+    # Rationale and the measurement they target: docs/liars_residual_floor.md.
+    behavior_epsilon: float = 0.0  # mu = (1-eps)*pi + eps*Uniform(legal)
+    advantage_estimator: str = "gae"  # "gae" (paper) | "vtrace" (off-policy correction)
+    vtrace_rho_bar: float = 1.0
+    vtrace_c_bar: float = 1.0
+    # Temper the training distribution from rho to rho^(1-kappa) by weighting
+    # each sample with reach(h)^-kappa (NN path only; the tabular rules reject a
+    # weighted batch rather than ignore it). 0.0 = the paper's on-policy
+    # weighting. docs/liars_residual_floor.md §8.4-8.5 for the offline check.
+    sample_weight_kappa: float = 0.0
+    sample_weight_clip: float | None = None  # cap on the per-sample weight
+    # Replace the critic's V in the advantage baseline with the exact conditional
+    # expectation from the sequence form (mjai.eval.exact_value). An INSTRUMENT:
+    # it reads the whole game tree and the opponent's strategy, so it exists to
+    # attribute the reach-tempering failure (docs/liars_residual_floor.md §8.9),
+    # not to be an algorithm. Mirror self-play only; small games only.
+    oracle_value: bool = False
+    n_critic_updates: int = 0  # extra value-only updates/step (AlgoConfig); 0 = paper-faithful
+    separate_critic: bool = False  # independent critic net (AlgoConfig) -- clean critic test
+    critic_hidden_sizes: list[int] = field(default_factory=lambda: [128])
     # Default ACH shape since docs/reproduce_report.md §6.5: trunk LayerNorm
     # supplies logit-scale stability, so gate and loss body both use the raw
     # logit. Set all three to the old values for the pre-LayerNorm behavior.
@@ -164,6 +189,20 @@ class ExperimentConfig:
     # summation order follows a hash map). Use "python" when eval curves must
     # be bit-identical run to run.
     eval_exact_backend: str = "auto"
+    # ---- Average-strategy anchor (AGENTS.md D16) ----
+    # ACH's O(T^-1/2) bound is about the AVERAGE strategy; the curves this repo
+    # plots are the current policy (docs/reproduce_report.md), which is the right
+    # object for a last-iterate study but not the one the theorem covers. Setting
+    # this additionally tracks the running-average strategy in sequence-form
+    # coordinates and emits eval/avg_nash_conv (+ eval/avg_exploitability at 2
+    # players). Off by default: it costs exact NashConv(s) per eval point and
+    # only makes sense on exactly-enumerable games.
+    track_average_policy: bool = False
+    # Weighting for that average: "uniform" is the one the theorem is stated
+    # for; "linear" (weight = eval index) is CFR+'s and converges faster; "both"
+    # emits uniform under eval/avg_* and linear under eval/avg_*_lin from a
+    # single run. They are different curves — say which one a figure shows.
+    average_policy_weighting: str = "uniform"
 
     def __post_init__(self) -> None:
         # League knob validation (AGENTS.md §9: invalid config fails loudly).
@@ -199,6 +238,11 @@ class ExperimentConfig:
             raise ValueError(
                 f"bad eval_exact_backend {self.eval_exact_backend!r}; want auto|python|cpp"
             )
+        if self.average_policy_weighting not in ("uniform", "linear", "both"):
+            raise ValueError(
+                f"bad average_policy_weighting {self.average_policy_weighting!r}; "
+                f"want uniform|linear|both"
+            )
         if self.eval_mc_samples < 16:
             raise ValueError(
                 f"eval_mc_samples must be >= 16 for the derived probe/match budgets, "
@@ -224,7 +268,7 @@ def build_policy(spec: GameSpec, cfg: ExperimentConfig, *, seed: int) -> Policy:
             raise ValueError(
                 f"Unknown activation {cfg.activation!r}; expected one of {sorted(ACTIVATIONS)}"
             )
-        return MLPSharedActorCritic(
+        policy = MLPSharedActorCritic(
             obs_size=spec.obs_size,
             num_actions=spec.num_actions,
             hidden_sizes=tuple(cfg.hidden_sizes),
@@ -233,6 +277,23 @@ def build_policy(spec: GameSpec, cfg: ExperimentConfig, *, seed: int) -> Policy:
             device=cfg.device,
             seed=seed,
         )
+        if cfg.separate_critic:
+            # Independent critic net (own trunk+value head). The rollout reads its
+            # V via the wrapper's act_with_value, so GAE uses the well-trained
+            # critic; the update rule trains it on the value loss (no policy drift).
+            from mjai.agents.critic_wrapper import PolicyWithCritic
+
+            critic = MLPSharedActorCritic(
+                obs_size=spec.obs_size,
+                num_actions=spec.num_actions,
+                hidden_sizes=tuple(cfg.critic_hidden_sizes),
+                activation=ACTIVATIONS[cfg.activation],
+                trunk_layernorm=cfg.trunk_layernorm,
+                device=cfg.device,
+                seed=seed + 1,
+            )
+            return PolicyWithCritic(policy, critic)
+        return policy
     raise ValueError(f"Unknown policy_kind: {cfg.policy_kind}")
 
 
@@ -281,6 +342,10 @@ def build_update_rule(policy: Policy, cfg: ExperimentConfig, spec: GameSpec) -> 
         eta=cfg.eta,
         l_th=cfg.l_th,
         ratio_eps=cfg.ratio_eps,
+        iw_clip=cfg.iw_clip,
+        n_critic_updates=cfg.n_critic_updates,
+        separate_critic=cfg.separate_critic,
+        critic_hidden_sizes=tuple(cfg.critic_hidden_sizes),
         loss_centered_logits=cfg.loss_centered_logits,
         centered_mean_legal_only=cfg.centered_mean_legal_only,
         gate_centered_logits=cfg.gate_centered_logits,
@@ -310,18 +375,82 @@ def build_update_rule(policy: Policy, cfg: ExperimentConfig, spec: GameSpec) -> 
     raise ValueError(f"Unknown policy_kind: {cfg.policy_kind}")
 
 
+def warn_if_rollout_ach_incompatible(cfg: ExperimentConfig) -> None:
+    """Warn when a ROLLOUT-side knob the ACH paper contradicts is on.
+
+    The mirror of ``nn_updates._warn_if_ach_incompatible`` (AGENTS.md D11) for
+    the knobs that live on :class:`~mjai.pipeline.rollout.RolloutConfig` rather
+    than on ``AlgoConfig``: the behavior policy and the advantage estimator are
+    properties of data COLLECTION, so they belong there, but they are exactly as
+    much a deviation from the paper as an optimizer swap is.
+
+    Silent at ``theta=0`` and on the shipped defaults, so a reproduction run
+    never warns and an A/B arm always says so out loud.
+    """
+    if resolve_theta(cfg) <= 0.0:
+        return
+    issues: list[str] = []
+    if cfg.behavior_epsilon > 0.0:
+        issues.append(
+            f"behavior_epsilon={cfg.behavior_epsilon} (p24: the behavior policy is "
+            "mu_{p,t} = pi_{p,t}; sampling off-policy also makes the ratio gate "
+            "non-vacuous, which p28 states it is not in this experiment)"
+        )
+    if cfg.advantage_estimator != "gae":
+        issues.append(
+            f"advantage_estimator={cfg.advantage_estimator!r} (p24: advantages are "
+            "GAE(lambda) and G is the sampled return)"
+        )
+    if cfg.sample_weight_kappa != 0.0:
+        issues.append(
+            f"sample_weight_kappa={cfg.sample_weight_kappa} (Eq. 29 p24 averages the "
+            "mini-batch uniformly, so a sample's influence is exactly the probability "
+            "its history was sampled; re-weighting optimizes a tempered objective)"
+        )
+    if cfg.oracle_value:
+        issues.append(
+            "oracle_value=True (the advantage baseline is the exact V(s) from the "
+            "game tree, not the critic's; this is ground truth entering the "
+            "training loop and is an attribution instrument, not an algorithm)"
+        )
+    if issues:
+        warnings.warn(
+            "ACH fidelity: " + "; ".join(issues),
+            ACHFidelityWarning,
+            stacklevel=2,
+        )
+
+
 def build_controller(
     spec: GameSpec, policy: Policy, cfg: ExperimentConfig, *, rng: random.Random
 ) -> SelfPlayController:
     """Build the mirror or league controller + return it."""
+    warn_if_rollout_ach_incompatible(cfg)
+    oracle = None
+    if cfg.oracle_value:
+        if cfg.self_play_mode != "mirror":
+            raise ValueError(
+                "oracle_value needs one policy in both seats to define V; "
+                f"self_play_mode={cfg.self_play_mode!r} (see mjai.eval.exact_value)"
+            )
+        from mjai.eval.exact_value import ExactValueOracle
+
+        oracle = ExactValueOracle(spec)
     runner = RolloutWorkerCore(
         spec,
         learner_player=0,
+        value_oracle=oracle,
         config=RolloutConfig(
             n_episodes=cfg.episodes_per_round,
             gae_lambda=cfg.gae_lambda,
             seed=cfg.seed,
             target_samples=cfg.target_samples,
+            behavior_epsilon=cfg.behavior_epsilon,
+            advantage_estimator=cfg.advantage_estimator,
+            vtrace_rho_bar=cfg.vtrace_rho_bar,
+            vtrace_c_bar=cfg.vtrace_c_bar,
+            sample_weight_kappa=cfg.sample_weight_kappa,
+            sample_weight_clip=cfg.sample_weight_clip,
             # League rounds shuffle the collector's seat per episode so every
             # opponent is faced from both perspectives; routing by producer
             # identity keeps each learner's dose exact regardless of seat.

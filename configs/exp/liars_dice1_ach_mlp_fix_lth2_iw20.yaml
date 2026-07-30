@@ -1,0 +1,50 @@
+# Liar's Dice floor FIX (B1+B4): l_th=2.0, iw_clip=20.
+# This is configs/exp/liars_dice1_ach_mlp_mirror.yaml (the paper-faithful ACH
+# arm, Fu et al. ICLR 2022 Appendix G p25-26 + H.3 p27-28; OpenSpiel default =
+# liars_dice(numdice=1, dice_sides=6)) with the D16 average-strategy tracker
+# turned on. It is a STRICT SUPERSET of the reproduction arm — same training
+# run, one extra metric — so the current-policy curve this produces matches the
+# reproduction, and the average-policy curve is read off the same trajectory.
+# ACH's O(T^-1/2) bound is about the AVERAGE strategy; the reproduction plots
+# the current policy, which is the paper's figure choice and the right object
+# for a last-iterate study, but not the object the theorem bounds (AGENTS.md
+# D16, docs/paper_spec_ach.md §1.1).
+game: liars_dice1
+algo: ach
+self_play_mode: mirror
+policy_kind: mlp
+hidden_sizes: [128]
+activation: relu
+optimizer: sgd
+learning_rate: 0.001
+value_coef: 1.0
+entropy_coef: 0.01
+gae_lambda: 0.95
+max_grad_norm: 0.0
+eta: 1.0
+l_th: 2.0
+ratio_eps: 0.5
+iw_clip: 20              # cap 1/pi_old (root-cause fix; None=paper)
+target_samples: 64
+episodes_per_round: 200
+total_env_steps: 10000000
+eval_every_env_steps: 100000
+n_steps: 1000000
+save_every_steps: 1000
+eval_every_steps: 1000
+eval_during_training: true
+verbose: false
+seed: 0
+out_dir: runs/ab_fix/liars_fix_lth2_iw20_seed0
+hedge_eta: null
+clip_eps: 0.2
+league_capacity: 16
+device: null
+trunk_layernorm: true
+gate_centered_logits: false
+loss_centered_logits: false
+# ---- D16 average-strategy anchor (AGENTS.md D16) ----
+# "both" emits the uniform (theorem-stated) average under eval/avg_* and the
+# linear/CFR+ average under eval/avg_*_lin from this one run.
+track_average_policy: true
+average_policy_weighting: both

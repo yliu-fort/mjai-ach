@@ -1,0 +1,61 @@
+# BRPS diagnostic arm: learning rate matched to the MLP's LOGIT-SPACE step.
+#
+# docs/brps_mlp_nonconvergence.md §2: the ACH loss moves parameters, and the
+# logit that results carries the extra factor ||d y_a/d theta||^2. With
+# trunk_layernorm=True the torso output has ||f||^2 = hidden_size exactly, so
+# that factor is 131 at hidden_sizes=[128] (measured, tools/brps_logit_step.py).
+# BRPS's +-50 payoffs then make ONE update move a logit by 10.06 -- 5x past the
+# l_th=2 gate box, which is evaluated BEFORE the step and so cannot contain it.
+# The policy is a pure strategy within ~1000 env-steps, where mirror self-play
+# makes every advantage exactly 0 and the gate zeroes the gradient: an absorbing
+# vertex at NashConv 50-100.
+#
+# lr = 1e-3 / 131 = 7.63e-6 restores the tabular/exact logit step. It is a
+# DIAGNOSTIC arm, not a proposed default: it does not reach Nash either, it
+# lands on the exact operator's limit cycle (NashConv ~3; see that doc §5-6).
+# Paper-faithful ACH protocol: BRPS (biased rock-paper-scissors), MIRROR self-play.
+# A/B control arm for brps_ach_mlp_league.yaml. Game params: configs/games/brps.yaml
+# (one-shot simultaneous, horizon 1, exact NE known) — the cheapest cycling game,
+# standing in for oshi_zumo whose exact NashConv eval is infeasible at size.
+game: brps
+algo: ach
+self_play_mode: mirror
+policy_kind: mlp
+# Network (p25): 1 hidden FC layer of 128 units + ReLU, then two linear heads.
+hidden_sizes: [128]
+activation: relu
+# Optimization (H.3, p27): SGD with constant learning rate, best lr=1e-3.
+optimizer: sgd
+learning_rate: 7.63e-06   # = 1e-3 / 131 (the measured amplification)
+value_coef: 1.0
+entropy_coef: 0.01     # β = 1e-2 (p28 Table 8)
+gae_lambda: 0.95
+max_grad_norm: 0.0     # disabled — the paper mentions no grad clipping
+eta: 1.0               # hedge coefficient η(s) (p27 Table 7)
+l_th: 2.0              # one-sided logit gate threshold (p28 Table 8)
+ratio_eps: 0.5         # ratio gate; vacuous under synchronous single-thread (p28)
+# Batch = 64 samples (p28 Table 8): whole episodes until ≥64 transitions.
+target_samples: 64
+episodes_per_round: 200  # safety cap only (target_samples stops first)
+# Env-step protocol (p25-26): evaluate every 1e5 steps, train to 1e7 steps.
+total_env_steps: 10000000
+eval_every_env_steps: 100000
+# Legacy round-mode fields (unused while total_env_steps is set).
+n_steps: 1000000
+save_every_steps: 1000
+eval_every_steps: 1000
+eval_during_training: true
+verbose: false
+seed: 0
+out_dir: runs/brps_probe/lr_matched/seed_0
+hedge_eta: null
+clip_eps: 0.2
+device: null
+# Logit-scale handling (docs/reproduce_report.md §6.5). A LayerNorm at the
+# torso end normalizes the features feeding both heads, so the gate and the
+# loss body threshold the RAW logit rather than a mean-centered one. This
+# combination reproduces the paper's Liar's Dice curve; manual mean-centering
+# did not. Deviation from the paper's stated architecture (p25) — see §6.5.
+trunk_layernorm: true
+gate_centered_logits: false
+loss_centered_logits: false

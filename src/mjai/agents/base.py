@@ -50,6 +50,7 @@ class Policy(ABC):
         *,
         eval: bool = False,
         rng_key: Any = None,
+        behavior_epsilon: float = 0.0,
     ) -> tuple[int, float]:
         """Choose an action.
 
@@ -58,10 +59,15 @@ class Policy(ABC):
             legal_actions: action ids legal at this state; never empty.
             eval: if True, act greedily (no exploration); else sample stochastically.
             rng_key: optional deterministic-state handle (seed/key) for reproducibility.
+            behavior_epsilon: sample from ``mu = (1-eps)*pi + eps*Uniform(legal)``
+                instead of ``pi``. 0.0 (default) is the paper's on-policy
+                behavior and leaves this path bit-identical.
 
         Returns:
             (action_id, logprob). ``logprob`` is the log-probability of the
-            chosen action under the policy (0.0 in eval mode is acceptable).
+            chosen action under the **behavior** policy that sampled it -- which
+            is ``pi`` unless ``behavior_epsilon`` is set (0.0 in eval mode is
+            acceptable).
         """
         ...
 
@@ -143,6 +149,7 @@ class Policy(ABC):
         *,
         eval: bool = False,
         rng_key: Any = None,
+        behavior_epsilon: float = 0.0,
     ) -> tuple[int, float, float]:
         """Fused (action, logprob, value) in one call.
 
@@ -151,7 +158,9 @@ class Policy(ABC):
         two reads into a single forward pass. The rollout hot path must call
         this rather than ``act`` + ``value`` separately.
         """
-        action, logprob = self.act(obs, legal_actions, eval=eval, rng_key=rng_key)
+        action, logprob = self.act(
+            obs, legal_actions, eval=eval, rng_key=rng_key, behavior_epsilon=behavior_epsilon
+        )
         value = self.value(obs)
         return action, logprob, value
 
@@ -202,6 +211,41 @@ def copy_weights(src: Policy, dst: Policy) -> None:
     construction: both methods are abstract, so every concrete policy has them.
     """
     dst.restore_state(src.snapshot_state())
+
+
+# ---------------------------------------------------------------------------
+# Exploring behavior policy (mu) -- ONE implementation of the mixture and its
+# inverse, because the two must round-trip exactly.
+#
+# Sampling from mu instead of pi does NOT change what ACH estimates: the loss
+# divides by ``pi_old(a|s)``, so recording ``pi_old = mu(a|s)`` makes the
+# importance weight cancel the sampling probability exactly and the expected
+# per-visit update is unchanged (paper Eq. 29 p24). What changes is the
+# information-set visitation ``rho``, which is the point -- see
+# docs/liars_residual_floor.md.
+#
+# The paper's behavior policy is ``mu = pi`` (p24), so any epsilon > 0 is a
+# deliberate deviation and warns via ACHFidelityWarning.
+# ---------------------------------------------------------------------------
+
+
+def behavior_prob(pi_a: float, n_legal: int, epsilon: float) -> float:
+    """``mu(a|s) = (1-eps) * pi(a|s) + eps / |legal|``."""
+    return (1.0 - epsilon) * pi_a + epsilon / n_legal
+
+
+def target_ratio(mu_a: float, n_legal: int, epsilon: float) -> float:
+    """``pi(a|s) / mu(a|s)``, recovered from the behavior probability.
+
+    Written as ``(1 - u/mu) / (1 - eps)`` with ``u = eps/|legal|`` rather than
+    the algebraically equal ``((mu - u)/(1 - eps)) / mu``: the subtraction
+    ``mu - u`` cancels catastrophically exactly where it matters (rare actions,
+    where ``mu -> u``), while ``u/mu`` stays accurate there and the result
+    degrades gracefully to 0. Returns 1.0 at ``epsilon = 0`` by construction.
+    """
+    if epsilon <= 0.0:
+        return 1.0
+    return (1.0 - (epsilon / n_legal) / mu_a) / (1.0 - epsilon)
 
 
 def entropy_of_probs(probs: list[float]) -> float:

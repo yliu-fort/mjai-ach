@@ -27,6 +27,7 @@ from mjai.agents.base import Policy
 from mjai.agents.ckpt_io import CheckpointManifest, write_checkpoint
 from mjai.algos.controller import Trainer
 from mjai.algos.transition import UpdateStats
+from mjai.eval.average_policy import AveragePolicyTracker
 from mjai.games.loader import GameSpec, load_game
 from mjai.scripts.experiment_build import (
     ALGO_THETA,
@@ -101,8 +102,15 @@ def run_experiment(cfg: ExperimentConfig) -> Path:
     writer = SummaryWriter(log_dir=str(out_dir / "tb"))
     curve_path = out_dir / "train_curve.json"
     curve_rows: list[dict[str, object]] = []
+    # D16: built before the loop so a game with no sequence form fails loudly
+    # at startup rather than at the first eval point an hour in (AGENTS.md §11).
+    average_trackers = (
+        _build_average_trackers(spec, cfg.average_policy_weighting)
+        if cfg.track_average_policy
+        else []
+    )
     step, env_steps, stats = _train_loop(
-        cfg, trainer, writer, out_dir, spec, policy, curve_path, curve_rows
+        cfg, trainer, writer, out_dir, spec, policy, curve_path, curve_rows, average_trackers
     )
     eval_ran = cfg.total_env_steps is not None or cfg.eval_during_training
     if eval_ran and (not curve_rows or curve_rows[-1]["step"] != step):
@@ -117,10 +125,30 @@ def run_experiment(cfg: ExperimentConfig) -> Path:
             step,
             env_steps,
             checkpoint=False,
+            average_trackers=average_trackers,
         )
     _save_checkpoint(out_dir, spec, cfg, policy, step)
     writer.close()
     return out_dir
+
+
+def _build_average_trackers(
+    spec: GameSpec, weighting: str
+) -> list[tuple[str, AveragePolicyTracker]]:
+    """Construct the average-strategy tracker(s) for the run (AGENTS.md D16).
+
+    ``weighting`` selects the average: ``uniform`` is the one Theorem 1 is
+    stated for; ``linear`` (weight = t) is CFR+'s and converges faster; ``both``
+    emits the uniform curve under ``eval/avg_*`` and the linear one under
+    ``eval/avg_*_lin`` from a single run. Each tracker builds its own sequence
+    form, so construction itself is what fails loudly on a game with none.
+    """
+    if weighting == "both":
+        return [
+            ("", AveragePolicyTracker(spec, weighting="uniform")),
+            ("_lin", AveragePolicyTracker(spec, weighting="linear")),
+        ]
+    return [("", AveragePolicyTracker(spec, weighting=weighting))]
 
 
 def _train_loop(
@@ -132,6 +160,7 @@ def _train_loop(
     policy: Policy,
     curve_path: Path,
     curve_rows: list[dict[str, object]],
+    average_trackers: list[tuple[str, AveragePolicyTracker]],
 ) -> tuple[int, int, UpdateStats | None]:
     """Run the train rounds; returns (rounds_run, env_steps, last_stats).
 
@@ -187,6 +216,7 @@ def _train_loop(
                     step,
                     env_steps,
                     checkpoint=True,
+                    average_trackers=average_trackers,
                 )
         else:
             if step % cfg.save_every_steps == 0:
@@ -203,6 +233,7 @@ def _train_loop(
                     step,
                     env_steps,
                     checkpoint=False,
+                    average_trackers=average_trackers,
                 )
     if bar is not None:
         bar.close()
@@ -228,6 +259,7 @@ def _eval_and_record(
     env_steps: int,
     *,
     checkpoint: bool,
+    average_trackers: list[tuple[str, AveragePolicyTracker]],
 ) -> None:
     """Evaluate the current policy, append the curve row, log to TensorBoard."""
     if checkpoint:
@@ -242,6 +274,7 @@ def _eval_and_record(
         eval_mc_samples=cfg.eval_mc_samples,
         seed=cfg.seed,
         eval_exact_backend=cfg.eval_exact_backend,
+        average_trackers=average_trackers,
     )
     curve_rows.append(row)
     write_curve(curve_path, curve_rows)
