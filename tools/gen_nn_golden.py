@@ -42,12 +42,20 @@ What it does NOT catch, also measured: ``entropy_coef`` 0.01 -> 0.0101 is
 invisible (0 differences), because the entropy term's share of a two-step
 parameter change is ~1e-6 relative — under the tolerance. The fixture pins the
 policy term's *structure* (which is what licenses the theta merge, AGENTS.md
-D11), not the calibration of a coefficient. Also blind, and this one is a
-pre-existing coverage gap rather than a consequence of the tolerance:
-``gate_centered_logits=True`` reproduces every scenario bit for bit, because the
-gate mask happens to come out identical under both readings of ambiguity A3.
+D11), not the calibration of a coefficient.
 ``test_golden_comparison_rejects_an_algorithmic_change`` pins the comparator's
 teeth directly instead of relying on any of these.
+
+One structural knob is invisible here for a reason that predates the tolerance
+and is not fixable from this file: ``gate_centered_logits=True`` reproduces every
+scenario **bit for bit** even under exact equality, because these scenarios' raw
+and mean-centered logits both sit far inside ±``l_th`` (the gate is not inert —
+``gate_off_frac`` is 0.4 — the mask just comes out the same). Ambiguity A3 is
+therefore covered behaviorally instead, by
+``test_gate_centered_logits_changes_the_update_when_the_readings_disagree``,
+which builds the regime where the two readings disagree. Adding a scenario here
+cannot fix it: the committed fixture is pre-merge evidence and this tool refuses
+to overwrite it.
 
 Scenario configs are plain :class:`AlgoConfig` kwargs; pre-merge a small
 adapter mapped them onto the two old constructors and asserted that every

@@ -187,6 +187,82 @@ def test_grad_norm_is_reported_at_every_theta():
         assert stats.extra["grad_norm"] > 0.0
 
 
+# ---- the gate's logit source (paper ambiguity A3) ----
+
+
+def _policy_with_logit_offset(offset: float, seed: int = 11) -> MLPSharedActorCritic:
+    """A policy whose logits are shifted by ``offset`` — the mean moves, the shape does not.
+
+    Adding a constant to the policy head's bias is a pure gauge move: softmax is
+    invariant to it, so the mean-CENTERED logits are untouched while every RAW
+    logit moves. That is exactly the axis the two readings of ambiguity A3
+    disagree along, and nothing else about the update changes with it.
+    """
+    policy = _policy(seed=seed)
+    with torch.no_grad():
+        policy.policy_head.bias.add_(offset)
+    return policy
+
+
+def _ach_step_at_offset(offset: float, *, gate_centered: bool):
+    """One ACH step at the shipped ``l_th``; return (stats, the stepped policy)."""
+    policy = _policy_with_logit_offset(offset)
+    rule = NNActorCriticUpdate(
+        policy,
+        AlgoConfig(theta=1.0, l_th=2.0, learning_rate=1e-3, gate_centered_logits=gate_centered),
+    )
+    return rule.step(_batch()), policy
+
+
+def test_gate_centered_logits_changes_the_update_when_the_readings_disagree():
+    """A3 coverage the golden fixture cannot give: the gate's logit source matters.
+
+    Measured 2026-07-30: all six fixture scenarios reproduce **bit for bit** with
+    ``gate_centered_logits=True``, even under exact equality, so
+    ``tools/gen_nn_golden.py --check`` and the golden test are both blind to which
+    logit the gate thresholds. Their logits simply sit far inside ±l_th once the
+    mean is subtracted — not because the gate is inert (``gate_off_frac`` is 0.4
+    there). Regenerating the fixture is not the fix: it is pre-merge evidence and
+    the generator refuses to overwrite it. So the coverage is behavioral, here.
+
+    The knob is load-bearing (AGENTS.md D4 makes the one-sided gate the defining
+    piece of the ACH loss; ``docs/paper_spec_ach.md`` records that the paper states
+    the CENTERED reading while the repo ships the raw one, coherent only because
+    the torso LayerNorm bounds the feature scale). A change that flipped it must
+    not pass silently.
+
+    Both halves are asserted, because the pair is what localizes the fixture's
+    blind spot rather than just working around it:
+
+      - at offset 0 (the fixture's regime) the two readings agree exactly, so the
+        fixture's blindness is a property of its logit scale, not of ``l_th``;
+      - at offset +3 every raw logit is above ``l_th`` while the centered ones are
+        near zero, so a positive-advantage sample is blocked raw and allowed
+        centered — and the gate rate, the loss and the parameters all move.
+    """
+    agree_raw, agree_pol = _ach_step_at_offset(0.0, gate_centered=False)
+    agree_centered, agree_pol_c = _ach_step_at_offset(0.0, gate_centered=True)
+    assert agree_raw.extra["gate_off_frac"] == agree_centered.extra["gate_off_frac"]
+    assert agree_raw.policy_loss == agree_centered.policy_loss
+    for (_, a), (_, b) in zip(
+        agree_pol.named_parameters(), agree_pol_c.named_parameters(), strict=True
+    ):
+        assert torch.equal(a, b), "offset 0 is the fixture's regime: the readings must agree"
+
+    raw, raw_pol = _ach_step_at_offset(3.0, gate_centered=False)
+    centered, centered_pol = _ach_step_at_offset(3.0, gate_centered=True)
+    # The masks themselves differ, and in the direction the construction predicts:
+    # with the logit mean above zero the RAW threshold is the stricter one.
+    assert raw.extra["gate_off_frac"] > centered.extra["gate_off_frac"]
+    assert raw.policy_loss != pytest.approx(centered.policy_loss, rel=1e-4)
+    assert any(
+        not torch.equal(a, b)
+        for (_, a), (_, b) in zip(
+            raw_pol.named_parameters(), centered_pol.named_parameters(), strict=True
+        )
+    ), "a different gate mask must reach the parameters"
+
+
 # ---- per-term gradient probe (debug telemetry for mixed-theta runs) ----
 
 
