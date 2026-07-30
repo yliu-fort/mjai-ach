@@ -5,8 +5,12 @@
 >
 > 论文：Fu et al., *Actor-Critic Policy Optimization in a Large-Scale
 > Imperfect-Information Game*, ICLR 2022, OpenReview `DTXZqTNV5nW`。
-> 本地存档：`docs/ach_paper.pdf`（经 Internet Archive 快照取得；
-> OpenReview 原链有反爬验证），全文文本 `docs/ach_paper_fulltext.txt`（28 页）。
+> 取用方式（2026-07-30 复核）：`docs/ach_paper.pdf` / `docs/ach_paper_fulltext.txt`
+> **已不在工作区**（从未提交，磁盘清理后丢失）——引用它们的说明作废。OpenReview 直链
+> 现返回 **403**（`curl` 带 UA 与 Referer 均无效）。可用的路径是 Internet Archive 快照
+> `https://web.archive.org/web/2022/https://openreview.net/pdf?id=DTXZqTNV5nW`
+> （1.3 MB，28 页，`pypdf` 可抽全文）；作者的 ICLR 讲稿
+> `https://iclr.cc/media/iclr-2022/Slides/6627.pdf` 第 8 页也完整给出了定理 1。
 > 下文页码 = PDF 页码（1-based）。
 
 ---
@@ -22,8 +26,43 @@
 - policy 损失（Eq. 2）：对**采样到的状态** s，向目标
   `y(a|s;θ_{t−1}) + (1/M)Σ_i 1{s∈τ_i} A^{π_t}(s,a)` 做 MSE 回归；
   未采样状态目标增量为 0。
-- 定理 1：NW-CFR ≈ 加权 CFR + Hedge，平均策略 exploitability 上界
-  `ε ≤ |S|Δ√(ln|A|/(2T)) + ΔΣ_s (w_h−w_l)/w_h`（p5, Eq. 3）。
+- 定义 1（p5）：**加权 CFR** = 原始 CFR，但瞬时反事实 regret `r^c_t(s,a)` 乘一个权重
+  `w_t(s) > 0`，且要求 `Σ_{t=0}^∞ w_t(s) = ∞`。原始 CFR 即 `w_t(s) = 1.0` 的特例。
+- **定理 1（p5, Eq. 3）**：当 `w_t(s) = f^{μ_t}_p(s) > 0`（`f^{μ_t}_p(s)` = 在行为策略
+  `μ_t` 下到达 s 的概率）、采样足够、且 `y(a|s;θ_t)` 足够接近 `R^a_t(s,a)` 时，
+  NW-CFR ≡ 加权 CFR + Hedge。进一步，若
+  `η(s) = √(8ln|A(s)| / ([w_h(s)]²Δ²(s)T))` 且
+  **`w_t(s) = f^{μ_t}_p(s) ∈ [w_l(s), w_h(s)] ⊂ (0,1]`，`t = 1,…,T`**，
+  则**平均策略** `π̄_p(a|s) = Σ_t[f^{π_t}_p(s)π_t(a|s)] / Σ_t f^{π_t}_p(s)` 满足
+
+  ```
+  ε ≤ |S|Δ√(ln|A|/(2T))  +  Δ Σ_{s∈S} (w_h(s) − w_l(s)) / w_h(s)
+  ```
+
+  > ⚠️ **`w_h`/`w_l` 的口径（2026-07-30 修正）**：二者**带自变量 `s`**，是**每个信息态
+  > 自己的权重在 `t = 1…T` 上的上下界**，求和号再跨信息态。所以第二项度量的是
+  > **每一行的权重在迭代之间漂移了多少**（时间跨度），**不是** ρ 在信息态之间的分布跨度。
+  > 本文档此前转录成 `ΔΣ_s (w_h−w_l)/w_h`、漏掉 `(s)`，
+  > `docs/liars_residual_floor.md` §8.12/§10.0 据此把它读成"跨信息态权重跨度"——
+  > 那个读法错了，已在 `docs/liars_operator_floor.md` 更正。
+- 论文自己的解读（p5 定理 1 下方原文）：第一项以 `O(T^{-1/2})` 收敛到 0，第二项是
+  **`O(1)`**，由"权重归一化范围之和"加权；并且**"可以通过收紧 `f^{μ_t}_p(s)` 的范围把
+  第二项减到任意小，这一点在附录 D 里用实验证明"**。
+- **推论 1（p23, C.2 证明）**：若每个玩家的行为策略 `μ_{p,k}` **在迭代之间恒定**，则任何
+  状态的到达概率 `f^{μ_k}_p(s)` 也恒定，记 `= w(s)`，于是 `R^a_{t−1} = w(s)·R^c_{t−1}`，
+  Hedge 的 `η(s)w(s)` 可并成新的 `η'(s) = √(8ln|A(s)|/(Δ²(s)T))`；此时
+  **`w_l(s) = w_h(s)`，第二项消失**，恢复 CFR+Hedge 的界 `ε ≤ |S|Δ√(ln|A|/(2T))`（Eq. 28）。
+- **附录 D（p23–24，Figure 8）**：论文自己在 **Kuhn / Leduc / Liar's Dice** 上实例化了几种
+  加权 CFR，只改 `μ_{p,t}`（`w_t(s)` 只依赖它）。**该加权 CFR 每次迭代遍历整棵博弈树**，
+  `μ_{p,t}` **仅**用来算 `f^{μ_t}_p(s)`。臂：`CFR(Hedge)`（`w=1`）、`Uniform`
+  （`μ_{p,t}` = 均匀策略，**平稳**）、`Current`（`μ_{p,t} = π_{p,t}`，**即 ACH**）、
+  `Current(x)`（`μ = x·Uniform + (1−x)·π_t`）。结论原文：平稳 `μ` 诱导的加权 CFR
+  **与 CFR(Hedge) 同速收敛**（"Corollary 1 is verified on the three small benchmarks"）；
+  `Current(0.5)` **仍与 CFR(Hedge) 相当**。exploitability 按**平均策略**报。
+- **附录 E（p24）**：ACH **有意**不用平稳行为策略——"We do not use an additional
+  time-invariant behavioral policy for sampling actions. Instead, we use the current
+  policy `π_t`, i.e., `μ_{p,t} = π_{p,t}`"，理由是这样同一批样本能同时训练 value net 和
+  policy net。**即 ACH 用工程上的便利换掉了推论 1 的前提。**
 
 ### 1.2 ACH — Algorithm 2 + Eq. 29（p24，复现的真正对象）
 
