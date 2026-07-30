@@ -535,7 +535,7 @@ Training Steps
 2
 4
 6
-Average Scores 
+Average Scores
 Lost
 PPO
 RPG
@@ -1227,7 +1227,7 @@ i	=	1-i
 Is	Kong?
 Pi		discards	a	tile
 Pi		selects	a	legal	action
-Is	Concealed-Kong	
+Is	Concealed-Kong
 or	Add-Kong?
 yes
 yes
