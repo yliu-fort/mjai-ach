@@ -146,14 +146,30 @@ def run(
     window_start = 0
     buf: list[tuple[float, float, float, float]] = []
     collapse_updates = 0
+    diverged_at: int | None = None
+    # Running (uniform) average policy: ACH's O(T^-1/2) guarantee is about the
+    # AVERAGE strategy, not the current one (AGENTS.md D16), so a run whose last
+    # iterate orbits can still be converging in the sense the theorem states.
+    # Tracked here because the surrogate is where it costs nothing; the pipeline
+    # only has the tracker enabled on Kuhn.
+    pi_sum = np.zeros(3, dtype=np.float64)
     for t in range(updates):
+        if not np.isfinite(y).all():
+            # The same death the pipeline dies (mjai.agents.nonfinite:
+            # NonFiniteNetworkError, formerly a bare torch.multinomial error).
+            # Reported rather than raised: a sweep wants "this arm diverged at
+            # update N", not a traceback that kills the other arms.
+            diverged_at = t
+            break
         pi = softmax(y)
         expl = exploitability(m_true, pi)
         buf.append((expl, tv_to_nash(pi), float(y.max() - y.min()), float(pi.max())))
         collapse_updates += int(pi.max() > 0.9)
+        pi_sum += pi
         y, v, stats = sampled_step(y, v, m, params, rng)
         if (t + 1) in checkpoints:
             arr = np.asarray(buf[window_start:])
+            pi_avg = pi_sum / (t + 1)
             rows.append(
                 {
                     "updates": float(t + 1),
@@ -167,6 +183,9 @@ def run(
                     "gate_off_frac": stats["gate_off_frac"],
                     "iw_max": stats["iw_max"],
                     "adv_std": stats["adv_std"],
+                    # Average policy over ALL updates so far (not the window).
+                    "expl_avg_policy": exploitability(m_true, pi_avg),
+                    "tv_avg_policy": tv_to_nash(pi_avg),
                 }
             )
             window_start = len(buf)
@@ -175,8 +194,9 @@ def run(
         "seed": seed,
         "updates": updates,
         "rows": rows,
-        "final_pi": softmax(y).tolist(),
+        "final_pi": softmax(y).tolist() if diverged_at is None else [float("nan")] * 3,
         "collapse_frac_all": collapse_updates / max(1, updates),
+        "diverged_at": diverged_at,
     }
 
 

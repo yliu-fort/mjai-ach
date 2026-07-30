@@ -21,6 +21,7 @@
 > | **结构** | 即使修掉放大，paper 超参下**精确无噪声算子也不收敛**：旋转 6.66e-3/步 vs 收缩 1.9e-6/步（比 2.9e-4），振幅锁在盒壁 `spread → 2·l_th = 4` | §5（`tools/brps_operator.py`） |
 > | **界限** | β 和 `l_th` 在 BRPS 上**都救不了 RL**（NashConv 66.7 / 53.3），但在精确算子里 β=0.1 → 0.023、`l_th=log10/2` → 0.002 —— 两者治的是 §5 的病，不是 §2 的病 | §5–§6 |
 > | **范围** | 8 个游戏里 BRPS 的首步位移 19.65 是第二名（leduc 5.11）的 4 倍；这是 D8 里唯一支付量级 ±50 的博弈 | §7 |
+> | **可调** | **能调掉"不收敛"，调不出"收敛到 Nash"**：单靠 `eta=0.02`（论文自带旋钮）就从 NashConv 66.7 → 3.76 且 3 seeds 无崩溃；加 batch 1024、1e8 步后 last iterate 0.14。但平均策略停在 0.12 的 QRE 偏置上，加预算无效 | §9 |
 >
 > 度量口径：exploitability = NashConv/2（memory `exploitability-vs-nashconv-units`）；BRPS 是
 > 同时行动博弈，只能用 `eval/nash_conv`（`src/mjai/eval/nash.py:289`）。NashConv = 2·max_a A_a，
@@ -276,15 +277,99 @@ BRPS 是 D8 里唯一支付量级 ±50 的博弈，D₁ 是第二名的 4 倍、
    `configs/exp/brps_ach_mlp_league.yaml` 报告的是一个死策略的数字。本文不改它们，但任何引用
    BRPS MLP 结果的地方都应先读本文。
 
-## 9. 复现
+## 9. 能不能靠调参把 BRPS 训到收敛？
+
+§6 的臂全是**单因子**臂 —— 修放大的没修动力学，修动力学的没修放大 —— 所以"存不存在一组现有旋钮
+让它收敛"当时仍是开放的。本节回答它。
+
+### 9.1 先造一个便宜且可信的代理
+
+MLP 的放大近似**各向同性**（两个头的参数梯度正交，`NTK[a,b] = 0`（a≠b）除去 torso 的小交叉项，
+所以 NTK ≈ `(‖f‖²+1)·I`），于是整个 MLP 臂 = **表格采样臂在 `lr_eff = lr·(hidden+3)`**。先验证再
+使用：代理在 `lr_eff` 上复现了 §6 四个已测 RL 臂的**顺序与量级**（代理 expl 15.06 / 3.91 / 2.18 /
+2.05 对 RL 的 NashConv/2 = 33.4 / 3.2 / 2.4 / 1.5），且同样在 1/3 seed 上发散成非有限。于是搜索在
+代理里做（`tools/brps_tuning_sweep.py`，秒级），入围者再回 RL 确认。
+
+### 9.2 关键旋钮是 η，不是 β 也不是 l_th
+
+`eta`（论文的 hedge coefficient η(s)，p27 Table 7 = 1.0）**只缩放策略项**，所以它是唯一能改变
+`β/(η·|A|)` 这个 §5 的支配比值、同时**不削弱**熵收缩的旋钮 —— 而 `learning_rate` 会把两者一起
+按比例缩小。代理 1e7 步、3 seeds、24 臂（`runs/brps_tune/fine.json`）：
+
+| η | β=0.003 | β=0.01 | β=0.1 | 备注 |
+|---|---|---|---|---|
+| **1（论文值）** | 25.0（2/3 发散） | 25.0（2/3 发散） | 15.0（1/3 发散） | **任何 β 都救不了** |
+| 0.1 | 3.59 | 3.57 | 3.53 | 活；对 β 几乎不敏感 |
+| 0.02 | 3.00 | **2.03** | 1.65 | |
+| 0.005 | **0.31** | 0.55 | 4.53 | β 过大开始反弹（偏置 ∝ β/η） |
+
+`l_th=1.1513`（恰好装下 NE 的最紧盒子）在 η ≤ 0.1 时把 last iterate 再压 2–3 倍（3.57 → 1.17，
+2.03 → 0.82），但**代价是把轨道中心也偏置了**：平均策略反而从 0.12 变差到 0.83。批量（在**相同
+env-step 预算**下，`runs/brps_tune/batch_axis.json`）：η=0.02、β=0.01 时 64 → 2.07、256 → 0.39、
+1024 → **0.17**。
+
+### 9.3 RL 确认（1e6 env-steps，3 seeds，`runs/brps_tune_rl/`）
+
+`expl_AVG` = 逐 eval 点均匀平均策略的 exploitability（D16 的对象；`track_average_policy` 对同时
+行动博弈会**明确拒绝** —— `UnsupportedGameError` —— 所以这里是事后算的）。
+
+| arm | 改动 | RL expl（末 20%） | 代理（同预算） | RL expl_AVG | π_max | entropy | 崩溃 |
+|---|---|---|---|---|---|---|---|
+| paper | — | **33.3** | 25 | 32.9 | 1.000 | 0.000 | 1/3 |
+| eta0.1 | `eta=0.1` | 3.57 | 3.57 | 0.257 | 0.667 | 0.839 | 0 |
+| eta0.02 | `eta=0.02` | 1.88 | 2.07 | **0.128** | 0.651 | 0.797 | 0 |
+| eta0.02_lth1.15 | `+l_th=1.1513` | **0.71** | 0.82 | 0.990 | 0.728 | 0.745 | 0 |
+| eta0.005_b0.003 | `eta=0.005, β=0.003` | 0.54 | 0.28 | 0.173 | 0.639 | 0.816 | 0 |
+| eta0.02_b1024 | `+target_samples=1024` | 2.03 | 2.07 | 0.441 | 0.653 | 0.812 | 0 |
+
+**六个臂全部落在代理预测的 2 倍以内**（末行看着背离，其实是预算错配：1e6 步在 batch 1024 下只有
+976 次更新，代理在同预算给 2.07 —— 它要到 ≥1e7 才发挥）。
+
+### 9.4 结论：能训"活"，能压到 0.1 量级，但收敛的极限不是 Nash
+
+`tools/brps_noise.py` 跨三个数量级（η=0.02，2 seeds）：
+
+| 预算 | batch=1024 last iterate | batch=64 last iterate | 平均策略 |
+|---|---|---|---|
+| 1e6 | 2.07 / 2.27 | 1.94 | 0.42 |
+| 1e7 | 0.46 / 0.58 | 2.05（**不再下降**） | 0.128 |
+| 1e8 | **0.14 / 0.14** | — | 0.119（**不再下降**） |
+
+三条都要说：
+
+1. **能。** 只用 `eta` 一个**论文自带**的旋钮（不触发 `ACHFidelityWarning` —— 会触发的是
+   `iw_clip`/`normalize_advantages`/`adam`/`n_epochs`/`separate_critic`），就把"前 1000 步死在纯
+   策略、NashConv 50–100、1/3 崩溃"变成"稳定训练、3 seeds 无崩溃、exploitability 1.9"；再加
+   batch 与 β 的微调，1e8 步下 last iterate 到 **0.14**（NashConv 0.28）—— 比论文臂好 **240 倍**。
+2. **但 last iterate 只在大 batch 下持续下降**（1e6→1e8 每十倍预算约 ×1/3，≈ `T^-1/2`），
+   batch 64 停在噪声地板 ~2.0。常数学习率（论文 H.3 明写）+ 无界 `1/π_old` 决定了这一点：管线
+   没有 lr 退火，last iterate 只能停在噪声地板上，把 η 再降会同时把时间常数拉长。
+3. **平均策略很快到 0.12 之后就不动了**（1e7 的 0.128 → 1e8 的 0.119）。它收敛的是**轨道中心**，
+   而中心被 β 与 `l_th` 的 QRE 位移推离 Nash —— 所以这 0.12 是偏置，不是方差，加预算无效，只能靠
+   退火 β（管线不支持）或更小的 β 换更大的方差来换。
+
+**推荐配方**（若目的是"BRPS 上有一条可用的 ACH 曲线"）：`eta: 0.02`、`target_samples: 1024`、
+`episodes_per_round: 2000`，其余保持论文值，预算 ≥1e7；报告口径用平均策略或明确标注 last iterate
+的振幅（`expl_max` 与 `expl_tail` 一起给）。**不推荐**把 `l_th` 收紧到 1.1513：它让 last iterate
+好看，却把平均策略变差 8 倍。
+
+一句话：**"不收敛"是可以调掉的，`eta` 是那个旋钮；但"收敛到 Nash"调不出来 —— 现有旋钮下的极限是
+exploitability ≈ 0.12–0.14，其中平均策略那一份是 β/l_th 的结构性偏置，不是预算问题。**
+
+## 10. 复现
 
 ```bash
 uv run python -m tools.brps_operator --iters 156000                      # §5 精确算子 + 盒子闭式
 uv run python -m tools.brps_noise --updates 15625 --seeds 0 1 2          # §3 采样算子
 uv run python -m tools.brps_logit_step                                   # §2 放大倍数表
+uv run python -m tools.brps_tuning_sweep --env-steps 10000000 \
+    --eta 1.0 0.1 0.02 0.005 --beta 0.003 0.01 0.1 --batch 64 1024       # §9 调参扫描
 uv run python tools/ab_factor_probe.py --config brps_ach_mlp_mirror \
     --label paper --overrides '{}' --seed 0 --root runs/brps_probe \
     --total-env-steps 300000 --eval-every 5000                           # §6 RL 臂
+uv run python tools/ab_factor_probe.py --config brps_ach_mlp_mirror \
+    --label eta0.02 --overrides '{"eta":0.02}' --seed 0 \
+    --root runs/brps_tune_rl --total-env-steps 1000000 --eval-every 2000 # §9.3 RL 确认
 ```
 
 判别臂的两个 yaml：`configs/exp/brps_ach_mlp_mirror_lr_matched.yaml`（放大匹配的 lr）、
