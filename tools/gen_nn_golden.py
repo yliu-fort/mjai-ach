@@ -15,23 +15,50 @@ evidence. Verify the current code still reproduces it::
     uv run python tools/gen_nn_golden.py --check   # must print OK
 
 The check requires every recorded parameter tensor and every recorded stat to
-match exactly; telemetry keys the fixture does not carry are allowed to be
-added (the merge did exactly that — ``grad_norm`` became available on the PPO
-arms, which the old PPO endpoint never computed). Removing or changing a
-recorded value fails.
+match **to within platform float32 noise** (:data:`GOLDEN_RTOL`); telemetry keys
+the fixture does not carry are allowed to be added (the merge did exactly that —
+``grad_norm`` became available on the PPO arms, which the old PPO endpoint never
+computed). Removing or changing a recorded value fails.
+
+Why a tolerance and not equality (AGENTS.md D19). Storage is exact — the values
+are Python doubles, which round-trip float32 losslessly — but *recomputation* is
+not: the same float32 graph reduced by a different BLAS kernel lands a few ULP
+away. Measured 2026-07-30 on macOS/CPU torch 2.x against this fixture (generated
+on another platform): 9-20 of each scenario's 26-41 recorded values differ, worst
+case **4.43 float32 ULP** (5.3e-7 relative) on ``explained_variance``, a ratio of
+variances and so the most cancellation-prone number recorded; parameters, which
+are single-reduction values, stay inside 2.09 ULP. Equality therefore tested the
+host's BLAS, not the update rule.
+
+What the tolerance still catches, measured on ``ach_shipped_layernorm`` as the
+worst-case relative deviation of any recorded value — all 100x to 1e5x above
+:data:`GOLDEN_RTOL`::
+
+    l_th 2.0 -> 0.5             2.1e+0     loss_centered_logits=True   1.1e+0
+    eta +0.1%                   1.0e-3     value_coef +0.1%            6.0e-4
+    learning_rate +0.1%         1.0e-4
+
+What it does NOT catch, also measured: ``entropy_coef`` 0.01 -> 0.0101 is
+invisible (0 differences), because the entropy term's share of a two-step
+parameter change is ~1e-6 relative — under the tolerance. The fixture pins the
+policy term's *structure* (which is what licenses the theta merge, AGENTS.md
+D11), not the calibration of a coefficient. Also blind, and this one is a
+pre-existing coverage gap rather than a consequence of the tolerance:
+``gate_centered_logits=True`` reproduces every scenario bit for bit, because the
+gate mask happens to come out identical under both readings of ambiguity A3.
+``test_golden_comparison_rejects_an_algorithmic_change`` pins the comparator's
+teeth directly instead of relying on any of these.
 
 Scenario configs are plain :class:`AlgoConfig` kwargs; pre-merge a small
 adapter mapped them onto the two old constructors and asserted that every
 knob that did not exist yet carried the value the old code hardcoded.
-
-All tensors are stored as Python floats (doubles), which round-trip float32
-exactly, so equality checks are exact rather than tolerance-based.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -41,6 +68,19 @@ import torch
 
 REPO = Path(__file__).resolve().parents[1]
 OUT_PATH = REPO / "tests" / "unit" / "data" / "nn_updates_golden.json"
+
+# Comparison tolerance for the golden check (module docstring; AGENTS.md D19).
+# 1e-5 relative is ~84 float32 ULP: ~19x the worst platform disagreement measured
+# against this fixture (4.43 ULP) and ~100x below the smallest structural change
+# it exists to catch (learning_rate +0.1% -> 1.0e-4). Not tightened further
+# because the 4.43 ULP is one host's BLAS; a GPU or a different vendor library
+# can reduce in yet another order, and this check runs wherever CI runs.
+# The absolute floor only bites on values the fixture records as exactly 0
+# (clip_frac / gate_off_frac at an endpoint), where a relative test is undefined;
+# it sits below one ULP of the parameter magnitudes (~1e-8), so parameters are
+# effectively relative-only.
+GOLDEN_RTOL = 1e-5
+GOLDEN_ATOL = 1e-9
 
 # Shared ACH knobs: the shipped reproduction defaults (configs/exp/*_ach_mlp_*.yaml
 # -- SGD lr=1e-3, alpha=2.0 <=> value_coef=1.0, beta=1e-2, no grad clipping,
@@ -325,13 +365,96 @@ def build_fixture() -> dict[str, Any]:
     }
 
 
-def diff_against_committed(fixture: dict[str, Any], committed: dict[str, Any]) -> list[str]:
-    """Return human-readable differences; empty list means the fixture holds.
+def _mismatch(want: float, got: object) -> float | None:
+    """Relative deviation if ``got`` is outside tolerance, else None.
 
-    Every recorded parameter and stat must match exactly. Telemetry keys absent
-    from the committed fixture may be present in the fresh run (additive
-    observability is not a numerics change); the reverse is a failure.
+    ``None`` for a value that is absent (rather than 0.0) — a missing key is not
+    a numeric difference and is reported separately by the caller.
     """
+    if not isinstance(got, int | float):
+        return math.inf
+    if math.isclose(float(got), want, rel_tol=GOLDEN_RTOL, abs_tol=GOLDEN_ATOL):
+        return None
+    return abs(float(got) - want) / max(abs(want), 1e-30)
+
+
+def compare_expected(want: dict[str, Any], got: dict[str, Any], label: str = "") -> list[str]:
+    """Compare one scenario's recorded outputs against a fresh run.
+
+    Both arguments are the ``{"stats": [...], "params": {...}}`` shape — the
+    fixture's ``expected`` block and :func:`run_scenario`'s return value are the
+    same shape on purpose, so the ``--check`` CLI and
+    ``tests/unit/test_algos_nn_theta.py`` share ONE comparison. Two gates that
+    disagree about what "reproduces the fixture" means would let a numerics
+    change through whichever is looser (AGENTS.md §4 names both).
+
+    Returns human-readable differences; empty list means the fixture holds.
+    Telemetry keys absent from the fixture may be present in the fresh run
+    (additive observability is not a numerics change); the reverse is a failure.
+    """
+    prefix = f"{label} " if label else ""
+    diffs = _compare_stats(want["stats"], got["stats"], prefix)
+    diffs.extend(_compare_params(want["params"], got["params"], prefix))
+    return diffs
+
+
+def _compare_scalar(
+    label: str, key: str, want: float, got_row: dict[str, Any], prefix: str
+) -> list[str]:
+    """One recorded scalar: absent, or outside tolerance, or fine (empty list).
+
+    ``label`` is for the message, ``key`` is what to look up — they differ
+    because the message carries the step index and the ``extra.`` namespace.
+    """
+    if key not in got_row:
+        return [f"{prefix}{label}: missing from the fresh run"]
+    observed = got_row[key]
+    rel = _mismatch(want, observed)
+    if rel is None:
+        return []
+    return [f"{prefix}{label}: {want} != {observed} (rel {rel:.2e} > {GOLDEN_RTOL:.0e})"]
+
+
+def _compare_stats(
+    want_stats: list[dict[str, Any]], got_stats: list[dict[str, Any]], prefix: str
+) -> list[str]:
+    """Per-step :class:`UpdateStats`, including the nested ``extra`` telemetry."""
+    diffs: list[str] = []
+    for i, (a, b) in enumerate(zip(want_stats, got_stats, strict=True)):
+        for key, value in a.items():
+            if key == "extra":
+                for ek, ev in value.items():
+                    diffs.extend(_compare_scalar(f"step{i} extra.{ek}", ek, ev, b["extra"], prefix))
+            else:
+                diffs.extend(_compare_scalar(f"step{i} {key}", key, value, b, prefix))
+    return diffs
+
+
+def _compare_params(
+    want_params: dict[str, Any], got_params: dict[str, Any], prefix: str
+) -> list[str]:
+    """Post-step parameter tensors, elementwise at the same tolerance."""
+    diffs: list[str] = []
+    for pname, pvals in want_params.items():
+        if pname not in got_params:
+            diffs.append(f"{prefix}parameter {pname}: missing from the fresh run")
+            continue
+        a_arr = np.asarray(pvals, dtype=np.float64)
+        b_arr = np.asarray(got_params[pname], dtype=np.float64)
+        if a_arr.shape != b_arr.shape:
+            diffs.append(f"{prefix}parameter {pname}: shape {a_arr.shape} != {b_arr.shape}")
+            continue
+        if not np.allclose(b_arr, a_arr, rtol=GOLDEN_RTOL, atol=GOLDEN_ATOL):
+            rel = float((np.abs(b_arr - a_arr) / np.maximum(np.abs(a_arr), 1e-30)).max())
+            diffs.append(
+                f"{prefix}parameter {pname} differs after the update "
+                f"(max rel {rel:.2e} > {GOLDEN_RTOL:.0e})"
+            )
+    return diffs
+
+
+def diff_against_committed(fixture: dict[str, Any], committed: dict[str, Any]) -> list[str]:
+    """Scenario-by-scenario :func:`compare_expected` over the whole fixture."""
     diffs: list[str] = []
     fresh_by_name = {sc["name"]: sc for sc in fixture["scenarios"]}
     for want in committed["scenarios"]:
@@ -340,19 +463,7 @@ def diff_against_committed(fixture: dict[str, Any], committed: dict[str, Any]) -
         if got is None:
             diffs.append(f"{name}: scenario missing from the fresh run")
             continue
-        for i, (a, b) in enumerate(
-            zip(want["expected"]["stats"], got["expected"]["stats"], strict=True)
-        ):
-            for key, value in a.items():
-                if key == "extra":
-                    for ek, ev in value.items():
-                        if b["extra"].get(ek) != ev:
-                            diffs.append(f"{name} step{i} extra.{ek}: {ev} != {b['extra'].get(ek)}")
-                elif b.get(key) != value:
-                    diffs.append(f"{name} step{i} {key}: {value} != {b.get(key)}")
-        for pname, pvals in want["expected"]["params"].items():
-            if got["expected"]["params"].get(pname) != pvals:
-                diffs.append(f"{name}: parameter {pname} differs after the update")
+        diffs.extend(compare_expected(want["expected"], got["expected"], label=name))
     return diffs
 
 
