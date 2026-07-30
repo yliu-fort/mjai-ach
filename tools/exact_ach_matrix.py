@@ -62,6 +62,7 @@ def main() -> None:
     ap.add_argument("--eval-every", type=int, default=10_000)
     ap.add_argument("--arms", nargs="*", default=list(ARMS))
     ap.add_argument("--lr", type=float, default=None, help="override lr on every arm")
+    ap.add_argument("--track-average", action="store_true")
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
 
@@ -76,13 +77,20 @@ def main() -> None:
             params = AchParams(**{**params.__dict__, "lr": args.lr})
         print(f"\n=== {args.game} / {name}: {params}", flush=True)
         t = time.time()
-        res = run(args.game, params, iters=args.iters, eval_every=args.eval_every)
+        res = run(
+            args.game,
+            params,
+            iters=args.iters,
+            eval_every=args.eval_every,
+            track_average=args.track_average,
+        )
         results[name] = {
             "params": res.params,
             "iters": res.iters,
             "final": res.final_exploitability,
             "best": res.best_exploitability,
             "curve": res.curve,
+            "avg_curve": res.avg_curve,
             "telemetry": res.telemetry,
             "seconds": res.seconds,
         }

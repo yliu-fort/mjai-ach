@@ -50,6 +50,7 @@ from pathlib import Path
 
 import torch
 
+from mjai.eval.average_policy import RealizationAverage
 from mjai.games.loader import load_game
 from mjai.seqform.plan import nash_conv, realization_plans
 from mjai.seqform.tree import SequenceForm, build_sequence_form
@@ -243,6 +244,12 @@ class RunResult:
     best_exploitability: float = math.nan
     telemetry: dict[str, float] = field(default_factory=dict)
     seconds: float = 0.0
+    # ``--track-average``: (iter, uniform-average expl, linear-average expl).
+    # The CURRENT policy is what ``curve`` holds and what the paper plots; the
+    # AVERAGE is what Theorem 1's O(T^-1/2) bound is actually about (AGENTS.md
+    # D16), so a current-iterate limit cycle says nothing about the theorem
+    # until this column exists.
+    avg_curve: list[tuple[int, float, float]] = field(default_factory=list)
 
 
 def run(
@@ -252,12 +259,22 @@ def run(
     iters: int,
     eval_every: int,
     verbose: bool = True,
+    track_average: bool = False,
 ) -> RunResult:
     spec = load_game(game)
     sf = build_sequence_form(spec)
     engine = ExactAdvantage(sf)
     logits = torch.zeros(sf.num_infosets, sf.max_actions, dtype=torch.float64)
     divisor = float(spec.num_players) if spec.num_players == 2 and spec.is_zero_sum else 1.0
+    # Averaging in REALIZATION-PLAN space, not behaviour space -- averaging
+    # behaviour probabilities is not the average strategy and does not obey the
+    # bound. Every iterate is folded in, not just the eval points: the average
+    # of 20 checkpoints is a different object from the average of 200k iterates.
+    trackers: dict[str, RealizationAverage] = (
+        {"uniform": RealizationAverage(sf), "linear": RealizationAverage(sf)}
+        if track_average
+        else {}
+    )
 
     result = RunResult(
         game=game,
@@ -281,11 +298,26 @@ def run(
             expl = float(nash_conv(sf, pi, validate=False)) / divisor
             best = min(best, expl)
             result.curve.append((it, expl))
+            avg = ""
+            if trackers and trackers["uniform"].num_updates:
+                scores = [
+                    float(nash_conv(sf, tr.average_behavior(), validate=False)) / divisor
+                    for tr in (trackers["uniform"], trackers["linear"])
+                ]
+                result.avg_curve.append((it, scores[0], scores[1]))
+                avg = f"avg_u {scores[0]:.6f} avg_lin {scores[1]:.6f} "
             if verbose:
                 extra = " ".join(f"{k}={v:.3f}" for k, v in telemetry.items())
-                print(f"  iter {it:>8} expl {expl:.6f}  {extra}", flush=True)
+                print(f"  iter {it:>8} expl {expl:.6f}  {avg}{extra}", flush=True)
         if it == iters:
             break
+        if trackers:
+            # The PRE-update iterate, weighted t for the linear average -- the
+            # off-by-one RealizationAverage.update warns about (0.6% relative on
+            # Kuhn after 50 CFR+ iterations, i.e. noise-sized and plot-visible).
+            pre = masked_softmax(sf, logits)
+            trackers["uniform"].update(pre)
+            trackers["linear"].update(pre, weight=float(it + 1))
         logits, telemetry = ach_step(sf, logits, engine, params)
     result.final_exploitability = result.curve[-1][1]
     result.best_exploitability = best
@@ -305,7 +337,8 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--no-gate", action="store_true")
     ap.add_argument("--gate-centered", action="store_true")
-    ap.add_argument("--weighting", choices=("reach", "uniform"), default="reach")
+    ap.add_argument("--weighting", default="reach", help="reach | uniform | rho:K")
+    ap.add_argument("--track-average", action="store_true", help="also score the AVERAGE strategy")
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
 
@@ -319,7 +352,13 @@ def main() -> None:
         weighting=args.weighting,
     )
     print(f"exact ACH on {args.game}: {params}")
-    res = run(args.game, params, iters=args.iters, eval_every=args.eval_every)
+    res = run(
+        args.game,
+        params,
+        iters=args.iters,
+        eval_every=args.eval_every,
+        track_average=args.track_average,
+    )
     print(
         f"final expl {res.final_exploitability:.6f}  best {res.best_exploitability:.6f}"
         f"  ({res.seconds:.1f}s)"
