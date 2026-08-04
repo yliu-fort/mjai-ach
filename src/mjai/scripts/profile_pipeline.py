@@ -10,14 +10,21 @@ Answers the three questions worth asking before optimizing anything here:
      single learner update.
   3. **Is the device the right one?** ``--device cuda`` vs ``--device cpu``.
      For Phase-1-sized games the rollout asks the policy for ONE decision at a
-     time, so a small MLP forward is launch-and-sync overhead: measured 2809
-     env-steps/s on CPU vs 441 on CUDA for Liar's Dice.
+     time, so a small MLP forward is launch-and-sync overhead. Liar's Dice,
+     MLP mirror arm, CPU vs CUDA env-steps/s:
+
+       2809 vs 441   (original reference box, unrecorded hardware)
+       4084 vs 1747  (GRID P40-12Q + 8 vCPU, torch 2.5.1+cu121, 2026-08-04)
+
+     Absolute numbers are machine-specific and only comparable within a row;
+     the CPU-beats-GPU conclusion holds on both.
 
 The legacy cProfile view is still available with ``--cprofile``.
 
 Usage::
 
     uv run python -m mjai.scripts.profile_pipeline --game liars_dice1 --device cuda
+    uv run python -m mjai.scripts.profile_pipeline --config configs/exp/kuhn_ach_mlp_league.yaml
     uv run python -m mjai.scripts.profile_pipeline --game kuhn --cprofile --steps 50
 """
 
@@ -34,8 +41,8 @@ from typing import Any
 DEFAULT_CONFIG_TEMPLATE = "configs/exp/{game}_ach_mlp_mirror.yaml"
 
 
-def _load_config(game: str, device: str) -> Any:
-    """The game's MLP mirror arm, pinned to ``device``."""
+def _load_config(game: str, device: str, config_path: str | None = None) -> Any:
+    """``config_path`` if given, else the game's MLP mirror arm; pinned to ``device``."""
     import dataclasses
 
     import yaml
@@ -43,15 +50,25 @@ def _load_config(game: str, device: str) -> Any:
     from mjai.scripts.experiment import ExperimentConfig
 
     repo = Path(__file__).resolve().parents[3]
-    path = repo / DEFAULT_CONFIG_TEMPLATE.format(game=game)
+    path = Path(config_path) if config_path else repo / DEFAULT_CONFIG_TEMPLATE.format(game=game)
     if not path.is_file():
-        raise FileNotFoundError(f"no MLP config for {game!r}: {path}")
+        raise FileNotFoundError(f"no config at {path}")
     cfg = ExperimentConfig(**yaml.safe_load(path.read_text(encoding="utf-8")))
     return dataclasses.replace(cfg, device=device, seed=0)
 
 
-def _build(game: str, device: str) -> tuple[Any, Any, Any]:
-    """(trainer, policy, spec) for ``game`` on ``device``."""
+def _build(
+    game: str, device: str, config_path: str | None = None
+) -> tuple[Any, Any, Any, dict[int, Any]]:
+    """``(trainer, policy, cfg, rules_by_learner)`` for ``game`` on ``device``.
+
+    A controller may collect for several learners (the league's main + its two
+    exploiters), and a gradient step is only valid on the policy that generated
+    the batch — so each learner needs its OWN rule (see ``Trainer`` and
+    ``scripts/experiment.py``). ``rules_by_learner`` is keyed by ``id()`` to
+    match the Trainer's identity-based dispatch; it lets this module route a
+    part to its owner without reaching into ``Trainer`` internals.
+    """
     from mjai.algos.controller import Trainer
     from mjai.games.loader import load_game
     from mjai.scripts.experiment_build import (
@@ -60,12 +77,44 @@ def _build(game: str, device: str) -> tuple[Any, Any, Any]:
         build_update_rule,
     )
 
-    cfg = _load_config(game, device)
-    spec = load_game(game)
+    cfg = _load_config(game, device, config_path)
+    spec = load_game(cfg.game)
     policy = build_policy(spec, cfg, seed=0)
     rule = build_update_rule(policy, cfg, spec)
     controller = build_controller(spec, policy, cfg, rng=random.Random(0))
-    return Trainer(policy=policy, update_rule=rule, controller=controller), policy, cfg
+    extra_rules = [
+        build_update_rule(learner, cfg, spec)
+        for learner in controller.learners()
+        if learner is not policy
+    ]
+    trainer = Trainer(
+        policy=policy, update_rule=rule, controller=controller, extra_rules=extra_rules
+    )
+    rules_by_learner = {id(r.policy): r for r in (rule, *extra_rules)}
+    return trainer, policy, cfg, rules_by_learner
+
+
+def _apply_updates(collected: Any, rules_by_learner: dict[int, Any]) -> int:
+    """Update every part's own learner; returns the samples the updates consumed.
+
+    Mirrors ``Trainer.step``: one update per part, dispatched on the part's
+    learner identity, empty parts skipped. An unroutable part is a wiring bug,
+    not something to skip past (AGENTS.md §11: no silent fallback).
+    """
+    consumed = 0
+    for part in collected.parts:
+        if part.batch.size == 0:
+            continue  # a kept learner produced nothing this round
+        rule = rules_by_learner.get(id(part.learner))
+        if rule is None:
+            raise RuntimeError(
+                f"collected a part for learner {type(part.learner).__name__} "
+                f"(label={part.label!r}) with no update rule; _build did not cover "
+                "every controller.learners() entry"
+            )
+        rule.step(part.batch)
+        consumed += part.batch.size
+    return consumed
 
 
 def _sync(device: str) -> None:
@@ -75,30 +124,35 @@ def _sync(device: str) -> None:
         torch.cuda.synchronize()
 
 
-def profile_phases(game: str, device: str, rounds: int) -> dict[str, object]:
+def profile_phases(
+    game: str, device: str, rounds: int, config_path: str | None = None
+) -> dict[str, object]:
     """Wall-clock split across rollout / update / eval, synchronized per phase."""
     from mjai.eval.nash import evaluate_equilibrium
     from mjai.games.loader import load_game
 
-    trainer, policy, cfg = _build(game, device)
-    spec = load_game(game)
+    trainer, policy, cfg, rules = _build(game, device, config_path)
+    spec = load_game(cfg.game)
     trainer.step()  # warm up: CUDA context, allocator, autotune
     _sync(device)
 
     t_rollout = t_update = 0.0
-    samples = 0
+    env_steps = consumed = 0
     for _ in range(rounds):
         trainer.controller.set_learner(trainer.policy)
         _sync(device)
         t0 = time.perf_counter()
-        batch = trainer.controller.collect()
+        collected = trainer.controller.collect()
         _sync(device)
         t1 = time.perf_counter()
-        trainer.update_rule.step(batch)
+        consumed += _apply_updates(collected, rules)
         _sync(device)
         t_rollout += t1 - t0
         t_update += time.perf_counter() - t1
-        samples += batch.size
+        # The round's environment cost is every decision point played, including
+        # producers whose transitions were dropped from the parts. Summing part
+        # sizes instead would price the same simulation differently per mode.
+        env_steps += collected.sampled_steps
 
     evaluate_equilibrium(spec, policy, estimator=cfg.eval_estimator)  # warm the skeleton cache
     t0 = time.perf_counter()
@@ -111,13 +165,14 @@ def profile_phases(game: str, device: str, rounds: int) -> dict[str, object]:
     result = {
         "device": device,
         "rounds": rounds,
-        "samples": samples,
+        "env_steps": env_steps,
+        "samples_consumed": consumed,
         "rollout_s": t_rollout,
         "update_s": t_update,
         "eval_s_per_point": t_eval,
-        "env_steps_per_s": samples / train if train else 0.0,
+        "env_steps_per_s": env_steps / train if train else 0.0,
     }
-    print(f"PHASE SPLIT — {game} on {device}, {rounds} train rounds")
+    print(f"PHASE SPLIT — {cfg.game}/{cfg.algo}/{cfg.self_play_mode} on {device}, {rounds} rounds")
     print(
         f"  rollout        {t_rollout:8.3f}s  {t_rollout / train:6.1%}  "
         f"{t_rollout / rounds * 1e3:8.2f} ms/round"
@@ -126,7 +181,10 @@ def profile_phases(game: str, device: str, rounds: int) -> dict[str, object]:
         f"  learner update {t_update:8.3f}s  {t_update / train:6.1%}  "
         f"{t_update / rounds * 1e3:8.2f} ms/round"
     )
-    print(f"  -> {samples / train:.0f} env-steps/s")
+    print(f"  -> {env_steps / train:.0f} env-steps/s")
+    # Under a controller that drops a producer (the league dropping frozen
+    # opponents) fewer samples are trained on than were played; show both.
+    print(f"  env-steps played {env_steps}, samples trained on {consumed}")
     print(
         f"  one eval point {t_eval:8.3f}s  (estimator={cfg.eval_estimator}, "
         f"backend={cfg.eval_exact_backend})"
@@ -134,15 +192,35 @@ def profile_phases(game: str, device: str, rounds: int) -> dict[str, object]:
     return result
 
 
-def profile_ops(game: str, device: str, calls: int) -> dict[str, object]:
+def _main_learner_batch(collected: Any, policy: Any) -> Any:
+    """The Trainer policy's own share of ``collected``.
+
+    ``--ops`` profiles ``trainer.update_rule.step``, which owns exactly this
+    policy; feeding it another learner's part would profile an update nobody
+    performs. A round with no share for the main policy is reported, not
+    silently substituted (AGENTS.md §11).
+    """
+    for part in collected.parts:
+        if part.learner is policy and part.batch.size:
+            return part.batch
+    raise RuntimeError(
+        "collect() returned no non-empty part for the Trainer's own policy "
+        f"(parts={[p.label for p in collected.parts]}, "
+        f"sampled_steps={collected.sampled_steps}); cannot profile its update"
+    )
+
+
+def profile_ops(
+    game: str, device: str, calls: int, config_path: str | None = None
+) -> dict[str, object]:
     """Op / launch / memcpy accounting for one policy call and one update."""
     from torch.profiler import ProfilerActivity, profile
 
     from mjai.games.loader import load_game
 
-    trainer, policy, _cfg = _build(game, device)
-    spec = load_game(game)
-    batch = trainer.controller.collect()
+    trainer, policy, cfg, _rules = _build(game, device, config_path)
+    spec = load_game(cfg.game)
+    batch = _main_learner_batch(trainer.controller.collect(), policy)
     obs = [0.0] * spec.obs_size
     legal = list(range(min(6, spec.num_actions)))
     activities = [ProfilerActivity.CPU]
@@ -178,13 +256,15 @@ def profile_ops(game: str, device: str, calls: int) -> dict[str, object]:
     return {"act_with_value": per_step, "update": per_update}
 
 
-def profile_memory(game: str, device: str, rounds: int) -> dict[str, object]:
+def profile_memory(
+    game: str, device: str, rounds: int, config_path: str | None = None
+) -> dict[str, object]:
     """Allocator churn: allocations, cudaMalloc segments, retries, peak."""
     if device == "cpu":
         return {}
     import torch
 
-    trainer, _policy, _cfg = _build(game, device)
+    trainer, _policy, _cfg, _rules = _build(game, device, config_path)
     trainer.step()
     torch.cuda.reset_peak_memory_stats()
     before = torch.cuda.memory_stats()
@@ -236,6 +316,11 @@ def run_cprofile(game: str, algo: str, mode: str, steps: int, out_dir: Path) -> 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Profile a short mjai training run.")
     parser.add_argument("--game", default="liars_dice1")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help=f"Experiment YAML to profile. Default: {DEFAULT_CONFIG_TEMPLATE} for --game.",
+    )
     parser.add_argument("--device", default="cpu", help="cpu | cuda | cuda:N")
     parser.add_argument("--rounds", type=int, default=30, help="Train rounds for the phase split.")
     parser.add_argument("--calls", type=int, default=50, help="Policy calls for the op counts.")
@@ -261,14 +346,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     everything = not (args.phases or args.ops or args.memory)
-    summary: dict[str, object] = {"game": args.game, "device": args.device}
+    summary: dict[str, object] = {
+        "game": args.game,
+        "device": args.device,
+        "config": args.config or DEFAULT_CONFIG_TEMPLATE.format(game=args.game),
+    }
     if everything or args.phases:
-        summary["phases"] = profile_phases(args.game, args.device, args.rounds)
+        summary["phases"] = profile_phases(args.game, args.device, args.rounds, args.config)
     if everything or args.ops:
-        summary["ops"] = profile_ops(args.game, args.device, args.calls)
+        summary["ops"] = profile_ops(args.game, args.device, args.calls, args.config)
     if everything or args.memory:
-        summary["memory"] = profile_memory(args.game, args.device, 10)
-    path = out_dir / f"profile_{args.game}_{args.device.replace(':', '')}.json"
+        summary["memory"] = profile_memory(args.game, args.device, 10, args.config)
+    stem = Path(args.config).stem if args.config else args.game
+    path = out_dir / f"profile_{stem}_{args.device.replace(':', '')}.json"
     path.write_text(json.dumps(summary, indent=2))
     print(f"\nWrote {path}")
     return 0
